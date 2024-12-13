@@ -175,7 +175,6 @@ def compile(files: Optional[List[Union[str, 'PathLike']]] = None,
                             if not line.baseline:
                                 logger.info('No baseline given for line')
                                 continue
-                            # the dataset 
                             encoded_line = tokenizer.encode(text, add_bos=False, add_eos=False).numpy()
                             max_octets_in_line = max(len(encoded_line), max_octets_in_line)
                             page_data.append(pa.scalar({'text': pa.scalar(encoded_line),
@@ -227,13 +226,19 @@ def collate_sequences(im, page_data, max_seq_len: int):
     Sorts and pads image data.
     """
     if isinstance(page_data[0][0], str):
-        labels = [x for x, _ in page_data]
+        labels = [x for x, _, _ in page_data]
     else:
-        labels = torch.stack([F.pad(x, pad=(0, max_seq_len-len(x)), value=-100) for x, _ in page_data]).long()
-    curves = torch.stack([x for _, x in page_data])
+        labels = torch.stack([F.pad(x, pad=(0, max_seq_len-len(x)), value=-100) for x, _, _ in page_data]).long()
+    curves = None
+    boxes = None
+    if page_data[0][1] is not None:
+        curves = torch.stack([x for _, x, _ in page_data])
+    if page_data[0][2] is not None:
+        boxes = torch.stack([x for _, _, x in page_data])
     return {'image': im,
             'tokens': labels,
-            'curves': curves}
+            'curves': curves,
+            'boxes': boxes}
 
 
 class TextLineDataModule(L.LightningDataModule):
@@ -376,12 +381,14 @@ class BinnedBaselineDataset(Dataset):
 
         # sample randomly between baselines
         sample = []
+        return_boxes = rng.choice([False, True], 1)
         for x in rng.choice(len(page_data), self.batch_size, replace=True, shuffle=False):
             line = page_data[x]
             # filter out pad/bos/eos tokens and add them manually after
-            tokens = torch.tensor([self.bos_id] + [x for x in line['text'] if x>2] + [self.eos_id], dtype=torch.int32)
-            curve = torch.tensor(line['curve']).view(4, 2)
-            sample.append((tokens, curve))
+            tokens = torch.tensor([self.bos_id] + list(filter(lamba t: t>2, line['text'])) + [self.eos_id], dtype=torch.int32)
+            curve = torch.tensor(line['curve']).view(4, 2) if not return_boxes else None
+            bbox = torch.tensor(line['bbox']).view(4, 2) if return_boxes else None
+            sample.append((tokens, curve, bbox))
         return collate_sequences(im.unsqueeze(0), sample, self.max_seq_len)
 
     def __len__(self) -> int:

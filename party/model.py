@@ -115,7 +115,8 @@ class RecognitionModel(L.LightningModule):
             tokens.masked_fill_(tokens == self.criterion.ignore_index, 0)
             logits = self.model(tokens=tokens,
                                 encoder_input=batch['image'],
-                                encoder_curves=batch['curves'])
+                                encoder_curves=batch['curves']
+                                encoder_boxes=batch['boxes'])
 
             logits = logits.reshape(-1, logits.shape[-1])
             # Compute loss
