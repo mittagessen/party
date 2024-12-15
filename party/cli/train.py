@@ -187,6 +187,15 @@ def compile(ctx, output, files, normalization, normalize_whitespace, reorder,
               show_default=True,
               default=RECOGNITION_HYPER_PARAMS['augment'],
               help='Enable image augmentation')
+@click.option('--prompt-mode',
+              show_default=True,
+              type=click.Choice(['boxes',
+                                 'curves',
+                                 'both']),
+              default='both',
+              help='Sets line prompt sampling mode: `boxes` for boxes only, '
+              '`curves` for curves only, and `both` for randomly switching '
+              'between boxes and curves.')
 @click.option('--accumulate-grad-batches',
               show_default=True,
               default=RECOGNITION_HYPER_PARAMS['accumulate_grad_batches'],
@@ -196,8 +205,8 @@ def train(ctx, load_from_checkpoint, load_from_hub, batch_size, output, freq,
           quit, epochs, min_epochs, lag, min_delta, optimizer, lrate, momentum,
           weight_decay, gradient_clip_val, warmup, schedule, gamma, step_size,
           sched_patience, cos_max, cos_min_lr, training_files,
-          evaluation_files, workers, threads, augment, accumulate_grad_batches,
-          ground_truth):
+          evaluation_files, workers, threads, augment, prompt_mode,
+          accumulate_grad_batches, ground_truth):
     """
     Trains a model from image-text pairs.
     """
@@ -268,6 +277,7 @@ def train(ctx, load_from_checkpoint, load_from_hub, batch_size, output, freq,
 
     data_module = TextLineDataModule(training_data=ground_truth,
                                      evaluation_data=evaluation_files,
+                                     prompt_mode=prompt_mode,
                                      augmentation=augment,
                                      batch_size=batch_size,
                                      num_workers=workers)

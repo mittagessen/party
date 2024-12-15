@@ -59,6 +59,7 @@ class RecognitionModel(L.LightningModule):
                  encoder: str = 'swin_base_patch4_window12_384.ms_in22k',
                  encoder_input_size: Tuple[int, int] = (2560, 1920),
                  decoder: str = 'mittagessen/bytellama_oscar',
+                 pretrained: bool = True,
                  **kwargs):
         super().__init__()
 
@@ -72,7 +73,7 @@ class RecognitionModel(L.LightningModule):
         timm.layers.use_fused_attn(experimental=True)
 
         encoder_model = timm.create_model(encoder,
-                                          pretrained=True,
+                                          pretrained=pretrained,
                                           num_classes=0,
                                           img_size=encoder_input_size,
                                           global_pool='')
@@ -80,7 +81,7 @@ class RecognitionModel(L.LightningModule):
         l_idx = encoder_model.prune_intermediate_layers(indices=(-2,), prune_head=True, prune_norm=True)[0]
         l_red = encoder_model.feature_info[l_idx]['reduction']
 
-        decoder_model = bytellama_vision_decoder(pretrained=decoder,
+        decoder_model = bytellama_vision_decoder(pretrained=decoder if pretrained else None,
                                                  encoder_max_seq_len=encoder_input_size[0] // l_red * encoder_input_size[1] // l_red)
 
         self.model = PartyModel(encoder=encoder_model,
@@ -115,7 +116,7 @@ class RecognitionModel(L.LightningModule):
             tokens.masked_fill_(tokens == self.criterion.ignore_index, 0)
             logits = self.model(tokens=tokens,
                                 encoder_input=batch['image'],
-                                encoder_curves=batch['curves']
+                                encoder_curves=batch['curves'],
                                 encoder_boxes=batch['boxes'])
 
             logits = logits.reshape(-1, logits.shape[-1])
@@ -194,7 +195,7 @@ class RecognitionModel(L.LightningModule):
         """
         Loads weights from a huggingface hub repository.
         """
-        module = cls(*args, **kwargs)
+        module = cls(*args, **kwargs, pretrained=False)
         module.model = PartyModel.from_huggingface(hub_id)
         module.model = torch.compile(module.model)
         module.model.train()

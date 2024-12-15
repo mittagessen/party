@@ -260,7 +260,7 @@ class PartyModel(nn.Module):
                                      encoder_embed_dim,
                                      decoder_embed_dim)
 
-        self.curve_embedding = PromptEncoder(decoder_embed_dim)
+        self.line_embedding = PromptEncoder(decoder_embed_dim)
 
         self.ready_for_generation = False
 
@@ -356,6 +356,7 @@ class PartyModel(nn.Module):
                 encoder_input: Optional[torch.Tensor] = None,
                 encoder_hidden_states: Optional[torch.Tensor] = None,
                 encoder_curves: Optional[torch.Tensor] = None,
+                encoder_boxes: Optional[torch.Tensor] = None,
                 encoder_mask: Optional[torch.Tensor] = None,
                 mask: Optional[torch.Tensor] = None,
                 input_pos: Optional[torch.Tensor] = None) -> Union[torch.Tensor, List[torch.Tensor]]:
@@ -366,7 +367,9 @@ class PartyModel(nn.Module):
             encoder_hidden_states: Optional encoder embeddings with curve
                                    embeddings already added.
             encoder_curves: Optional curves to be embedded and added to encoder
-                            embeddings.
+                            embeddings. Mutually exclusive with `encoder_boxes`.
+            encoder_boxes: Optional boxes to be embedded and added to encoder
+                            embeddings. Mutually exclusive with `encoder_curves`.
             input_pos: Optional tensor which contains the position ids of each
                        token. During training, this is used to indicate the
                        positions of each token relative to its sample when
@@ -398,13 +401,15 @@ class PartyModel(nn.Module):
         # for new inputs. Previous encoder outputs are cached
         # in the decoder cache.
         if encoder_input is not None:
+
             encoder_hidden_states = self.forward_encoder_embeddings(encoder_input)
             # expand encoder_hidden_states from (1, s_e, d) to (b, s_e, d)
             encoder_hidden_states = encoder_hidden_states.repeat(tokens.size(0), 1, 1)
 
             # add curve embeddings to encoder hidden states after adaptatio to decoder_embed_dim
-            curve_embeds = self.curve_embedding(encoder_curves).unsqueeze(1).expand(-1, encoder_hidden_states.size(1), -1)
-            encoder_hidden_states = encoder_hidden_states + curve_embeds
+            line_embeds = self.line_embedding(curves=encoder_curves,
+                                              boxes=encoder_boxes).unsqueeze(1).expand(-1, encoder_hidden_states.size(1), -1)
+            encoder_hidden_states = encoder_hidden_states + line_embeds
 
         output = self.decoder(tokens=tokens,
                               mask=mask,
@@ -458,7 +463,8 @@ class PartyModel(nn.Module):
     @torch.inference_mode()
     def predict_tokens(self,
                        encoder_input: torch.FloatTensor,
-                       curves: torch.FloatTensor,
+                       curves: Optional[torch.FloatTensor] = None,
+                       boxes: Optional[torch.FloatTensor] = None,
                        eos_id: int = 2) -> Generator[torch.Tensor, None, None]:
         """
         Predicts text from an input page image and a number of quadratic Bézier
@@ -467,6 +473,7 @@ class PartyModel(nn.Module):
         Args:
             encoder_input: Image input for the encoder with shape ``1 x c x h x w``
             curves: Curves to be embedded and added to the encoder embeddings (``n x 4 x 2``)
+            boxes: Boxes to be embedded and added to the encoder embeddings (``n x 4 x 2``)
             batch_size: Number of curves to generate text for simultaneously.
             eos_id: EOS ID of tokenizer
 
@@ -476,13 +483,19 @@ class PartyModel(nn.Module):
             BOS and EOS have already been stripped from the token sequences.
             Entries beyond the EOS are padded with zeroes.
         """
+        if curves is not None and boxes is not None:
+            raise ValueError('`curves` and `boxes` are mutually exclusive.')
+        if curves is None and boxes is None:
+            raise ValueError('One of `curves` or `boxes` needs to be set.')
+
         logger.info(f'Computing encoder embeddings')
 
         encoder_hidden_states = self.forward_encoder_embeddings(encoder_input).repeat(self._batch_size, 1, 1)
 
         eos_token = torch.tensor(eos_id, device=curves.device, dtype=torch.long)
 
-        batches = torch.split(curves, self._batch_size)
+        line_pos = curves if curves is not None else boxes
+        batches = torch.split(line_pos, self._batch_size)
 
         # Mask is shape (batch_size, max_seq_len, image_embedding_len)
         encoder_mask = torch.ones((self._batch_size,
@@ -502,9 +515,9 @@ class PartyModel(nn.Module):
 
             logger.info(f'Processing batch {batch_idx} of {len(batches)}')
 
-            # add curve embeddings to encoder hidden states
-            curve_embeds = self.curve_embedding(batch).unsqueeze(1).expand(-1, encoder_hidden_states.size(1), -1)
-            exp_encoder_hidden_states = encoder_hidden_states + curve_embeds
+            # add line embeddings to encoder hidden states
+            line_embeds = self.line_embedding(batch).unsqueeze(1).expand(-1, encoder_hidden_states.size(1), -1)
+            exp_encoder_hidden_states = encoder_hidden_states + line_embeds
 
             # prefill step
             curr_masks = self._masks[:, :1]

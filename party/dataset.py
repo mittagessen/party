@@ -243,8 +243,9 @@ def collate_sequences(im, page_data, max_seq_len: int):
 
 class TextLineDataModule(L.LightningDataModule):
     def __init__(self,
-                 training_data: Union[str, 'PathLike'],
-                 evaluation_data: Union[str, 'PathLike'],
+                 training_data: List[Union[str, 'PathLike']],
+                 evaluation_data: List[Union[str, 'PathLike']],
+                 prompt_mode: Literal['boxes', 'curves', 'both'] = 'both',
                  augmentation: bool = False,
                  batch_size: int = 16,
                  num_workers: int = 8):
@@ -310,14 +311,11 @@ class BinnedBaselineDataset(Dataset):
     upper limit of the number of samples returned.
 
     Args:
-        normalization: Unicode normalization for gt
-        whitespace_normalization: Normalizes unicode whitespace and strips
-                                  whitespace.
-        skip_empty_lines: Whether to return samples without text.
-        reorder: Whether to rearrange code points in "display"/LTR order.
-                 Set to L|R to change the default text direction.
         im_transforms: Function taking an PIL.Image and returning a tensor
                        suitable for forward passes.
+        prompt_mode: Select line prompt sampling mode: `boxes` for bbox-only,
+                     `curves` for curves-only, and `both` for randomly
+                     switching between the two.
         augmentation: Enables augmentation.
         batch_size: Maximum size of a batch. All samples from a batch will
                     come from a single page.
@@ -325,6 +323,7 @@ class BinnedBaselineDataset(Dataset):
     def __init__(self,
                  files: Sequence[Union[str, 'PathLike']],
                  im_transforms: Callable[[Any], torch.Tensor] = None,
+                 prompt_mode: Literal['boxes', 'curves', 'both'] = 'both',
                  augmentation: bool = False,
                  batch_size: int = 32,
                  pad_id: int = 0,
@@ -333,6 +332,7 @@ class BinnedBaselineDataset(Dataset):
         super().__init__()
         self.files = files
         self.transforms = im_transforms
+        self.prompt_mode = prompt_mode
         self.aug = None
         self.batch_size = batch_size
         self.max_seq_len = 0
@@ -381,11 +381,16 @@ class BinnedBaselineDataset(Dataset):
 
         # sample randomly between baselines
         sample = []
-        return_boxes = rng.choice([False, True], 1)
+        if self.prompt_mode == 'both':
+            return_boxes = rng.choice([False, True], 1)
+        elif self.prompt_mode == 'boxes':
+            return_boxes = True
+        else:
+            return_boxes = False
         for x in rng.choice(len(page_data), self.batch_size, replace=True, shuffle=False):
             line = page_data[x]
             # filter out pad/bos/eos tokens and add them manually after
-            tokens = torch.tensor([self.bos_id] + list(filter(lamba t: t>2, line['text'])) + [self.eos_id], dtype=torch.int32)
+            tokens = torch.tensor([self.bos_id] + list(filter(lambda t: t>2, line['text'])) + [self.eos_id], dtype=torch.int32)
             curve = torch.tensor(line['curve']).view(4, 2) if not return_boxes else None
             bbox = torch.tensor(line['bbox']).view(4, 2) if return_boxes else None
             sample.append((tokens, curve, bbox))
