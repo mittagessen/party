@@ -124,7 +124,7 @@ def compile(ctx, output, files, normalization, normalize_whitespace,
               type=click.Choice(['Adam',
                                  'AdamW',
                                  'SGD',
-                                 'RMSprop']),
+                                 'Mars']),
               help='Select optimizer')
 @click.option('-r', '--lrate', show_default=True, default=RECOGNITION_HYPER_PARAMS['lr'], help='Learning rate')
 @click.option('-m', '--momentum', show_default=True, default=RECOGNITION_HYPER_PARAMS['momentum'], help='Momentum')

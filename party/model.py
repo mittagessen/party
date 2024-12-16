@@ -44,7 +44,7 @@ class RecognitionModel(L.LightningModule):
     def __init__(self,
                  quit: Literal['fixed', 'early'] = 'fixed',
                  lag: int = 10,
-                 optimizer: str = 'AdamW',
+                 optimizer: str = 'Mars',
                  lr: float = 1e-3,
                  momentum: float = 0.9,
                  weight_decay: float = 1e-3,
@@ -263,8 +263,10 @@ def _configure_optimizer_and_lr_scheduler(hparams, params, loss_tracking_mode='m
     # XXX: Warmup is not configured here because it needs to be manually done in optimizer_step()
     logger.debug(f'Constructing {optimizer} optimizer (lr: {lr}, momentum: {momentum})')
     if optimizer in ['Adam', 'AdamW']:
-        from torchao.prototype.low_bit_optim import _AdamW
-        optim = _AdamW(params, bf16_stochastic_round=True, lr=lr, weight_decay=weight_decay)
+        optim = getattr(torch.optim, optimizer)(params, lr=lr, weight_decay=weight_decay)
+    elif optimizer == 'Mars':
+        from timm.optim import Mars
+        optim = Mars(params, lr=lr, weight_decay=weight_decay, caution=True)
     else:
         optim = getattr(torch.optim, optimizer)(params,
                                                 lr=lr,
