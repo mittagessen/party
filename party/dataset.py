@@ -168,7 +168,7 @@ def compile(files: Optional[List[Union[str, 'PathLike']]] = None,
                             if not line.baseline:
                                 logger.info('No baseline given for line')
                                 continue
-                            encoded_line = tokenizer.encode(text, add_bos=False, add_eos=False).numpy()
+                            encoded_line = np.array(tokenizer.encode(text, add_bos=False, add_eos=False), dtype=np.int32)
                             max_octets_in_line = max(len(encoded_line), max_octets_in_line)
                             page_data.append(pa.scalar({'text': pa.scalar(encoded_line),
                                                         'curve': _to_curve(line.baseline, im_size),
