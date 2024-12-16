@@ -231,7 +231,7 @@ class RecognitionModel(L.LightningModule):
         if self.hparams.warmup and self.trainer.global_step < self.hparams.warmup:
             lr_scale = min(1.0, float(self.trainer.global_step + 1) / self.hparams.warmup)
             for pg in optimizer.param_groups:
-                pg["lr"] = lr_scale * self.hparams.lr
+                pg['lr'].fill_(lr_scale * self.hparams.lr)
 
     def lr_scheduler_step(self, scheduler, metric):
         if not self.hparams.warmup or self.trainer.global_step >= self.hparams.warmup:
