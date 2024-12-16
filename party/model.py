@@ -263,7 +263,8 @@ def _configure_optimizer_and_lr_scheduler(hparams, params, loss_tracking_mode='m
     # XXX: Warmup is not configured here because it needs to be manually done in optimizer_step()
     logger.debug(f'Constructing {optimizer} optimizer (lr: {lr}, momentum: {momentum})')
     if optimizer in ['Adam', 'AdamW']:
-        optim = getattr(torch.optim, optimizer)(params, lr=lr, weight_decay=weight_decay)
+        from torchao.prototype.low_bit_optim import _AdamW
+        optim = _AdamW(params, bf16_stochastic_round=True, lr=lr, weight_decay=weight_decay)
     else:
         optim = getattr(torch.optim, optimizer)(params,
                                                 lr=lr,
