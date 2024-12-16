@@ -44,14 +44,13 @@ logging.getLogger("lightning.fabric.utilities.seed").setLevel(logging.ERROR)
               default=RECOGNITION_HYPER_PARAMS['normalization'], help='Ground truth normalization')
 @click.option('-n', '--normalize-whitespace/--no-normalize-whitespace', show_default=True,
               default=RECOGNITION_HYPER_PARAMS['normalize_whitespace'], help='Normalizes unicode whitespace')
-@click.option('--reorder/--no-reorder', show_default=True, default=True, help='Reordering of code points to display order')
 @click.option('--base-dir', show_default=True, default='auto',
               type=click.Choice(['L', 'R', 'auto']), help='Set base text '
               'direction.  This should be set to the direction used during the '
               'creation of the training data. If set to `auto` it will be '
               'overridden by any explicit value given in the input files.')
 @click.argument('ground_truth', nargs=-1, type=click.Path(exists=True, dir_okay=False))
-def compile(ctx, output, files, normalization, normalize_whitespace, reorder,
+def compile(ctx, output, files, normalization, normalize_whitespace,
             base_dir, ground_truth):
     """
     Precompiles a binary dataset from a collection of XML files.
@@ -65,9 +64,6 @@ def compile(ctx, output, files, normalization, normalize_whitespace, reorder,
 
     if not ground_truth:
         raise click.UsageError('No training data was provided to the compile command. Use the `ground_truth` argument.')
-
-    if reorder and base_dir != 'auto':
-        reorder = base_dir
 
     from party import dataset
     from rich.progress import Progress, TimeElapsedColumn, MofNCompleteColumn
@@ -86,7 +82,6 @@ def compile(ctx, output, files, normalization, normalize_whitespace, reorder,
                         output,
                         normalization=normalization,
                         normalize_whitespace=normalize_whitespace,
-                        reorder=reorder,
                         callback=_update_bar)
 
     message(f'Output file written to {output}')

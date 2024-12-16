@@ -91,7 +91,6 @@ def _to_bbox(boundary, im_size):
 
 def compile(files: Optional[List[Union[str, 'PathLike']]] = None,
             output_file: Union[str, 'PathLike'] = None,
-            reorder: Union[bool, Literal['L', 'R']] = True,
             normalize_whitespace: bool = True,
             normalization: Optional[Literal['NFD', 'NFC', 'NFKD', 'NFKC']] = None,
             max_line_tokens: int = 384,
@@ -102,7 +101,6 @@ def compile(files: Optional[List[Union[str, 'PathLike']]] = None,
     Args:
         files: List of XML files
         output_file: destination to write arrow file to
-        reorder: text reordering
         normalize_whitespace: whether to normalize all whitespace to ' '
         normalization: Unicode normalization to apply to data.
         max_line_tokens: maximum number of tokens per line
@@ -125,11 +123,6 @@ def compile(files: Optional[List[Union[str, 'PathLike']]] = None,
         text_transforms.append(partial(F_t.text_normalize, normalization=normalization))
     if normalize_whitespace:
         text_transforms.append(F_t.text_whitespace_normalize)
-        if reorder:
-            if reorder in ('L', 'R'):
-                text_transforms.append(partial(F_t.text_reorder, base_dir=reorder))
-            else:
-                text_transforms.append(F_t.text_reorder)
 
     num_lines = 0
     # helper variables to enable padding to longest sequence without iterating
