@@ -112,7 +112,7 @@ def compile(files: Optional[List[Union[str, 'PathLike']]] = None,
     text_transforms: List[Callable[[str], str]] = []
 
     # pyarrow structs
-    line_struct = pa.struct([('text', pa.string(),
+    line_struct = pa.struct([('text', pa.string()),
                              ('curve', pa.list_(pa.float32())),
                              ('bbox', pa.list_(pa.float32()))])
     page_struct = pa.struct([('im', pa.binary()), ('lines', pa.list_(line_struct))])
