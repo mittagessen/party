@@ -2,9 +2,9 @@ party
 =====
 
 party is **PA**\ ge-wise **R**\ ecognition of **T**\ ext-\ **y**. It is a
-replacement for conventional text recognizers in ATR system using the
-baseline+bounding polygon line data model where it eliminates the need for
-bounding polygons.
+replacement for conventional text recognizers in ATR system using conventional
+baseline+bounding polygon (where it eliminates the need for bounding polygons)
+and bounding box line data models. 
 
 Party consists of a Swin vision transformer encoder, baseline positional
 embeddings, and a `tiny Llama decoder
@@ -28,7 +28,11 @@ compilation is fairly similar:
 
 ::
 
-        $ party compile -o dataset.arrow --no-reorder *.xml
+        $ party compile -o dataset.arrow *.xml
+
+It is recommended not to enable BiDi reordering as the pretrained language
+model and the base model have been trained to recognize RTL text in logical
+order.
 
 It is recommended to disable BiDi reordering as the pretrained model has been
 trained to recognize RTL text in logical order.
@@ -38,7 +42,23 @@ files on all available GPUs:
 
 ::
 
-        $ party -d cuda --precision bf16-true train --load-from-hub mittagessen/llama_party --workers 32 -f train.lst -e val.lst
+        $ party --precision bf16-true train --load-from-hub mittagessen/llama_party --workers 32 -f train.lst -e val.lst
+
+With the default parameters both baseline and bounding box prompts are randomly
+sampled from the training data. It is suggested that you fine-tune the model
+with uni-modal line embeddings by only selecting the line format that your
+segmentation method produces, i.e.:
+
+::
+
+        $ party --precision bf16-true train --load-from-hub mittagessen/llama_party -f train.lst -e val.lst --prompt-mode curves
+
+or:
+
+::
+
+        $ party --precision bf16-true train --load-from-hub mittagessen/llama_party -f train.lst -e val.lst --prompt-mode boxes
+
 
 Inference
 ---------
