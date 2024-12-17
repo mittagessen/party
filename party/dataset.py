@@ -112,7 +112,7 @@ def compile(files: Optional[List[Union[str, 'PathLike']]] = None,
     text_transforms: List[Callable[[str], str]] = []
 
     # pyarrow structs
-    line_struct = pa.struct([('text', pa.list_(pa.int32())),
+    line_struct = pa.struct([('text', pa.string(),
                              ('curve', pa.list_(pa.float32())),
                              ('bbox', pa.list_(pa.float32()))])
     page_struct = pa.struct([('im', pa.binary()), ('lines', pa.list_(line_struct))])
@@ -168,9 +168,8 @@ def compile(files: Optional[List[Union[str, 'PathLike']]] = None,
                             if not line.baseline:
                                 logger.info('No baseline given for line')
                                 continue
-                            encoded_line = np.array(tokenizer.encode(text, add_bos=False, add_eos=False), dtype=np.int32)
-                            max_octets_in_line = max(len(encoded_line), max_octets_in_line)
-                            page_data.append(pa.scalar({'text': pa.scalar(encoded_line),
+                            max_octets_in_line = max(len(tokenizer.encode(text, add_bos=False, add_eos=False)), max_octets_in_line)
+                            page_data.append(pa.scalar({'text': pa.scalar(text),
                                                         'curve': _to_curve(line.baseline, im_size),
                                                         'bbox': _to_bbox(line.boundary, im_size)},
                                                        line_struct))
@@ -264,17 +263,11 @@ class TextLineDataModule(L.LightningDataModule):
         self.train_set = BinnedBaselineDataset(self.hparams.training_data,
                                                im_transforms=self.im_transforms,
                                                augmentation=self.hparams.augmentation,
-                                               batch_size=self.hparams.batch_size,
-                                               pad_id=self.pad_id,
-                                               bos_id=self.bos_id,
-                                               eos_id=self.eos_id)
+                                               batch_size=self.hparams.batch_size)
         self.val_set = BinnedBaselineDataset(self.hparams.evaluation_data,
                                              im_transforms=self.im_transforms,
                                              augmentation=self.hparams.augmentation,
-                                             batch_size=self.hparams.batch_size,
-                                             pad_id=self.pad_id,
-                                             bos_id=self.bos_id,
-                                             eos_id=self.eos_id)
+                                             batch_size=self.hparams.batch_size)
         self.train_set.max_seq_len = max(self.train_set.max_seq_len, self.val_set.max_seq_len)
         self.val_set.max_seq_len = self.train_set.max_seq_len
 
@@ -318,10 +311,7 @@ class BinnedBaselineDataset(Dataset):
                  im_transforms: Callable[[Any], torch.Tensor] = None,
                  prompt_mode: Literal['boxes', 'curves', 'both'] = 'both',
                  augmentation: bool = False,
-                 batch_size: int = 32,
-                 pad_id: int = 0,
-                 bos_id: int = 1,
-                 eos_id: int = 2) -> None:
+                 batch_size: int = 32) -> None:
         super().__init__()
         self.files = files
         self.transforms = im_transforms
@@ -330,9 +320,8 @@ class BinnedBaselineDataset(Dataset):
         self.batch_size = batch_size
         self.max_seq_len = 0
         self._len = 0
-        self.pad_id = pad_id
-        self.bos_id = bos_id
-        self.eos_id = eos_id
+
+        self.tokenizer = OctetTokenizer()
 
         self.arrow_table = None
 
@@ -382,8 +371,7 @@ class BinnedBaselineDataset(Dataset):
             return_boxes = False
         for x in rng.choice(len(page_data), self.batch_size, replace=True, shuffle=False):
             line = page_data[x]
-            # filter out pad/bos/eos tokens and add them manually after
-            tokens = torch.tensor([self.bos_id] + list(filter(lambda t: t>2, line['text'])) + [self.eos_id], dtype=torch.int32)
+            tokens = torch.tensor(self.tokenizer.encode(text, add_bos=True, add_eos=True), dtype=torch.int32)
             curve = torch.tensor(line['curve']).view(4, 2) if not return_boxes else None
             bbox = torch.tensor(line['bbox']).view(4, 2) if return_boxes else None
             sample.append((tokens, curve, bbox))
