@@ -21,9 +21,12 @@ API for inference
 import torch
 import logging
 
-from party.dataset import get_default_transforms, _to_curve, _to_bbox
+from kraken.containers import BBoxOCRRecord, BaselineOCRRecord
 
 from typing import TYPE_CHECKING, Union, Tuple, Optional, Literal, Generator
+
+from party.dataset import get_default_transforms, _to_curve, _to_bbox
+
 
 logging.captureWarnings(True)
 logger = logging.getLogger('party')
@@ -95,17 +98,18 @@ class batched_pred(object):
             if m_prompt_mode == 'boxes' and s_prompt_mode == 'baseline':
                 logger.info('Model expect boxes and segmentation is baseline-type. Casting bounding polygons to bounding boxes.')
                 line_prompt_fn = _box_prompt_fn
-                prompt_mode = 'boxes'
+                self.prompt_mode = 'boxes'
             elif m_prompt_mode == 'both':
                 line_prompt_fn = _box_prompt_fn if s_prompt_mode == 'bbox' else _curve_prompt_fn
-                prompt_mode = 'boxes' if s_prompt_mode == 'bbox' else 'curves'
+                self.prompt_mode = 'boxes' if s_prompt_mode == 'bbox' else 'curves'
             else:
                 line_prompt_fn = _box_prompt_fn if m_prompt_mode == 'boxes' else _curve_prompt_fn
-                prompt_mode = 'boxes' if m_prompt_mode == 'boxes' else 'curves'
+                self.prompt_mode = 'boxes' if m_prompt_mode == 'boxes' else 'curves'
         elif m_prompt_mode != 'both' or m_prompt_mode != prompt_mode:
             raise ValueError(f'Model expects prompt {m_prompt_mode} and explicit line prompt mode {prompt_mode} selected.')
         else:
             line_prompt_fn = _box_prompt_fn if prompt_mode == 'boxes' else _curve_prompt_fn
+            self.prompt_mode = prompt_mode
 
         # load image transforms
         im_transforms = get_default_transforms()
@@ -120,12 +124,25 @@ class batched_pred(object):
             lines = lines.view(-1, 4, 2)
             self.len = len(lines)
 
-            self._pred = model.predict_string(encoder_input=image_input,
-                                              curves=lines if prompt_mode == 'curves' else None,
-                                              boxes=lines if prompt_mode == 'boxes' else None)
+            self._pred = zip(model.predict_string(encoder_input=image_input,
+                                                  curves=lines if self.prompt_mode == 'curves' else None,
+                                                  boxes=lines if self.prompt_mode == 'boxes' else None),
+                             bounds.lines)
 
     def __next__(self):
-        return next(self._pred)
+        pred_str, line = next(self._pred)
+        if self.prompt_mode == 'curves':
+            return BaselineOCRRecord(prediction=pred_str,
+                                     cuts=tuple(),
+                                     confidences=tuple(),
+                                     line=line,
+                                     display_order=False)
+        else:
+            return BBoxOCRRecord(prediction=pred_str,
+                                 cuts=tuple(),
+                                 confidences=tuple(),
+                                 line=line,
+                                 display_order=False)
 
     def __iter__(self):
         return self
