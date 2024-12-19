@@ -301,6 +301,8 @@ class PartyModel(nn.Module):
             state_dict = {k: f.get_tensor(k) for k in f.keys()}
         model.load_state_dict(state_dict, strict=False)
 
+        model.line_prompt_mode = 'both'
+
         return model
 
     def setup_caches(self,
@@ -576,7 +578,8 @@ class PartyModel(nn.Module):
     @torch.inference_mode
     def predict_string(self,
                        encoder_input: torch.FloatTensor,
-                       curves: torch.FloatTensor,
+                       curves: Optional[torch.FloatTensor] = None,
+                       boxes: Optional[torch.FloatTensor] = None,
                        eos_id: int = 2) -> Generator[str, None, None]:
         """
         Predicts text from an input page image and a number of quadratic Bézier
@@ -593,7 +596,8 @@ class PartyModel(nn.Module):
         """
         tokenizer = OctetTokenizer()
         for preds in self.predict_tokens(encoder_input=encoder_input,
-                                        curves=curves,
-                                        eos_id=eos_id):
+                                         curves=curves,
+                                         boxes=boxes,
+                                         eos_id=eos_id):
             for pred in preds:
                 yield tokenizer.decode(pred[pred != 0])

@@ -82,10 +82,11 @@ def _repl_page(fname, preds):
               default='mittagessen/llama_party',
               show_default=True,
               help="Huggingface hub identifier of the party model")
-@click.option('--compile/--no-compile', help='Switch to enable/disable torch.compile() on model')
-@click.option('--quantize/--no-quantize', help='Switch to enable/disable PTQ')
+@click.option('--curves/--boxes', help='Encode line prompts as bounding boxes or curves', default=None, show_default=True)
+@click.option('--compile/--no-compile', help='Switch to enable/disable torch.compile() on model', default=True, show_default=True)
+@click.option('--quantize/--no-quantize', help='Switch to enable/disable PTQ', default=False, show_default=True)
 @click.option('-b', '--batch-size', default=2, help='Set batch size in generator')
-def ocr(ctx, input, batch_input, suffix, model, compile, quantize, batch_size):
+def ocr(ctx, input, batch_input, suffix, model, curves, compile, quantize, batch_size):
     """
     Runs text recognition on pre-segmented images in XML format.
     """
@@ -97,19 +98,24 @@ def ocr(ctx, input, batch_input, suffix, model, compile, quantize, batch_size):
         raise click.UsageError('Inference requires the kraken package')
 
     import torch
-    import pathlib
     from PIL import Image
+    from pathlib import Path
     from lightning.fabric import Fabric
 
     from threadpoolctl import threadpool_limits
 
-    from party.dataset import get_default_transforms, _to_curve
+    from party.pred import batched_pred
     from party.fusion import PartyModel
 
     try:
         accelerator, device = to_ptl_device(ctx.meta['device'])
     except Exception as e:
         raise click.BadOptionUsage('device', str(e))
+
+    if curves is True:
+        curves = 'curves'
+    elif curves is False:
+        curves = 'boxes'
 
     # parse input files
     input = list(input)
@@ -148,31 +154,25 @@ def ocr(ctx, input, batch_input, suffix, model, compile, quantize, batch_size):
             except Exception:
                 click.secho('\u2717', fg='red')
 
-        # load image transforms
-        im_transforms = get_default_transforms()
-
-        # prepare model for generation
-        model.prepare_for_generation(batch_size=batch_size)
-        model = model.eval()
-
-        m_dtype = next(model.parameters()).dtype
-
         with KrakenProgressBar() as progress:
             file_prog = progress.add_task('Files', total=len(input))
             for input_file, output_file in input:
-                input_file = pathlib.Path(input_file)
-                output_file = pathlib.Path(output_file)
+                input_file = Path(input_file)
+                output_file = Path(output_file)
 
                 doc = XMLPage(input_file)
                 im = Image.open(doc.imagename)
                 bounds = doc.to_container()
                 rec_prog = progress.add_task(f'Processing {input_file}', total=len(bounds.lines))
-                image_input = fabric.to_device(im_transforms(im)).to(m_dtype).unsqueeze(0)
-                curves = fabric.to_device(torch.tensor([_to_curve(line.baseline, im.size).as_py() for line in bounds.lines], dtype=m_dtype))
-                curves = curves.view(-1, 4, 2)
+                predictor = batched_pred(model=model,
+                                         im=im,
+                                         bounds=bounds,
+                                         fabric=fabric,
+                                         prompt_mode=curves,
+                                         batch_size=batch_size)
+
                 preds = []
-                for pred in model.predict_string(encoder_input=image_input,
-                                                 curves=curves):
+                for pred in predictor:
                     preds.append(pred)
                     progress.update(rec_prog, advance=1)
                 with open(output_file, 'wb') as fo:
