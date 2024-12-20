@@ -301,7 +301,7 @@ def train(ctx, load_from_checkpoint, load_from_hub, batch_size, output, freq,
     with trainer.init_module():
         if load_from_checkpoint:
             message(f'Loading from checkpoint {load_from_checkpoint}.')
-            model = RecognitionModel.load_from_checkpoint(load,
+            model = RecognitionModel.load_from_checkpoint(load_from_checkpoint,
                                                           **hyper_params)
         elif load_from_hub:
             message(f'Loading from huggingface hub {load_from_hub}.')
