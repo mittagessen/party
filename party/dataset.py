@@ -371,7 +371,7 @@ class BinnedBaselineDataset(Dataset):
             return_boxes = False
         for x in rng.choice(len(page_data), self.batch_size, replace=True, shuffle=False):
             line = page_data[x]
-            tokens = torch.tensor(self.tokenizer.encode(text, add_bos=True, add_eos=True), dtype=torch.int32)
+            tokens = torch.tensor(self.tokenizer.encode(line['text'], add_bos=True, add_eos=True), dtype=torch.int32)
             curve = torch.tensor(line['curve']).view(4, 2) if not return_boxes else None
             bbox = torch.tensor(line['bbox']).view(4, 2) if return_boxes else None
             sample.append((tokens, curve, bbox))
