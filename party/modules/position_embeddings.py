@@ -5,11 +5,27 @@
 # LICENSE file in the root directory of this source tree.
 
 import math
-from typing import Optional
+from typing import Optional, List
 
 import torch
 
 from torch import nn
+
+
+class ScaleEncoder(nn.Module):
+    """
+    Learnable embedding to mark the scale of the concatenated feature maps in
+    encoder memory for cross attention.
+    """
+    def __init__(self,
+                 num_feat_maps: int):
+        super().__init__()
+        self.scale_embeddings = nn.Embedding(1, num_feat_maps)
+
+    def forward(self, feats: List[torch.Tensor]) -> List[torch.Tensor]:
+        for scale, feat in enumerate(feats):
+            feat += self.scale_embeddings.weight[:, scale].repeat(feat.shape)
+        return feats
 
 
 class Llama3ScaledRoPE(nn.Module):

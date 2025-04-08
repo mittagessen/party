@@ -25,11 +25,11 @@ from torch import nn
 from lightning.pytorch.callbacks import EarlyStopping
 from torch.optim import lr_scheduler
 
-from typing import Literal, Tuple
+from typing import Literal, Tuple, List, Optional
 
 from torchmetrics.aggregation import MeanMetric
 
-from party.fusion import bytellama_vision_decoder, PartyModel
+from party.fusion import bytellama_vision_decoder, PartyModel, EncoderFusion
 
 logger = logging.getLogger(__name__)
 
@@ -75,11 +75,14 @@ class RecognitionModel(L.LightningModule):
                  cos_t_max: float = 30,
                  cos_min_lr: float = 1e-4,
                  warmup: int = 15000,
-                 encoder: str = 'swin_base_patch4_window12_384.ms_in22k',
+                 encoder: str = 'convnext_base',
                  encoder_input_size: Tuple[int, int] = (2560, 1920),
+                 encoder_topk_tokens: List[int] = [8192, 4096, 256],
+                 encoder_embed_dim: int = 576,
                  decoder: str = 'mittagessen/bytellama_oscar',
                  pretrained: bool = True,
                  freeze_encoder: bool = False,
+                 from_safetensors: Optional[str] = None,
                  **kwargs):
         super().__init__()
 
@@ -89,25 +92,29 @@ class RecognitionModel(L.LightningModule):
 
         self.save_hyperparameters()
 
-        # enable fused attn in encoder
-        timm.layers.use_fused_attn(experimental=True)
+        if not from_safetensors:
+            out_indices = list(range(4 - len(encoder_topk_tokens), 4, 1))
 
-        encoder_model = timm.create_model(encoder,
-                                          pretrained=pretrained,
-                                          num_classes=0,
-                                          img_size=encoder_input_size,
-                                          global_pool='')
+            encoder_model = timm.create_model(encoder,
+                                              pretrained=pretrained,
+                                              features_only=True,
+                                              out_indices=out_indices)
 
-        l_idx = encoder_model.prune_intermediate_layers(indices=(-2,), prune_head=True, prune_norm=True)[0]
-        l_red = encoder_model.feature_info[l_idx]['reduction']
+            max_seq_len = sum(encoder_topk_tokens)
 
-        decoder_model = bytellama_vision_decoder(pretrained=decoder if pretrained else None,
-                                                 encoder_max_seq_len=encoder_input_size[0] // l_red * encoder_input_size[1] // l_red)
+            adapter = EncoderFusion(in_channels=encoder.feature_info.channels(),
+                                    topk_tokens=encoder_topk_tokens,
+                                    embed_dim=encoder_embed_dim)
 
-        self.model = PartyModel(encoder=encoder_model,
-                                decoder=decoder_model,
-                                encoder_embed_dim=encoder_model.feature_info[l_idx]['num_chs'],
-                                decoder_embed_dim=decoder_model.tok_embeddings.embedding_dim)
+            decoder_model = bytellama_vision_decoder(pretrained=decoder if pretrained else None,
+                                                     encoder_max_seq_len=max_seq_len)
+
+            self.model = PartyModel(encoder=encoder_model,
+                                    adapter=adapter,
+                                    decoder=decoder_model,
+                                    decoder_embed_dim=decoder_model.tok_embeddings.embedding_dim)
+        else:
+            self.model = PartyModel.from_safetensors(from_safetensors)
 
         if freeze_encoder:
             for param in self.model.encoder.parameters():
@@ -182,17 +189,20 @@ class RecognitionModel(L.LightningModule):
     @classmethod
     def load_from_repo(cls, id=None, *args, **kwargs):
         """
-        Loads weights from a huggingface hub repository.
+        Loads weights from the HTRMoPo repository.
         """
         from htrmopo import get_model
 
-        module = cls(*args, **kwargs, pretrained=False)
-
         model_path = get_model(id) / 'model.safetensors'
 
-        module.model = PartyModel.from_safetensors(model_path)
-        module.model.train()
-        return module
+        return cls(*args, **kwargs, pretrained=False, from_safetensors=model_path)
+
+    @classmethod
+    def load_from_safetensors(cls, path=None, *args, **kwargs):
+        """
+        Loads weights from a (possibly partial) safetensors file.
+        """
+        return cls(*args, **kwargs, pretrained=False, from_safetensors=path)
 
     def configure_callbacks(self):
         callbacks = []

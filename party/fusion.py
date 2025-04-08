@@ -24,7 +24,7 @@ from torch import nn
 from party.modules import (MultiHeadAttention, RMSNorm, TanhGate,
                            TransformerCrossAttentionLayer, TransformerDecoder,
                            FeedForward, TransformerSelfAttentionLayer,
-                           FusionLayer, scale_hidden_dim_for_mlp,
+                           FusionLayer, scale_hidden_dim_for_mlp, ScaleEncoder,
                            Llama3ScaledRoPE, llama3_mlp, PromptEncoder)
 
 from party.tokenizer import OctetTokenizer
@@ -227,6 +227,97 @@ def party_adapter(num_layers: int,
     return nn.Sequential(*layers)
 
 
+class PruningModule(nn.Module):
+    """
+    Learned selective token pruning module.
+
+    Uses a simple MLP to produce a score map selecting `topk` tokens from an
+    input tensor with shape (B, S, C).
+
+    Args:
+        channels: # of channels `C` of input
+        hidden_dim: dimensionality of intermediate MLP layer
+        topk: number of tokens to select.
+    """
+    def __init__(self,
+                 channels: int,
+                 intermediate_dim: int):
+        super().__init__()
+        self.mlp = nn.Sequential(RMSNorm(channels, eps=1e-05),
+                                 nn.Linear(channels, intermediate_dim, bias=False),
+                                 nn.SiLU(),
+                                 nn.Linear(intermediate_dim, 1, bias=False))
+
+    def forward(self, x: torch.Tensor, topk: int):
+        sel = self.mlp(x)  # (b,l,1)
+        # select tokens
+        _, topk_ind = torch.topk(sel, topk, dim=-2)
+        return x.gather(dim=1, index=topk_ind.repeat(1, 1, x.shape[-1]))
+
+
+class EncoderFusion(nn.Module):
+    """
+    Fuses encoder feature pyramids with selective token pruning.
+
+    Args:
+        in_channels: Channel dimension size of each feature map.
+        topk_tokens: Number of tokens to retain for each map.
+        embed_dim: Output token embedding dimension.
+        intermediate_dim: Intermediate dimension of token pruning layer.
+    """
+    def __init__(self,
+                 in_channels: List[int],
+                 topk_tokens: List[int],
+                 embed_dim: int = 128,
+                 intermediate_dim: int = 768,
+                 adapter_num_layers: int = 4,
+                 adapter_num_heads: int = 8):
+        super().__init__()
+        self.topk_tokens = topk_tokens
+
+        self.scale_encoder = ScaleEncoder(len(in_channels))
+
+        self.output_proj = nn.ModuleList()
+        for in_channel in in_channels:
+            self.output_proj.append(nn.Linear(in_channel, embed_dim, bias=False))
+
+        self.pruning_layers = nn.ModuleList()
+        for idx, channels in enumerate(in_channels):
+            self.pruning_layers.append(PruningModule(channels, intermediate_dim))
+
+        self.adapter = party_adapter(adapter_num_layers,
+                                     adapter_num_heads,
+                                     embed_dim,
+                                     embed_dim)
+
+
+    def forward(self, features: Sequence[torch.Tensor]):
+        """
+        Args:
+            features: List of feature pyramid tensors with shape ``[b x c x h_n x w_n]``
+
+        Returns:
+            Tensor: output tensor with shape ``[b x t x e]``
+        Notation used for tensor shapes:
+            - b: batch size
+            - c: channels
+            - h_n: height of n-th feature map
+            - w_n: width of n-th feature map
+            - t: sum of lengths of topk_tokens
+            - e: embed dim
+        """
+        os = []
+        for feat, prune, proj, tkt in zip(features,
+                                          self.pruning_layers,
+                                          self.output_proj,
+                                          self.topk_tokens):
+            o = prune(feat.flatten(-2).transpose(1, 2), tkt)  # NCHW -> N(TKT)C
+            os.append(proj(o))
+        os = self.scale_encoder(os)
+        os = torch.cat(os, dim=1)
+        return self.adapter(os)
+
+
 class PartyModel(nn.Module):
     """
     The party fusion model.
@@ -240,18 +331,10 @@ class PartyModel(nn.Module):
     def __init__(self,
                  encoder: nn.Module,
                  decoder: nn.Module,
-                 encoder_embed_dim: int,
-                 decoder_embed_dim: int,
-                 adapter_num_layers: int = 4,
-                 adapter_num_heads: int = 8):
+                 decoder_embed_dim: int):
         super().__init__()
         self.encoder = encoder
         self.decoder = decoder
-
-        self.adapter = party_adapter(adapter_num_layers,
-                                     adapter_num_heads,
-                                     encoder_embed_dim,
-                                     decoder_embed_dim)
 
         self.line_embedding = PromptEncoder(decoder_embed_dim)
 
