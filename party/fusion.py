@@ -38,7 +38,7 @@ __all__ = ['bytellama_vision_decoder', 'PartyModel']
 
 
 def bytellama_vision_decoder(vocab_size: int = TOKEN_NUM,
-                             num_layers: int = 30,
+                             num_layers: int = 12,
                              num_heads: int = 9,
                              num_kv_heads: int = 3,
                              embed_dim: int = 576,
@@ -182,12 +182,6 @@ def bytellama_vision_decoder(vocab_size: int = TOKEN_NUM,
         from safetensors import safe_open
         with safe_open(weight_path, framework='pt') as f:
             state_dict = {k: f.get_tensor(k) for k in f.keys()}
-        rweight = torch.zeros(TOKEN_NUM - 259, config['embed_dim'])
-        torch.nn.init.xavier_uniform_(rweight)
-        state_dict['tok_embeddings.weight'] = torch.cat([state_dict['tok_embeddings.weight'], rweight], dim=0)
-        rweight = rweight.clone()
-        torch.nn.init.xavier_uniform_(rweight)
-        state_dict['output.weight'] = torch.cat([state_dict['output.weight'], rweight], dim=0)
         decoder.load_state_dict(state_dict, strict=False)
 
     return decoder
@@ -252,7 +246,7 @@ class PartyModel(nn.Module):
                  decoder: nn.Module,
                  encoder_embed_dim: int,
                  decoder_embed_dim: int,
-                 adapter_num_layers: int = 4,
+                 adapter_num_layers: int = 1,
                  adapter_num_heads: int = 8):
         super().__init__()
         self.encoder = encoder
@@ -429,9 +423,8 @@ class PartyModel(nn.Module):
         Computes the encoder embeddings *without* adding the curve positional
         embeddings.
         """
-        encoder_hidden_states = self.encoder(encoder_input)
-        b, e = encoder_hidden_states.shape[0], encoder_hidden_states.shape[-1]
-        encoder_hidden_states = encoder_hidden_states.view(b, -1, e)
+        encoder_hidden_states = self.encoder.forward_features(encoder_input)
+        encoder_hidden_states = encoder_hidden_states.flatten(-2).transpose(-1, -2)
         return self.adapter(encoder_hidden_states)
 
     @torch.inference_mode()

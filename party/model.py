@@ -75,9 +75,9 @@ class RecognitionModel(L.LightningModule):
                  cos_t_max: float = 30,
                  cos_min_lr: float = 1e-4,
                  warmup: int = 15000,
-                 encoder: str = 'swin_base_patch4_window12_384.ms_in22k',
+                 encoder: str = 'convnextv2_tiny.fcmae_ft_in22k_in1k_384',
                  encoder_input_size: Tuple[int, int] = (2560, 1920),
-                 decoder: str = 'mittagessen/bytellama_oscar',
+                 decoder: str = 'mittagessen/bytellama-40m-oscar',
                  pretrained: bool = True,
                  freeze_encoder: bool = False,
                  batch_size: int = 16,
@@ -96,7 +96,6 @@ class RecognitionModel(L.LightningModule):
         encoder_model = timm.create_model(encoder,
                                           pretrained=pretrained,
                                           num_classes=0,
-                                          img_size=encoder_input_size,
                                           global_pool='')
 
         l_idx = encoder_model.prune_intermediate_layers(indices=(-2,), prune_head=True, prune_norm=True)[0]
