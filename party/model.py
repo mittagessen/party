@@ -98,7 +98,7 @@ class RecognitionModel(L.LightningModule):
                                           num_classes=0,
                                           global_pool='')
 
-        l_idx = encoder_model.prune_intermediate_layers(indices=(-2,), prune_head=True, prune_norm=True)[0]
+        l_idx = encoder_model.prune_intermediate_layers(indices=(-2,), prune_head=True, prune_norm=True)[0] - 1
         l_red = encoder_model.feature_info[l_idx]['reduction']
 
         decoder_model = bytellama_vision_decoder(pretrained=decoder if pretrained else None,
