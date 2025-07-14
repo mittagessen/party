@@ -6,3 +6,4 @@ from .fusion_layer import FusionLayer  # NOQA
 from .transformer import TransformerCrossAttentionLayer, TransformerSelfAttentionLayer, TransformerDecoder  # NOQA
 from .feed_forward import FeedForward  # NOQA
 from .prompt import PromptEncoder  # NOQA
+from .backbone import Backbone  # NOQA

@@ -25,7 +25,8 @@ from party.modules import (MultiHeadAttention, RMSNorm, TanhGate,
                            TransformerCrossAttentionLayer, TransformerDecoder,
                            FeedForward, TransformerSelfAttentionLayer,
                            FusionLayer, scale_hidden_dim_for_mlp,
-                           Llama3ScaledRoPE, llama3_mlp, PromptEncoder)
+                           Llama3ScaledRoPE, llama3_mlp, PromptEncoder, Backbone)
+
 
 from party.tokenizer import OctetTokenizer, TOKEN_NUM
 
@@ -233,7 +234,7 @@ class PartyModel(nn.Module):
     The party fusion model.
 
     Args:
-        encoder: A timm image encoder model
+        encoder: An image encoder model
         decoder: Text decoder model
         encoder_embed_dim: Embedding dimension of the encoder
         decoder_embed_dim: Embedding dimension of the decoder
@@ -266,7 +267,6 @@ class PartyModel(nn.Module):
         """
         Loads model weights from a safetensors-based kraken serialization.
         """
-        import timm
         from safetensors import safe_open
 
         with safe_open(filename, framework='pt') as f:
@@ -275,26 +275,18 @@ class PartyModel(nn.Module):
                 raise ValueError(f'{filename} is not a llama party model. Got type {metadata["model_type"]}, expected: kraken_llama_party.')
             config = json.loads(metadata['config'])
             prompt_mode = config.pop('prompt_mode')
-            encoder_config = {k[8:]: v for k, v in config.items() if k.startswith('encoder_')}
             decoder_config = {k[8:]: v for k, v in config.items() if k.startswith('decoder_')}
 
             state_dict = {k: f.get_tensor(k) for k in f.keys()}
 
-        # enable fused attn in encoder
-        timm.layers.use_fused_attn(experimental=True)
 
-        encoder_model = timm.create_model(encoder_config['name'],
-                                          pretrained=False,
-                                          num_classes=0,
-                                          img_size=encoder_config['input_size'],
-                                          global_pool='')
+        encoder_model = Backbone()
 
-        l_idx = encoder_model.prune_intermediate_layers(indices=(-2,), prune_head=True, prune_norm=True)[0]
         decoder_model = bytellama_vision_decoder(**decoder_config)
 
         model = cls(encoder=encoder_model,
                     decoder=decoder_model,
-                    encoder_embed_dim=encoder_model.feature_info[l_idx]['num_chs'],
+                    encoder_embed_dim=encoder_model.outputs_dims[-1],
                     decoder_embed_dim=decoder_model.tok_embeddings.embedding_dim)
 
         model.load_state_dict(state_dict)
@@ -423,14 +415,14 @@ class PartyModel(nn.Module):
         Computes the encoder embeddings *without* adding the curve positional
         embeddings.
         """
-        encoder_hidden_states = self.encoder.forward_features(encoder_input)
-        encoder_hidden_states = encoder_hidden_states.flatten(-2).transpose(-1, -2)
+        encoder_hidden_states = self.encoder.forward(encoder_input)
+        encoder_hidden_states = encoder_hidden_states.transpose(-1, -2)
         return self.adapter(encoder_hidden_states)
 
     @torch.inference_mode()
     def prepare_for_generation(self,
                                batch_size: int = 8,
-                               max_encoder_seq_len: int = 19200,
+                               max_encoder_seq_len: int = 24000,
                                max_generated_tokens: int = 384,
                                device: torch.device = torch.device('cpu')):
 
