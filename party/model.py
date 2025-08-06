@@ -100,6 +100,7 @@ class RecognitionModel(L.LightningModule):
 
         l_idx = encoder_model.prune_intermediate_layers(indices=(-2,), prune_head=True, prune_norm=True)[0] - 1
         l_red = encoder_model.feature_info[l_idx]['reduction']
+        encoder_model.head = nn.Identity()
 
         decoder_model = bytellama_vision_decoder(pretrained=decoder if pretrained else None,
                                                  encoder_max_seq_len=encoder_input_size[0] // l_red * encoder_input_size[1] // l_red)

@@ -246,7 +246,7 @@ class PartyModel(nn.Module):
                  decoder: nn.Module,
                  encoder_embed_dim: int,
                  decoder_embed_dim: int,
-                 adapter_num_layers: int = 1,
+                 adapter_num_layers: int = 4,
                  adapter_num_heads: int = 8):
         super().__init__()
         self.encoder = encoder
