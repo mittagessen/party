@@ -16,6 +16,7 @@
 Training loop interception helpers
 """
 
+import timm
 import torch
 import logging
 import lightning.pytorch as L
@@ -24,12 +25,11 @@ from torch import nn
 from lightning.pytorch.callbacks import EarlyStopping
 from torch.optim import lr_scheduler
 
-from typing import Literal
+from typing import Literal, Tuple
 
 from torchmetrics.aggregation import MeanMetric
 
 from party.fusion import bytellama_vision_decoder, PartyModel
-from party.modules import Backbone
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +75,8 @@ class RecognitionModel(L.LightningModule):
                  cos_t_max: float = 30,
                  cos_min_lr: float = 1e-4,
                  warmup: int = 15000,
+                 encoder: str = 'convnextv2_tiny.fcmae_ft_in22k_in1k_384',
+                 encoder_input_size: Tuple[int, int] = (2560, 1920),
                  decoder: str = 'mittagessen/bytellama-40m-oscar',
                  pretrained: bool = True,
                  freeze_encoder: bool = False,
@@ -88,14 +90,23 @@ class RecognitionModel(L.LightningModule):
 
         self.save_hyperparameters()
 
-        encoder_model = Backbone()
+        # enable fused attn in encoder
+        timm.layers.use_fused_attn(experimental=True)
+
+        encoder_model = timm.create_model(encoder,
+                                          pretrained=pretrained,
+                                          num_classes=0,
+                                          global_pool='')
+
+        l_idx = encoder_model.prune_intermediate_layers(indices=(-2,), prune_head=True, prune_norm=True)[0] - 1
+        l_red = encoder_model.feature_info[l_idx]['reduction']
 
         decoder_model = bytellama_vision_decoder(pretrained=decoder if pretrained else None,
-                                                 encoder_max_seq_len=24000)
+                                                 encoder_max_seq_len=encoder_input_size[0] // l_red * encoder_input_size[1] // l_red)
 
         self.model = PartyModel(encoder=encoder_model,
                                 decoder=decoder_model,
-                                encoder_embed_dim=encoder_model.output_dims[-1],
+                                encoder_embed_dim=encoder_model.feature_info[l_idx]['num_chs'],
                                 decoder_embed_dim=decoder_model.tok_embeddings.embedding_dim)
 
         if freeze_encoder:
