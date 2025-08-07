@@ -42,6 +42,8 @@ from PIL import Image
 from scipy.special import comb
 
 from party.tokenizer import OctetTokenizer, LANG_TO_ISO
+from party.sampler import LossAwareSampler
+
 
 if TYPE_CHECKING:
     from os import PathLike
@@ -243,7 +245,7 @@ def collate_null(batch):
     return batch[0]
 
 
-def collate_sequences(im, page_data, max_seq_len: int):
+def collate_sequences(im, page_data, max_seq_len: int, index: int):
     """
     Sorts and pads image data.
     """
@@ -260,7 +262,8 @@ def collate_sequences(im, page_data, max_seq_len: int):
     return {'image': im,
             'tokens': labels,
             'curves': curves,
-            'boxes': boxes}
+            'boxes': boxes,
+            'index': index}
 
 
 class TextLineDataModule(L.LightningDataModule):
@@ -302,8 +305,10 @@ class TextLineDataModule(L.LightningDataModule):
 
     def train_dataloader(self):
         return DataLoader(self.train_set,
-                          batch_size=1,
                           num_workers=self.hparams.num_workers,
+                          batch_size=1,
+                          sampler=LossAwareSampler(self.train_set),
+                          prefetch_factor=1,
                           pin_memory=True,
                           shuffle=False,
                           collate_fn=collate_null)
@@ -372,11 +377,7 @@ class BinnedBaselineDataset(Dataset):
             self.aug = DefaultAugmenter()
 
     def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # just sample from a random page
-        rng = np.random.default_rng()
-        idx = rng.integers(0, len(self.arrow_table))
-
-        item = self.arrow_table.column('pages')[idx].as_py()
+        item = self.arrow_table.column('pages')[index].as_py()
         logger.debug(f'Attempting to load {item["im"]}')
         im, lang, page_data = item['im'], item['lang'], item['lines']
         try:
@@ -393,6 +394,7 @@ class BinnedBaselineDataset(Dataset):
         # sample randomly between baselines
         sample = []
         if self.prompt_mode == 'both':
+            rng = np.random.default_rng()
             return_boxes = rng.choice([False, True], 1)
         elif self.prompt_mode == 'boxes':
             return_boxes = True
@@ -404,9 +406,23 @@ class BinnedBaselineDataset(Dataset):
             curve = torch.tensor(line['curve']).view(4, 2) if not return_boxes else None
             bbox = torch.tensor(line['bbox']).view(4, 2) if return_boxes else None
             sample.append((tokens, curve, bbox))
-        return collate_sequences(im.unsqueeze(0), sample, self.max_seq_len)
+        return collate_sequences(im.unsqueeze(0), sample, self.max_seq_len, index)
 
     def __len__(self) -> int:
+        return len(self.arrow_table)
+
+    @property
+    def num_pages(self):
+        """
+        Number of pages in the dataset.
+        """
+        return len(self.arrow_table)
+
+    @property
+    def num_batches(self):
+        """
+        Number of batches in the dataset.
+        """
         return self._len // self.batch_size
 
 

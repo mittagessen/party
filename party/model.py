@@ -129,6 +129,7 @@ class RecognitionModel(L.LightningModule):
 
     def training_step(self, batch, batch_idx):
         loss = self.model_step(self.model, self.criterion, batch)
+        self.trainer.train_dataloader.sampler.update_loss(batch['index'], loss)
         self.log('train_loss',
                  loss,
                  batch_size=batch['tokens'].shape[0],
