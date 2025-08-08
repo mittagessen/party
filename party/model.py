@@ -133,7 +133,7 @@ class RecognitionModel(L.LightningModule):
         if isinstance(self.trainer.train_dataloader.sampler, LossAwareSampler):
             self.trainer.train_dataloader.sampler.update_loss(batch['index'], loss)
         else:
-            self.trainer.train_dataloader.sampler._sampler.update_loss(batch['index'], loss)
+            self.trainer.train_dataloader.sampler.dataset._sampler.update_loss(batch['index'], loss)
 
         self.log('train_loss',
                  loss,
