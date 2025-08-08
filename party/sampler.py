@@ -66,5 +66,4 @@ class LossAwareSampler(Sampler[int]):
         if loss < self.loss_thresh:
             self.last_perfect_sample_it = 0
             # locking isn't necessary as we can deal with single samples being
-            # labelled perfect/imperfect
-            self.perfect_samples[batch_idx] = True
+        self.perfect_samples[batch_idx] = loss < self.loss_thresh
