@@ -1,8 +1,9 @@
 import torch
 import numpy as np
-import torch.distributed as dist
 
-from torch.utils.data import Sampler, Dataset
+import torch.multiprocessing as mp
+
+from torch.utils.data import Sampler, Dataset, get_worker_info
 from collections.abc import Sized, Iterator
 
 
@@ -17,6 +18,7 @@ class LossAwareSampler(Sampler[int]):
         perfect_sample_delay: Number of iterations to wait before another
                               perfect sample can be drawn from the dataset.
         loss_thresh: Upper limit for a sample to be considered perfect.
+        perfect_samples: A boolean tensor in shared memory.
     """
 
     weights: torch.Tensor
@@ -25,10 +27,10 @@ class LossAwareSampler(Sampler[int]):
 
     def __init__(self,
                  data_source: Dataset,
+                 perfect_samples: torch.BoolTensor,
                  perfect_sample_delay: float = 5,
                  loss_thresh: float = 0.005) -> None:
-        self.data_source = data_source
-        self.perfect_samples = torch.zeros(data_source.num_pages, dtype=torch.bool)
+        self.perfect_samples = perfect_samples
         self.num_samples = data_source.num_batches
         self.perfect_sample_delay = perfect_sample_delay
         self.last_perfect_sample_it = 0
@@ -61,9 +63,6 @@ class LossAwareSampler(Sampler[int]):
 
         if loss < self.loss_thresh:
             self.last_perfect_sample_it = 0
-        
-        pos_and_loss = [None for _ in range(dist.get_world_size())]
-
-        dist.all_gather_object(pos_and_loss, (batch_idx, loss < self.loss_thresh))
-        for idx, perfect_sample in pos_and_loss:
-            self.perfect_samples[idx] = perfect_sample
+            # locking isn't necessary as we can deal with single samples being
+            # labelled perfect/imperfect
+            self.perfect_samples[batch_idx] = True

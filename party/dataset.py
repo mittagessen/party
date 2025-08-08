@@ -34,8 +34,7 @@ from typing import (TYPE_CHECKING, Any, Callable, List, Literal, Optional,
 
 from functools import partial
 from torchvision.transforms import v2
-from torch.utils.data import Dataset, DataLoader, IterableDataset, get_worker_info
-
+from torch.utils.data import Dataset, DataLoader, IterableDataset
 
 from PIL import Image
 
@@ -304,10 +303,13 @@ class TextLineDataModule(L.LightningDataModule):
         self.val_set.max_seq_len = self.train_set.max_seq_len
 
     def train_dataloader(self):
+        # shared tensor for perfect sample labeling 
+        perfect_samples = torch.zeros(self.train_set.num_pages, dtype=torch.bool).share_memory_()
         return DataLoader(self.train_set,
                           num_workers=self.hparams.num_workers,
                           batch_size=1,
-                          sampler=LossAwareSampler(self.train_set),
+                          sampler=LossAwareSampler(self.train_set,
+                                                   perfect_samples=perfect_samples),
                           prefetch_factor=1,
                           pin_memory=True,
                           shuffle=False,
