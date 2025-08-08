@@ -64,6 +64,6 @@ class LossAwareSampler(Sampler[int]):
         
         pos_and_loss = [None for _ in range(dist.get_world_size())]
 
-        dist.all_gather_object(pos_and_loss, (self.batch_idx, loss < self.loss_thresh))
+        dist.all_gather_object(pos_and_loss, (batch_idx, loss < self.loss_thresh))
         for idx, perfect_sample in pos_and_loss:
             self.perfect_samples[idx] = perfect_sample
