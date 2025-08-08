@@ -305,11 +305,13 @@ class TextLineDataModule(L.LightningDataModule):
     def train_dataloader(self):
         # shared tensor for perfect sample labeling 
         perfect_samples = torch.zeros(self.train_set.num_pages, dtype=torch.bool).share_memory_()
+        perfect_sample_it = torch.zeros(1).share_memory_()
         return DataLoader(self.train_set,
                           num_workers=self.hparams.num_workers,
                           batch_size=1,
                           sampler=LossAwareSampler(self.train_set,
-                                                   perfect_samples=perfect_samples),
+                                                   perfect_samples=perfect_samples
+                                                   perfect_sample_it=perfect_sample_it),
                           prefetch_factor=1,
                           pin_memory=True,
                           shuffle=False,

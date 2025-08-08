@@ -28,12 +28,14 @@ class LossAwareSampler(Sampler[int]):
     def __init__(self,
                  data_source: Dataset,
                  perfect_samples: torch.BoolTensor,
+                 perfect_sample_it: torch.IntTensor,
                  perfect_sample_delay: float = 5,
                  loss_thresh: float = 0.005) -> None:
+        self.data_source = data_source
         self.perfect_samples = perfect_samples
         self.num_samples = data_source.num_batches
         self.perfect_sample_delay = perfect_sample_delay
-        self.last_perfect_sample_it = 0
+        self.last_perfect_sample_it = perfect_sample_it
         self.loss_thresh = loss_thresh
     
     def __len__(self) -> int:
