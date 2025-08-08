@@ -310,7 +310,7 @@ class TextLineDataModule(L.LightningDataModule):
                           num_workers=self.hparams.num_workers,
                           batch_size=1,
                           sampler=LossAwareSampler(self.train_set,
-                                                   perfect_samples=perfect_samples
+                                                   perfect_samples=perfect_samples,
                                                    perfect_sample_it=perfect_sample_it),
                           prefetch_factor=1,
                           pin_memory=True,
