@@ -30,7 +30,6 @@ from typing import Literal, Tuple
 from torchmetrics.aggregation import MeanMetric
 
 from party.fusion import bytellama_vision_decoder, PartyModel
-from party.sampler import LossAwareSampler
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +75,7 @@ class RecognitionModel(L.LightningModule):
                  cos_t_max: float = 30,
                  cos_min_lr: float = 1e-4,
                  warmup: int = 15000,
-                 encoder: str = 'convnextv2_pico.fcmae_ft_in1k',
+                 encoder: str = 'convnextv2_nano.fcmae_ft_in22k_in1k',
                  encoder_input_size: Tuple[int, int] = (2560, 1920),
                  decoder: str = 'mittagessen/bytellama-10m-oscar',
                  pretrained: bool = True,
@@ -130,11 +129,6 @@ class RecognitionModel(L.LightningModule):
 
     def training_step(self, batch, batch_idx):
         loss = self.model_step(self.model, self.criterion, batch)
-        if isinstance(self.trainer.train_dataloader.sampler, LossAwareSampler):
-            self.trainer.train_dataloader.sampler.update_loss(batch['index'], loss)
-        else:
-            self.trainer.train_dataloader.sampler.dataset._sampler.update_loss(batch['index'], loss)
-
         self.log('train_loss',
                  loss,
                  batch_size=batch['tokens'].shape[0],

@@ -347,6 +347,7 @@ def train(ctx, load_from_checkpoint, load_from_safetensors, load_from_repo,
                       callbacks=cbs,
                       gradient_clip_val=hyper_params['gradient_clip_val'],
                       num_sanity_val_steps=0,
+                      use_distributed_sampler=False,
                       **val_check_interval)
 
     with trainer.init_module(empty_init=True):

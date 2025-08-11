@@ -34,14 +34,14 @@ from typing import (TYPE_CHECKING, Any, Callable, List, Literal, Optional,
 
 from functools import partial
 from torchvision.transforms import v2
-from torch.utils.data import Dataset, DataLoader, IterableDataset, get_worker_info
+from torch.utils.data import (Dataset, DataLoader, IterableDataset,
+                              get_worker_info, RandomSampler)
 
 from PIL import Image
 
 from scipy.special import comb
 
 from party.tokenizer import OctetTokenizer, LANG_TO_ISO
-from party.sampler import LossAwareSampler
 
 
 if TYPE_CHECKING:
@@ -303,16 +303,14 @@ class TextLineDataModule(L.LightningDataModule):
         self.val_set.max_seq_len = self.train_set.max_seq_len
 
     def train_dataloader(self):
-        perfect_samples = torch.zeros(self.train_set.num_pages, dtype=torch.bool).share_memory_()
-        perfect_sample_it = torch.zeros(1).share_memory_()
+        world_size = get_world_size() if is_initialized() else 1
 
         return DataLoader(self.train_set,
                           num_workers=self.hparams.num_workers,
                           batch_size=1,
-                          sampler=LossAwareSampler(self.train_set,
-                                                   perfect_samples=perfect_samples,
-                                                   perfect_sample_it=perfect_sample_it),
-                          prefetch_factor=1,
+                          sampler=RandomSampler(self.train_set,
+                                                replacement=True,
+                                                num_samples=self.train_set.num_batches // world_size),
                           pin_memory=True,
                           shuffle=False,
                           collate_fn=collate_null)
@@ -331,8 +329,15 @@ class BinnedBaselineDataset(Dataset):
     """
     Dataset for training a line recognition model from baseline data.
 
-    Images are binned, so the batch_size parameter of the data loader is an
-    upper limit of the number of samples returned.
+    Images are binned, i.e. a sample return `batch_size` lines sampled with
+    replacement from a single page at index `n` of the dataset. As lines are
+    sampled with replacement it is not useful to set batch sizes above the
+    average number of lines contained on a page.
+
+    The length of the dataset is the number of pages contained in the source
+    files. A property `num_batches` contains the number of random samples
+    required to roughly sample each line once over an epoch (under the
+    assumption that each page contains the same number of lines).
 
     Args:
         im_transforms: Function taking an PIL.Image and returning a tensor
@@ -413,13 +418,6 @@ class BinnedBaselineDataset(Dataset):
         return collate_sequences(im.unsqueeze(0), sample, self.max_seq_len, index)
 
     def __len__(self) -> int:
-        return len(self.arrow_table)
-
-    @property
-    def num_pages(self):
-        """
-        Number of pages in the dataset.
-        """
         return len(self.arrow_table)
 
     @property
