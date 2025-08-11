@@ -128,8 +128,8 @@ def bytellama_vision_decoder(vocab_size: int = TOKEN_NUM,
         decoder_layer = TransformerSelfAttentionLayer(
             attn=self_attn,
             mlp=mlp,
-            sa_norm=RMSNorm(dim=embed_dim, eps=1e-5),
-            mlp_norm=RMSNorm(dim=embed_dim, eps=1e-5),
+            sa_norm=RMSNorm(dim=config['embed_dim'], eps=1e-5),
+            mlp_norm=RMSNorm(dim=config['embed_dim'], eps=1e-5),
         )
 
         # cross attention layers, mixing text and vision,
@@ -137,7 +137,7 @@ def bytellama_vision_decoder(vocab_size: int = TOKEN_NUM,
         if idx % config['fusion_interval'] == 0:
             attn = MultiHeadAttention(
                 embed_dim=config['embed_dim'],
-                num_heads=num_heads,
+                num_heads=config['num_heads'],
                 num_kv_heads=num_kv_heads,
                 head_dim=head_dim,
                 q_proj=nn.Linear(config['embed_dim'], config['num_heads'] * head_dim, bias=False),
@@ -156,8 +156,8 @@ def bytellama_vision_decoder(vocab_size: int = TOKEN_NUM,
             xattn_layer = TransformerCrossAttentionLayer(
                 attn=attn,
                 mlp=mlp,
-                ca_norm=RMSNorm(dim=embed_dim),
-                mlp_norm=RMSNorm(dim=embed_dim),
+                ca_norm=RMSNorm(dim=config['embed_dim']),
+                mlp_norm=RMSNorm(dim=config['embed_dim']),
                 ca_scale=TanhGate(),
                 mlp_scale=TanhGate(),
             )
