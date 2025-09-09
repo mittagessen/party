@@ -12,6 +12,32 @@ import torch
 from torch import nn
 
 
+class PositionEmbeddingRandom(nn.Module):
+    """
+    Precomputed 2D positional encoding using random spatial frequencies.
+    """
+    def __init__(self, embed_dim: int = 64, size: tuple[int, int] = (160, 120)) -> None:
+        super().__init__()
+        h, w = size
+        self.register_buffer("positional_encoding_gaussian_matrix", torch.randn((2, embed_dim // 2)),)
+        device: Any = self.positional_encoding_gaussian_matrix.device
+        grid = torch.ones((h, w), device=device, dtype=torch.float32)
+        y_embed = grid.cumsum(dim=0) - 0.5
+        x_embed = grid.cumsum(dim=1) - 0.5
+        y_embed = y_embed / h
+        x_embed = x_embed / w
+
+        coords = torch.stack([x_embed, y_embed], dim=-1)
+        coords = 2 * coords - 1
+        coords = coords.to(self.positional_encoding_gaussian_matrix.dtype)
+        coords = coords @ self.positional_encoding_gaussian_matrix
+        coords = 2 * torch.pi * coords
+        self.pe = torch.cat([torch.sin(coords), torch.cos(coords)], dim=-1).flatten(0, 1)
+
+    def forward(self, x: torch.Tensor, *, input_pos: Optional[torch.Tensor] = None) -> torch.Tensor:
+        return self.pe.repeat(x.shape[0], 1, 1)
+
+
 class Llama3ScaledRoPE(nn.Module):
     """
     This class implements Rotary Positional Embeddings (RoPE)

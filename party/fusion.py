@@ -108,6 +108,8 @@ def bytellama_vision_decoder(vocab_size: int = TOKEN_NUM,
     layers = []
 
     rope = Llama3ScaledRoPE(dim=head_dim, max_seq_len=config['max_seq_len'], base=config['rope_base'])
+    cross_pos = PositionEmbeddingRandom(embed_dim=head_dim)
+
     for idx in range(1, num_layers + 1):
 
         # Self attention layers for text decoder
@@ -147,6 +149,7 @@ def bytellama_vision_decoder(vocab_size: int = TOKEN_NUM,
                 q_norm=RMSNorm(dim=head_dim, eps=1e-05),
                 k_norm=RMSNorm(dim=head_dim, eps=1e-05),
                 pos_embeddings=None,
+                cross_pos_embeddings=cross_pos,
                 max_seq_len=config['encoder_max_seq_len'],
                 is_causal=False,
                 attn_dropout=0.0,

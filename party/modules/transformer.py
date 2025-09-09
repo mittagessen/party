@@ -143,11 +143,7 @@ class TransformerCrossAttentionLayer(nn.Module):
         mlp_norm (Optional[nn.Module]): Normalization to be applied before the feed-forward layer.
         ca_scale (Optional[nn.Module]): Module to scale cross-attention output.
         mlp_scale (Optional[nn.Module]): Module to scale the feed-forward output.
-
-    Raises:
-        AssertionError: if attn.pos_embeddings is set.
     """
-
     def __init__(
         self,
         attn: MultiHeadAttention,
@@ -159,11 +155,6 @@ class TransformerCrossAttentionLayer(nn.Module):
         mlp_scale: Optional[nn.Module] = None,
     ) -> None:
         super().__init__()
-        if attn.pos_embeddings is not None:
-            raise AssertionError(
-                "Doesn't support positional embeddings for cross attention, \
-                because q and k are different sequences."
-            )
         self.attn = attn
         self.mlp = mlp
         self.ca_norm = ca_norm or nn.Identity()
