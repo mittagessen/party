@@ -11,6 +11,7 @@ import torch
 
 from torch import nn
 
+from typing import Any
 
 class PositionEmbeddingRandom(nn.Module):
     """

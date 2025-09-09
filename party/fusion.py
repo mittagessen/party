@@ -25,7 +25,8 @@ from party.modules import (MultiHeadAttention, RMSNorm, TanhGate,
                            TransformerCrossAttentionLayer, TransformerDecoder,
                            FeedForward, TransformerSelfAttentionLayer,
                            FusionLayer, scale_hidden_dim_for_mlp,
-                           Llama3ScaledRoPE, llama3_mlp, PromptEncoder)
+                           Llama3ScaledRoPE, llama3_mlp, PromptEncoder,
+                           PositionEmbeddingRandom)
 
 from party.tokenizer import OctetTokenizer, TOKEN_NUM
 
