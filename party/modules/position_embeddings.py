@@ -33,10 +33,10 @@ class PositionEmbeddingRandom(nn.Module):
         coords = coords.to(self.positional_encoding_gaussian_matrix.dtype)
         coords = coords @ self.positional_encoding_gaussian_matrix
         coords = 2 * torch.pi * coords
-        self.pe = torch.cat([torch.sin(coords), torch.cos(coords)], dim=-1).flatten(0, 1)
+        self.pe = torch.cat([torch.sin(coords), torch.cos(coords)], dim=-1).flatten(0, 1).unsqueeze(1)
 
     def forward(self, x: torch.Tensor, *, input_pos: Optional[torch.Tensor] = None) -> torch.Tensor:
-        return self.pe.repeat(x.shape[0], 1, 1)
+        return x + self.pe.repeat(x.shape[0], 1, x.shape[2], 1)
 
 
 class Llama3ScaledRoPE(nn.Module):
