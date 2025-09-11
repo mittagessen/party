@@ -75,8 +75,9 @@ class RecognitionModel(L.LightningModule):
                  cos_t_max: float = 30,
                  cos_min_lr: float = 1e-4,
                  warmup: int = 15000,
-                 encoder: str = 'convnextv2_base.fcmae_ft_in22k_in1k',
-                 encoder_input_size: Tuple[int, int] = (2560, 1920),
+                 encoder: str = 'convnextv2_tiny.fcmae_ft_in22k_in1k_384',
+                 encoder_input_size: Tuple[int, int] = (1920, 1440),
+                 encoder_idxs: list[int] = (1, 2, 3),
                  decoder: str = 'mittagessen/bytellama-40m-oscar',
                  pretrained: bool = True,
                  freeze_encoder: bool = False,
@@ -90,24 +91,22 @@ class RecognitionModel(L.LightningModule):
 
         self.save_hyperparameters()
 
-        # enable fused attn in encoder
-        timm.layers.use_fused_attn(experimental=True)
-
         encoder_model = timm.create_model(encoder,
                                           pretrained=pretrained,
-                                          num_classes=0,
-                                          global_pool='')
+                                          features_only=True,
+                                          out_indices=encoder_idxs)
+        strides = [encoder_model.feature_info.info.rreduction(idx) for idx in encoder_idxs]
 
-        l_idx = encoder_model.prune_intermediate_layers(indices=(-2,), prune_head=True, prune_norm=True)[0] - 1
-        l_red = encoder_model.feature_info[l_idx]['reduction']
-        encoder_model.head = nn.Identity()
+        encoder_sizes = [(int(encoder_input_size[0]/strides[idx]),
+                          int(encoder_input_size[1]/strides[idx]),
+                          encoder_model.feature_info.info.features(idx)) for idx in encoder_idxs]
 
         decoder_model = bytellama_vision_decoder(pretrained=decoder if pretrained else None,
-                                                 encoder_max_seq_len=encoder_input_size[0] // l_red * encoder_input_size[1] // l_red)
+                                                 encoder_sizes=encoder_sizes)
 
         self.model = PartyModel(encoder=encoder_model,
                                 decoder=decoder_model,
-                                encoder_embed_dim=encoder_model.feature_info[l_idx]['num_chs'],
+                                encoder_embed_dims=[x[2] for x in encoder_sizes],
                                 decoder_embed_dim=decoder_model.tok_embeddings.embedding_dim)
 
         if freeze_encoder:

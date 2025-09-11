@@ -13,14 +13,22 @@ from torch import nn
 
 from typing import Any
 
-class PositionEmbeddingRandom(nn.Module):
+
+class ChainedPositionEmbeddingRandom(nn.Module):
     """
-    Precomputed 2D positional encoding using random spatial frequencies.
+    Precomputed 2D positional encodings of a concatenated feature pyramid.
+
+    Args:
+        embed_dim: size of the embedding
+        sizes: List of the extends (h, w) of each feature map.
     """
-    def __init__(self, embed_dim: int = 64, size: tuple[int, int] = (160, 120)) -> None:
+    def __init__(self, embed_dim: int, sizes: list[tuple[int, int]]):
         super().__init__()
-        h, w = size
         self.register_buffer("positional_encoding_gaussian_matrix", torch.randn((2, embed_dim // 2)),)
+        self.pes = torch.cat([self._compute_pe(size) for size in sizes])
+
+    def _compute_pe(self, size):
+        h, w = size
         device: Any = self.positional_encoding_gaussian_matrix.device
         grid = torch.ones((h, w), device=device, dtype=torch.float32)
         y_embed = grid.cumsum(dim=0) - 0.5
@@ -33,10 +41,10 @@ class PositionEmbeddingRandom(nn.Module):
         coords = coords.to(self.positional_encoding_gaussian_matrix.dtype)
         coords = coords @ self.positional_encoding_gaussian_matrix
         coords = 2 * torch.pi * coords
-        self.pe = torch.cat([torch.sin(coords), torch.cos(coords)], dim=-1).flatten(0, 1).unsqueeze(1)
+        return torch.cat([torch.sin(coords), torch.cos(coords)], dim=-1).flatten(0, 1).unsqueeze(1)
 
     def forward(self, x: torch.Tensor, *, input_pos: Optional[torch.Tensor] = None) -> torch.Tensor:
-        return x + self.pe.repeat(x.shape[0], 1, x.shape[2], 1)
+        return x + self.pes.expand(x.shape[0], -1, x.shape[2], -1)
 
 
 class Llama3ScaledRoPE(nn.Module):
