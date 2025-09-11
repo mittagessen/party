@@ -95,11 +95,11 @@ class RecognitionModel(L.LightningModule):
                                           pretrained=pretrained,
                                           features_only=True,
                                           out_indices=encoder_idxs)
-        strides = [encoder_model.feature_info.reduction(idx) for idx in range(encoder_idxs)]
+        strides = [encoder_model.feature_info.reduction(idx) for idx in range(len(encoder_idxs))]
 
         encoder_sizes = [(int(encoder_input_size[0]/strides[idx]),
                           int(encoder_input_size[1]/strides[idx]),
-                          encoder_model.feature_info.channels(idx)) for idx in range(encoder_idxs)]
+                          encoder_model.feature_info.channels(idx)) for idx in range(len(encoder_idxs))]
 
         decoder_model = bytellama_vision_decoder(pretrained=decoder if pretrained else None,
                                                  encoder_sizes=encoder_sizes)
