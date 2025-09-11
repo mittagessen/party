@@ -76,7 +76,7 @@ class RecognitionModel(L.LightningModule):
                  cos_min_lr: float = 1e-4,
                  warmup: int = 15000,
                  encoder: str = 'convnextv2_tiny.fcmae_ft_in22k_in1k_384',
-                 encoder_input_size: Tuple[int, int] = (1920, 1440),
+                 encoder_input_size: tuple[int, int] = (1920, 1440),
                  encoder_idxs: list[int] = (1, 2, 3),
                  decoder: str = 'mittagessen/bytellama-40m-oscar',
                  pretrained: bool = True,
@@ -95,11 +95,10 @@ class RecognitionModel(L.LightningModule):
                                           pretrained=pretrained,
                                           features_only=True,
                                           out_indices=encoder_idxs)
-        strides = [encoder_model.feature_info.reduction(idx) for idx in range(len(encoder_idxs))]
 
-        encoder_sizes = [(int(encoder_input_size[0]/strides[idx]),
-                          int(encoder_input_size[1]/strides[idx]),
-                          encoder_model.feature_info.channels(idx)) for idx in range(len(encoder_idxs))]
+        encoder_sizes = [(int(encoder_input_size[0]/encoder_model.feature_info.reduction(idx)),
+                          int(encoder_input_size[1]/encoder_model.feature_info.reduction(idx)),
+                          encoder_model.feature_info.channels(idx)) for idx in encoder_idxs]
 
         decoder_model = bytellama_vision_decoder(pretrained=decoder if pretrained else None,
                                                  encoder_sizes=[x[:2] for x in encoder_sizes])
