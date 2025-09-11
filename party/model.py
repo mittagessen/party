@@ -95,7 +95,7 @@ class RecognitionModel(L.LightningModule):
                                           pretrained=pretrained,
                                           features_only=True,
                                           out_indices=encoder_idxs)
-        strides = [encoder_model.feature_info.info.rreduction(idx) for idx in encoder_idxs]
+        strides = [encoder_model.feature_info.info.reduction(idx) for idx in encoder_idxs]
 
         encoder_sizes = [(int(encoder_input_size[0]/strides[idx]),
                           int(encoder_input_size[1]/strides[idx]),
