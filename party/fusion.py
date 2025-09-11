@@ -243,7 +243,7 @@ class PartyAdapter(nn.Module):
         for idx, hidden_state in enumerate(encoder_hidden_states):
             hidden_state = hidden_state.flatten(-2).transpose(-1, -2)
             os.append(self.adapter[idx](hidden_state))
-        return torch.cat(os)
+        return torch.cat(os, dim=1)
 
 
 class PartyModel(nn.Module):
