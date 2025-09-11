@@ -102,7 +102,7 @@ class RecognitionModel(L.LightningModule):
                           encoder_model.feature_info.channels(idx)) for idx in range(len(encoder_idxs))]
 
         decoder_model = bytellama_vision_decoder(pretrained=decoder if pretrained else None,
-                                                 encoder_sizes=encoder_sizes)
+                                                 encoder_sizes=[x[:2] for x in encoder_sizes])
 
         self.model = PartyModel(encoder=encoder_model,
                                 decoder=decoder_model,
