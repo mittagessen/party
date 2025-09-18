@@ -16,6 +16,7 @@
 Utility functions for data loading and training of VGSL networks.
 """
 import io
+import gc
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -53,6 +54,8 @@ __all__ = ['TextLineDataModule']
 import logging
 
 logger = logging.getLogger(__name__)
+
+pa.jemalloc_set_decay_ms(0)
 
 try:
     import pillow_jxl # NOQA
@@ -258,6 +261,7 @@ def collate_sequences(im, page_data, max_seq_len: int, index: int):
         curves = torch.stack([x for _, x, _ in page_data])
     if page_data[0][2] is not None:
         boxes = torch.stack([x for _, _, x in page_data])
+    gc.collect()
     return {'image': im,
             'tokens': labels,
             'curves': curves,
