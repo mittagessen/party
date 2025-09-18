@@ -262,6 +262,11 @@ def collate_sequences(im, page_data, max_seq_len: int, index: int):
     if page_data[0][2] is not None:
         boxes = torch.stack([x for _, _, x in page_data])
     gc.collect()
+    worker_info = get_worker_info()
+    worker_rank, num_workers = (worker_info.id, worker_info.num_workers) if worker_info else (0, 1)
+    with open(f'worker_{worker_rank}.log', 'a') as fo:
+        fo.write(f'{pa.total_allocated_bytes()}\n')
+
     return {'image': im,
             'tokens': labels,
             'curves': curves,
