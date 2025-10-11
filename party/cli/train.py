@@ -350,7 +350,7 @@ def train(ctx, load_from_checkpoint, load_from_safetensors, load_from_repo,
                       use_distributed_sampler=False,
                       **val_check_interval)
 
-    with trainer.init_module(empty_init=True):
+    with trainer.init_module(empty_init=False if train_from_scratch else True):
         if train_from_scratch:
             message('Initializing new model.')
             model = RecognitionModel(**hyper_params)
