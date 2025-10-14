@@ -94,7 +94,7 @@ class RecognitionModel(L.LightningModule):
         encoder_model = nn.Sequential(HGNetv2(name='B2',
                                               return_idx=encoder_idxs,
                                               freeze_stem_only=True,
-                                              pretrained=False,
+                                              pretrained=True,
                                               freeze_at=-1,
                                               use_lab=True),
                                       HybridEncoder(in_channels=[384, 768, 1536],
