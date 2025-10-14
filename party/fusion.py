@@ -48,7 +48,7 @@ def bytellama_vision_decoder(vocab_size: int = TOKEN_NUM,
                              attn_dropout: float = 0.0,
                              norm_eps: int = 1e-5,
                              rope_base: int = 10000,
-                             encoder_sizes: list[tuple[int, int]] = None,  # start of fusion parameters
+                             encoder_max_seq_len: int = 56700,
                              fusion_interval: int = 3,
                              pretrained: Optional[str] = None,
                              **kwargs) -> TransformerDecoder:
@@ -82,8 +82,6 @@ def bytellama_vision_decoder(vocab_size: int = TOKEN_NUM,
     Returns:
         TransformerDecoder: Instantiation of Llama 3.2 vision decoder.
     """
-    encoder_max_seq_len = sum([x[0] * x[1] for x in encoder_sizes])
-
     config = {'vocab_size': vocab_size,
               'num_layers': num_layers,
               'num_heads': num_heads,
@@ -109,7 +107,6 @@ def bytellama_vision_decoder(vocab_size: int = TOKEN_NUM,
     layers = []
 
     rope = Llama3ScaledRoPE(dim=head_dim, max_seq_len=config['max_seq_len'], base=config['rope_base'])
-    cross_pos = ChainedPositionEmbeddingRandom(embed_dim=head_dim, sizes=encoder_sizes)
 
     for idx in range(1, num_layers + 1):
 
@@ -150,7 +147,6 @@ def bytellama_vision_decoder(vocab_size: int = TOKEN_NUM,
                 q_norm=RMSNorm(dim=head_dim, eps=1e-05),
                 k_norm=RMSNorm(dim=head_dim, eps=1e-05),
                 pos_embeddings=rope,
-                cross_pos_embeddings=cross_pos,
                 max_seq_len=config['encoder_max_seq_len'],
                 is_causal=False,
                 attn_dropout=0.0,

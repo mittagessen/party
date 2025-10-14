@@ -29,6 +29,7 @@ from typing import Literal, Tuple
 
 from torchmetrics.aggregation import MeanMetric
 
+from party.modules import HGNetv2, HybridEncoder
 from party.fusion import bytellama_vision_decoder, PartyModel
 
 logger = logging.getLogger(__name__)
@@ -75,7 +76,6 @@ class RecognitionModel(L.LightningModule):
                  cos_t_max: float = 30,
                  cos_min_lr: float = 1e-4,
                  warmup: int = 15000,
-                 encoder: str = 'convnextv2_tiny.fcmae_ft_in22k_in1k_384',
                  encoder_input_size: tuple[int, int] = (1920, 1440),
                  encoder_idxs: list[int] = (1, 2, 3),
                  decoder: str = 'mittagessen/bytellama-40m-oscar',
@@ -91,21 +91,31 @@ class RecognitionModel(L.LightningModule):
 
         self.save_hyperparameters()
 
-        encoder_model = timm.create_model(encoder,
-                                          pretrained=pretrained,
-                                          features_only=True,
-                                          out_indices=encoder_idxs)
-
-        encoder_sizes = [(int(encoder_input_size[0]/encoder_model.feature_info.reduction(idx)),
-                          int(encoder_input_size[1]/encoder_model.feature_info.reduction(idx)),
-                          encoder_model.feature_info.channels(idx)) for idx in encoder_idxs]
+        encoder_model = nn.Sequential(HGNetv2(name='B2',
+                                              return_idx=encoder_idxs,
+                                              freeze_stem_only=True,
+                                              pretrained=False,
+                                              freeze_at=-1,
+                                              use_lab=True),
+                                      HybridEncoder(in_channels=[384, 768, 1536],
+                                                    feat_strides=[8, 16, 32],
+                                                    hidden_dim=256,
+                                                    use_encoder_idx=[2],
+                                                    dim_feedforward=1024,
+                                                    expansion=1.0,
+                                                    depth_mult=0.67,
+                                                    num_encoder_layers=1,
+                                                    nhead=8,
+                                                    dropout=0.0,
+                                                    enc_act="gelu",
+                                                    act="silu"))
 
         decoder_model = bytellama_vision_decoder(pretrained=decoder if pretrained else None,
-                                                 encoder_sizes=[x[:2] for x in encoder_sizes])
+                                                 encoder_max_seq_len=56700)
 
         self.model = PartyModel(encoder=encoder_model,
                                 decoder=decoder_model,
-                                encoder_embed_dims=[x[2] for x in encoder_sizes],
+                                encoder_embed_dims=(256, 256, 256),
                                 decoder_embed_dim=decoder_model.tok_embeddings.embedding_dim)
 
         if freeze_encoder:

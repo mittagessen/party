@@ -7,3 +7,5 @@ from .transformer import TransformerCrossAttentionLayer, TransformerSelfAttentio
 from .feed_forward import FeedForward  # NOQA
 from .prompt import PromptEncoder  # NOQA
 from .position_embeddings import ChainedPositionEmbeddingRandom  # NOQA
+from .hybrid_encoder import HybridEncoder  # NOQA
+from .hgnetv2 import HGNetv2  # NOQA
