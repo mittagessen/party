@@ -218,7 +218,7 @@ def compile(files: Optional[List[Union[str, 'PathLike']]] = None,
                         ar = pa.array([pa.scalar({'im': im,
                                                   'lang': lang,
                                                   'lines': page_data,
-                                                  'path': im_path}, page_struct)], page_struct)
+                                                  'path': str(im_path)}, page_struct)], page_struct)
                         writer.write(pa.RecordBatch.from_arrays([ar], schema=schema))
                         max_lines_in_page = max(len(page_data), max_lines_in_page)
                     callback(1, len(files))
