@@ -142,8 +142,7 @@ def compile(files: Optional[List[Union[str, 'PathLike']]] = None,
                              ('bbox', pa.list_(pa.float32()))])
     page_struct = pa.struct([('im', pa.binary()),
                              ('lang', pa.string()),
-                             ('lines', pa.list_(line_struct)),
-                             ('path', pa.string())])
+                             ('lines', pa.list_(line_struct))])
 
     tokenizer = OctetTokenizer()
 
@@ -217,8 +216,7 @@ def compile(files: Optional[List[Union[str, 'PathLike']]] = None,
                             im = fp.read()
                         ar = pa.array([pa.scalar({'im': im,
                                                   'lang': lang,
-                                                  'lines': page_data,
-                                                  'path': str(im_path)}, page_struct)], page_struct)
+                                                  'lines': page_data}, page_struct)], page_struct)
                         writer.write(pa.RecordBatch.from_arrays([ar], schema=schema))
                         max_lines_in_page = max(len(page_data), max_lines_in_page)
                     callback(1, len(files))
@@ -248,7 +246,7 @@ def collate_null(batch):
     return batch[0]
 
 
-def collate_sequences(im, path, page_data, max_seq_len: int, index: int):
+def collate_sequences(im, page_data, max_seq_len: int, index: int):
     """
     Sorts and pads image data.
     """
@@ -270,8 +268,7 @@ def collate_sequences(im, path, page_data, max_seq_len: int, index: int):
             'tokens': labels,
             'curves': curves,
             'boxes': boxes,
-            'index': index,
-            'path': path}
+            'index': index}
 
 
 class TextLineDataModule(L.LightningDataModule):
@@ -397,7 +394,7 @@ class BinnedBaselineDataset(Dataset):
     def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         item = self.arrow_table.column('pages')[index].as_py()
         logger.debug(f'Attempting to load {item["im"]}')
-        im, lang, path, page_data = item['im'], item['lang'], item['path'], item['lines']
+        im, lang, page_data = item['im'], item['lang'], item['lines']
         try:
             im = Image.open(io.BytesIO(im)).convert('RGB')
         except Exception:
@@ -424,7 +421,7 @@ class BinnedBaselineDataset(Dataset):
             curve = torch.tensor(line['curve']).view(4, 2) if not return_boxes else None
             bbox = torch.tensor(line['bbox']).view(4, 2) if return_boxes else None
             sample.append((tokens, curve, bbox))
-        return collate_sequences(im.unsqueeze(0), path, sample, self.max_seq_len, index)
+        return collate_sequences(im.unsqueeze(0), sample, self.max_seq_len, index)
 
     def __len__(self) -> int:
         return len(self.arrow_table)
@@ -496,7 +493,7 @@ class ValidationBaselineDataset(IterableDataset):
         for item in self.arrow_table.column('pages')[replica_rank::num_replicas]:
             item = item.as_py()
             logger.debug(f'Attempting to load {item["im"]}')
-            im, path, lang, page_data = item['im'], item['path'], item['lang'], item['lines']
+            im, lang, page_data = item['im'], item['lang'], item['lines']
             im = Image.open(io.BytesIO(im)).convert('RGB')
             im = self.transforms(im)
             if self.aug:
@@ -533,8 +530,7 @@ class ValidationBaselineDataset(IterableDataset):
                 yield {'image': im,
                        'boxes': boxes,
                        'curves': curves,
-                       'tokens': tokens,
-                       'path': path}
+                       'tokens': tokens}
 
 
 class TestBaselineDataset(Dataset):
