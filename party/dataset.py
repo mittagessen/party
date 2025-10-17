@@ -278,7 +278,8 @@ class TextLineDataModule(L.LightningDataModule):
                  prompt_mode: Literal['boxes', 'curves', 'both'] = 'both',
                  augmentation: bool = False,
                  batch_size: int = 16,
-                 num_workers: int = 8):
+                 num_workers: int = 8,
+                 **kwargs):
         super().__init__()
 
         self.save_hyperparameters()

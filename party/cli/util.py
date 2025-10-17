@@ -18,9 +18,10 @@ party.cli.util
 
 Command line driver helpers
 """
+import os
+import yaml
 import glob
 import logging
-import os
 from typing import List, Optional, Tuple
 
 import click
@@ -28,9 +29,43 @@ import lightning as L
 
 from lightning.pytorch.callbacks import BaseFinetuning
 
+from typing import Any
 
 logging.captureWarnings(True)
 logger = logging.getLogger('party')
+
+
+def _recursive_update(a: dict[str, Any],
+                      b: dict[str, Any]) -> dict[str, Any]:
+    """Like standard ``dict.update()``, but recursive so sub-dict gets updated.
+
+    Ignore elements present in ``b`` but not in ``a``. Unless ``strict`` is set to
+    `True`, in which case a `ValueError` exception will be raised.
+    """
+    for k, v in b.items():
+        if isinstance(v, dict) and isinstance(a.get(k), dict):
+            a[k] = _recursive_update(a[k], v)
+        else:
+            a[k] = b[k]
+    return a
+
+
+def _load_config(ctx: click.Context,
+                 param: click.Parameter,
+                 path: 'PathLike') -> None:
+    """
+    Fetch parameters values from configuration file and sets them as defaults.
+    """
+    logger.info(f"Load configuration matching {path}")
+    if path:
+        try:
+            conf = yaml.safe_load(path)
+            # Update the default_map.
+            if ctx.default_map is None:
+                ctx.default_map = {}
+            ctx.default_map = _recursive_update(ctx.default_map, conf)
+        except FileNotFoundError:
+            logger.critical(f"No configuration file {path} found.")
 
 
 def _validate_manifests(ctx, param, value):

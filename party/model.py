@@ -15,8 +15,6 @@
 """
 Training loop interception helpers
 """
-
-import timm
 import torch
 import logging
 import lightning.pytorch as L
@@ -25,7 +23,7 @@ from torch import nn
 from lightning.pytorch.callbacks import EarlyStopping
 from torch.optim import lr_scheduler
 
-from typing import Literal, Tuple
+from typing import Literal
 
 from torchmetrics.aggregation import MeanMetric
 
@@ -71,9 +69,9 @@ class RecognitionModel(L.LightningModule):
                  schedule: Literal['cosine', 'exponential', 'step', 'reduceonplateau', 'constant'] = 'cosine',
                  step_size: int = 10,
                  gamma: float = 0.1,
-                 rop_factor: float = 0.1,
-                 rop_patience: int = 5,
-                 cos_t_max: float = 30,
+                 sched_factor: float = 0.1,
+                 sched_patience: int = 5,
+                 cos_max: float = 30,
                  cos_min_lr: float = 1e-4,
                  warmup: int = 15000,
                  encoder_input_size: tuple[int, int] = (1920, 1440),
@@ -276,11 +274,11 @@ def _configure_optimizer_and_lr_scheduler(hparams, model, loss_tracking_mode='mi
     weight_decay = hparams.get("weight_decay")
     schedule = hparams.get("schedule")
     gamma = hparams.get("gamma")
-    cos_t_max = hparams.get("cos_t_max")
+    cos_max = hparams.get("cos_max")
     cos_min_lr = hparams.get("cos_min_lr")
     step_size = hparams.get("step_size")
-    rop_factor = hparams.get("rop_factor")
-    rop_patience = hparams.get("rop_patience")
+    sched_factor = hparams.get("sched_factor")
+    sched_patience = hparams.get("sched_patience")
     completed_epochs = hparams.get("completed_epochs")
 
     param_groups = filter(lambda p: p.requires_grad, model.parameters())
@@ -306,7 +304,7 @@ def _configure_optimizer_and_lr_scheduler(hparams, model, loss_tracking_mode='mi
                     'interval': 'step'}
     elif schedule == 'cosine':
         lr_sched = {'scheduler': lr_scheduler.CosineAnnealingLR(optim,
-                                                                cos_t_max,
+                                                                cos_max,
                                                                 cos_min_lr,
                                                                 last_epoch=completed_epochs-1),
                     'interval': 'step'}
@@ -316,8 +314,8 @@ def _configure_optimizer_and_lr_scheduler(hparams, model, loss_tracking_mode='mi
     elif schedule == 'reduceonplateau':
         lr_sched = {'scheduler': lr_scheduler.ReduceLROnPlateau(optim,
                                                                 mode=loss_tracking_mode,
-                                                                factor=rop_factor,
-                                                                patience=rop_patience),
+                                                                factor=sched_factor,
+                                                                patience=sched_patience),
                     'interval': 'step'}
     elif schedule != 'constant':
         raise ValueError(f'Unsupported learning rate scheduler {schedule}.')
