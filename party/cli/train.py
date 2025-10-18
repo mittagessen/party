@@ -224,7 +224,7 @@ def train(ctx, **kwargs):
 
     torch.set_float32_matmul_precision('high')
 
-    ground_truth.extend(training_files, [])
+    ground_truth.extend(training_files)
 
     if len(ground_truth) == 0:
         raise click.UsageError('No training data was provided to the train command. Use `-t` or the `ground_truth` argument.')
