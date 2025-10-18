@@ -494,8 +494,10 @@ class ValidationBaselineDataset(IterableDataset):
         num_replicas = num_workers * world_size
         replica_rank = worker_rank * world_size + device_rank
 
-        for item in self.arrow_table.column('pages')[replica_rank::num_replicas]:
-            item = item.as_py()
+        len_ds = self.arrow_table.column('pages').length()
+
+        for idx in range(replica_rank, len_ds, num_replicas):
+            item = self.arrow_table.column('pages')[idx].as_py()
             logger.debug(f'Attempting to load {item["im"]}')
             im, lang, page_data = item['im'], item['lang'], item['lines']
             im = Image.open(io.BytesIO(im)).convert('RGB')
