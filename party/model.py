@@ -279,7 +279,7 @@ def _configure_optimizer_and_lr_scheduler(hparams, model, loss_tracking_mode='mi
     step_size = hparams.get("step_size")
     sched_factor = hparams.get("sched_factor")
     sched_patience = hparams.get("sched_patience")
-    completed_epochs = hparams.get("completed_epochs")
+    completed_epochs = hparams.get("completed_epochs", 0)
 
     param_groups = filter(lambda p: p.requires_grad, model.parameters())
 
