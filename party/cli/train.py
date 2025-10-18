@@ -129,6 +129,7 @@ def compile(ctx, output, files, normalization, normalize_whitespace,
 @click.option('-B', '--batch-size', type=int, help='batch sample size')
 @click.option('--val-batch-size', type=int, help='validation batch sample size')
 @click.option('-F', '--freq',
+              type=float,
               help='Model saving and report generation frequency in epochs '
                    'during training. If frequency is >1 it must be an integer, '
                    'i.e. running validation every n-th epoch.')
