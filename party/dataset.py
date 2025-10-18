@@ -278,11 +278,13 @@ class TextLineDataModule(L.LightningDataModule):
                  prompt_mode: Literal['boxes', 'curves', 'both'] = 'both',
                  augmentation: bool = False,
                  batch_size: int = 16,
+                 val_batch_size: Optional[int] = None,
                  num_workers: int = 8,
                  **kwargs):
         super().__init__()
 
         self.save_hyperparameters()
+        self.hparams.val_batch_size = batch_size if not val_batch_size else val_batch_size
 
         self.im_transforms = get_default_transforms()
 
@@ -305,7 +307,8 @@ class TextLineDataModule(L.LightningDataModule):
                                                batch_size=self.hparams.batch_size)
         self.val_set = ValidationBaselineDataset(self.hparams.evaluation_data,
                                                  im_transforms=self.im_transforms,
-                                                 augmentation=self.hparams.augmentation)
+                                                 augmentation=self.hparams.augmentation,
+                                                 batch_size=self.hparams.val_batch_size)
         self.train_set.max_seq_len = max(self.train_set.max_seq_len, self.val_set.max_seq_len)
         self.val_set.max_seq_len = self.train_set.max_seq_len
 

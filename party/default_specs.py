@@ -18,6 +18,7 @@ Default hyperparameters
 
 RECOGNITION_HYPER_PARAMS = {'freq': 1.0,
                             'batch_size': 16,
+                            'val_batch_size': None,
                             'quit': 'fixed',
                             'epochs': 12,
                             'min_epochs': 10,
