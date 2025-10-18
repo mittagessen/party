@@ -14,6 +14,7 @@ from .util import _load_config
 
 from party.default_specs import RECOGNITION_HYPER_PARAMS
 
+
 def set_logger(logger=None, level=logging.ERROR):
     logger.addHandler(RichHandler(rich_tracebacks=True))
     logger.setLevel(level)
@@ -36,6 +37,7 @@ install(suppress=[click])
 # raise default max image size to 20k * 20k pixels
 Image.MAX_IMAGE_PIXELS = 20000 ** 2
 
+
 @click.group(context_settings=dict(show_default=True,
                                    default_map={'precision': 'bf16-mixed',
                                                 'deterministic': False,
@@ -56,6 +58,8 @@ Image.MAX_IMAGE_PIXELS = 20000 ** 2
 @click.option('--precision',
               type=click.Choice(['transformer-engine', 'transformer-engine-float16', '16-true', '16-mixed', 'bf16-true', 'bf16-mixed', '32-true', '64-true']),
               help='Numerical precision to use for training. Default is 32-bit single-point precision.')
+@click.option('--workers', type=click.IntRange(0),
+              help='Size of worker pool for data loading')
 @click.option('--threads', type=click.IntRange(1),
               help='Size of thread pools for intra-op parallelization')
 @click.option('--config',
@@ -65,7 +69,7 @@ Image.MAX_IMAGE_PIXELS = 20000 ** 2
               is_eager=True,
               expose_value=False,
               required=False)
-def cli(ctx, verbose, seed, deterministic, device, precision, threads):
+def cli(ctx, verbose, seed, deterministic, device, precision, workers, threads):
     ctx.meta['deterministic'] = False if not deterministic else 'warn'
     if seed:
         from lightning.pytorch import seed_everything
@@ -81,6 +85,7 @@ def cli(ctx, verbose, seed, deterministic, device, precision, threads):
     ctx.meta['verbose'] = verbose
     ctx.meta['device'] = device
     ctx.meta['precision'] = precision
+    ctx.meta['workers'] = workers
     ctx.meta['threads'] = threads
     set_logger(logger, level=30 - min(10 * verbose, 20))
 
