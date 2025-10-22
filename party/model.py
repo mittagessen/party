@@ -267,7 +267,19 @@ def _configure_optimizer_and_lr_scheduler(hparams, model, loss_tracking_mode='mi
     sched_patience = hparams.get("sched_patience")
     completed_epochs = hparams.get("completed_epochs", 0)
 
-    param_groups = filter(lambda p: p.requires_grad, model.parameters())
+    encoder_params = []
+    rest_params = []
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if 'encoder' in name:
+            encoder_params.append(param)
+        else:
+            rest_params.append(param)
+
+    param_groups = [{'params': encoder_params, 'lr': lr / 10.},
+                    {'params': rest_params, 'lr': lr}]
 
     # XXX: Warmup is not configured here because it needs to be manually done in optimizer_step()
     logger.debug(f'Constructing {optimizer} optimizer (lr: {lr}, momentum: {momentum})')
