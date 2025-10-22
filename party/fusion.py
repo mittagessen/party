@@ -211,12 +211,13 @@ class PartyAdapter(nn.Module):
 
         for encoder_embed_dim in encoder_embed_dims:
             self.pruning.append(nn.Sequential(nn.Conv2d(encoder_embed_dim, 512, kernel_size=3, stride=2, padding=1, bias=False),
-                                              nn.Conv2d(512, decoder_embed_dim, kernel_size=3, stride=2, padding=1, bias=False)))
+                                              nn.Conv2d(512, decoder_embed_dim, kernel_size=3, stride=2, padding=1, bias=False),
+                                              nn.Flatten(-2))
 
     def forward(self, encoder_hidden_states: list[torch.Tensor]) -> torch.Tensor:
         os = []
         for idx, hidden_state in enumerate(encoder_hidden_states):
-            os.append(self.pruning[idx](hidden_state).flatten(-2).transpose(-1, -2))
+            os.append(self.pruning[idx](hidden_state).transpose(-1, -2))
         return torch.cat(os, dim=1)
 
 
