@@ -39,7 +39,7 @@ __all__ = ['bytellama_vision_decoder', 'PartyModel']
 
 
 def bytellama_vision_decoder(vocab_size: int = TOKEN_NUM,
-                             num_layers: int = 12,
+                             num_layers: int = 30,
                              num_heads: int = 9,
                              num_kv_heads: int = 3,
                              embed_dim: int = 576,
@@ -182,6 +182,12 @@ def bytellama_vision_decoder(vocab_size: int = TOKEN_NUM,
         from safetensors import safe_open
         with safe_open(weight_path, framework='pt') as f:
             state_dict = {k: f.get_tensor(k) for k in f.keys()}
+        rweight = torch.zeros(TOKEN_NUM - 259, config['embed_dim'], device=state_dict['tok_embeddings.weight'].device)
+        torch.nn.init.xavier_uniform_(rweight)
+        state_dict['tok_embeddings.weight'] = torch.cat([state_dict['tok_embeddings.weight'], rweight], dim=0)
+        rweight = rweight.clone()
+        torch.nn.init.xavier_uniform_(rweight)
+        state_dict['output.weight'] = torch.cat([state_dict['output.weight'], rweight], dim=0)
         decoder.load_state_dict(state_dict, strict=False)
 
     return decoder
@@ -200,45 +206,17 @@ class PartyAdapter(nn.Module):
         super().__init__()
         mlp_ratio = 4
         num_kv_heads = num_heads
+        self.pruning = nn.ModuleList()
         self.adapter = nn.ModuleList()
 
         for encoder_embed_dim in encoder_embed_dims:
-            hidden_dim = int(mlp_ratio * encoder_embed_dim)
-            head_dim = encoder_embed_dim // num_heads
-
-            layers = []
-            for _ in range(num_layers):
-                self_attn = MultiHeadAttention(embed_dim=encoder_embed_dim,
-                                               num_heads=num_heads,
-                                               num_kv_heads=num_heads,
-                                               head_dim=head_dim,
-                                               q_proj=nn.Linear(encoder_embed_dim, num_heads * head_dim, bias=False),
-                                               k_proj=nn.Linear(encoder_embed_dim, num_kv_heads * head_dim, bias=False),
-                                               v_proj=nn.Linear(encoder_embed_dim, num_kv_heads * head_dim, bias=False),
-                                               output_proj=nn.Linear(encoder_embed_dim, encoder_embed_dim, bias=False),
-                                               pos_embeddings=None,
-                                               attn_dropout=0.0,
-                                               is_causal=False)
-
-                mlp = FeedForward(gate_proj=nn.Linear(encoder_embed_dim, hidden_dim),
-                                  down_proj=nn.Linear(hidden_dim, encoder_embed_dim),
-                                  up_proj=None)
-
-                layer = TransformerSelfAttentionLayer(attn=self_attn,
-                                                      mlp=mlp,
-                                                      sa_norm=RMSNorm(encoder_embed_dim, eps=1e-5),
-                                                      mlp_norm=RMSNorm(encoder_embed_dim, eps=1e-5),
-                                                      sa_scale=TanhGate(),
-                                                      mlp_scale=TanhGate())
-                layers.append(layer)
-            layers.append(nn.Linear(encoder_embed_dim, decoder_embed_dim))
-            self.adapter.append(nn.Sequential(*layers))
+            self.pruning.append(nn.Sequential(nn.Conv2d(encoder_embed_dim, 512, kernel_size=3, stride=2, padding=1, bias=False),
+                                              nn.Conv2d(512, decoder_embed_dim, kernel_size=3, stride=2, padding=1, bias=False)))
 
     def forward(self, encoder_hidden_states: list[torch.Tensor]) -> torch.Tensor:
         os = []
         for idx, hidden_state in enumerate(encoder_hidden_states):
-            hidden_state = hidden_state.flatten(-2).transpose(-1, -2)
-            os.append(self.adapter[idx](hidden_state))
+            os.append(self.pruning[idx](hidden_state).flatten(-2).transpose(-1, -2)
         return torch.cat(os, dim=1)
 
 
