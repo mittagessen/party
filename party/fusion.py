@@ -241,7 +241,7 @@ class PartyAdapter(nn.Module):
                                                   sa_scale=TanhGate(),
                                                   mlp_scale=TanhGate())
             layers.append(layer)
-        self.adapter = nn.Sequential(layers)
+        self.adapter = nn.Sequential(*layers)
 
     def forward(self, encoder_hidden_states: list[torch.Tensor]) -> torch.Tensor:
         os = []
