@@ -25,8 +25,7 @@ from party.modules import (MultiHeadAttention, RMSNorm, TanhGate,
                            TransformerCrossAttentionLayer, TransformerDecoder,
                            FeedForward, TransformerSelfAttentionLayer,
                            FusionLayer, scale_hidden_dim_for_mlp,
-                           Llama3ScaledRoPE, llama3_mlp, PromptEncoder,
-                           ChainedPositionEmbeddingRandom)
+                           Llama3ScaledRoPE, llama3_mlp, PromptEncoder)
 
 from party.tokenizer import OctetTokenizer, TOKEN_NUM
 
@@ -207,18 +206,48 @@ class PartyAdapter(nn.Module):
         mlp_ratio = 4
         num_kv_heads = num_heads
         self.pruning = nn.ModuleList()
-        self.adapter = nn.ModuleList()
 
         for encoder_embed_dim in encoder_embed_dims:
             self.pruning.append(nn.Sequential(nn.Conv2d(encoder_embed_dim, 512, kernel_size=3, stride=2, padding=1, bias=False),
                                               nn.Conv2d(512, decoder_embed_dim, kernel_size=3, stride=2, padding=1, bias=False),
                                               nn.Flatten(-2)))
 
+        mlp_ratio = 4
+        hidden_dim = int(mlp_ratio * decoder_embed_dim)
+        head_dim = decoder_embed_dim // num_heads
+        num_kv_heads = num_heads
+        layers = []
+        for _ in range(num_layers):
+            self_attn = MultiHeadAttention(embed_dim=decoder_embed_dim,
+                                           num_heads=num_heads,
+                                           num_kv_heads=num_heads,
+                                           head_dim=head_dim,
+                                           q_proj=nn.Linear(decoder_embed_dim, num_heads * head_dim, bias=False),
+                                           k_proj=nn.Linear(decoder_embed_dim, num_kv_heads * head_dim, bias=False),
+                                           v_proj=nn.Linear(decoder_embed_dim, num_kv_heads * head_dim, bias=False),
+                                           output_proj=nn.Linear(decoder_embed_dim, encoder_embed_dim, bias=False),
+                                           pos_embeddings=None,
+                                           attn_dropout=0.0,
+                                           is_causal=False)
+
+            mlp = FeedForward(gate_proj=nn.Linear(decoder_embed_dim, hidden_dim),
+                              down_proj=nn.Linear(hidden_dim, decoder_embed_dim),
+                              up_proj=None)
+
+            layer = TransformerSelfAttentionLayer(attn=self_attn,
+                                                  mlp=mlp,
+                                                  sa_norm=RMSNorm(decoder_embed_dim, eps=1e-5),
+                                                  mlp_norm=RMSNorm(decoder_embed_dim, eps=1e-5),
+                                                  sa_scale=TanhGate(),
+                                                  mlp_scale=TanhGate())
+            layers.append(layer)
+        self.adapter = nn.Sequential(layers)
+
     def forward(self, encoder_hidden_states: list[torch.Tensor]) -> torch.Tensor:
         os = []
         for idx, hidden_state in enumerate(encoder_hidden_states):
             os.append(self.pruning[idx](hidden_state).transpose(-1, -2))
-        return torch.cat(os, dim=1)
+        return self.adapter(torch.cat(os, dim=1))
 
 
 class PartyModel(nn.Module):
