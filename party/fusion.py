@@ -225,7 +225,7 @@ class PartyAdapter(nn.Module):
                                            q_proj=nn.Linear(decoder_embed_dim, num_heads * head_dim, bias=False),
                                            k_proj=nn.Linear(decoder_embed_dim, num_kv_heads * head_dim, bias=False),
                                            v_proj=nn.Linear(decoder_embed_dim, num_kv_heads * head_dim, bias=False),
-                                           output_proj=nn.Linear(decoder_embed_dim, encoder_embed_dim, bias=False),
+                                           output_proj=nn.Linear(decoder_embed_dim, decoder_embed_dim, bias=False),
                                            pos_embeddings=None,
                                            attn_dropout=0.0,
                                            is_causal=False)
