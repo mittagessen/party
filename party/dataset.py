@@ -76,7 +76,7 @@ def batched(iterable, n, *, strict=False):
 
 
 def get_default_transforms(dtype=torch.float32):
-    return v2.Compose([v2.Resize((1920, 1440)),
+    return v2.Compose([v2.Resize((2560, 1920)),
                        v2.ToImage(),
                        v2.ToDtype(dtype, scale=True),
                        v2.Normalize(mean=[0.4850, 0.4560, 0.4060], std=[0.2290, 0.2240, 0.2250])])
