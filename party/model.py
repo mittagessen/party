@@ -89,6 +89,8 @@ class RecognitionModel(L.LightningModule):
         self.best_model = None
 
         self.save_hyperparameters()
+
+        timm.layers.use_fused_attn(experimental=True)
         backbone = timm.create_model(encoder,
                                      pretrained=pretrained,
                                      features_only=True,
