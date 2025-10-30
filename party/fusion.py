@@ -209,8 +209,7 @@ class PartyAdapter(nn.Module):
         self.pruning = nn.ModuleList()
 
         for encoder_embed_dim in encoder_embed_dims:
-            self.pruning.append(nn.Sequential(nn.Conv2d(encoder_embed_dim, 512, kernel_size=3, stride=2, padding=1, bias=False),
-                                              nn.Conv2d(512, hidden_dim, kernel_size=3, stride=2, padding=1, bias=False),
+            self.pruning.append(nn.Sequential(nn.Conv2d(encoder_embed_dim, hidden_dim, kernel_size=3, stride=2, padding=1, bias=False),
                                               nn.Flatten(-2)))
 
         mlp_ratio = 4
