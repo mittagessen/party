@@ -74,7 +74,7 @@ class RecognitionModel(L.LightningModule):
                  cos_max: float = 30,
                  cos_min_lr: float = 1e-4,
                  warmup: int = 15000,
-                 encoder: str = 'swin_base_patch4_window12_384.ms_in22k',
+                 encoder: str = 'convnextv2_base.fcmae_ft_in22k_in1k',
                  encoder_input_size: tuple[int, int] = (2560, 1920),
                  encoder_idxs: list[int] = (1, 2, 3),
                  decoder: str = 'mittagessen/bytellama_oscar',
@@ -92,14 +92,10 @@ class RecognitionModel(L.LightningModule):
         backbone = timm.create_model(encoder,
                                      pretrained=pretrained,
                                      features_only=True,
-                                     img_size=encoder_input_size,
                                      out_indices=encoder_idxs)
 
-        # token pruning with 2x convs with stride 2 -> reduction by 16x
-        encoder_max_seq_len = sum((encoder_input_size[0]//red * encoder_input_size[1] // red)//16 for red in backbone.feature_info.reduction())
-
         decoder_model = bytellama_vision_decoder(pretrained=decoder if pretrained else None,
-                                                 encoder_max_seq_len=encoder_max_seq_len)
+                                                 encoder_max_seq_len=56700)
 
         self.model = PartyModel(encoder=backbone,
                                 decoder=decoder_model,
@@ -108,6 +104,8 @@ class RecognitionModel(L.LightningModule):
 
         if freeze_encoder:
             for param in self.model.encoder.parameters():
+                param.requires_grad = False
+            for param in self.model.adapter.parameters():
                 param.requires_grad = False
 
         self.model.train()
