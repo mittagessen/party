@@ -200,55 +200,43 @@ class PartyAdapter(nn.Module):
     def __init__(self,
                  num_layers: int,
                  num_heads: int,
-                 encoder_embed_dims: list[int],
-                 decoder_embed_dim: int,
-                 hidden_dim: int = 1024):
+                 encoder_embed_dim: int,
+                 decoder_embed_dim: int):
         super().__init__()
         mlp_ratio = 4
+        hidden_dim = int(mlp_ratio * encoder_embed_dim)
+        head_dim = encoder_embed_dim // num_heads
         num_kv_heads = num_heads
-        self.pruning = nn.ModuleList()
-
-        for encoder_embed_dim in encoder_embed_dims:
-            self.pruning.append(nn.Sequential(nn.Conv2d(encoder_embed_dim, hidden_dim, kernel_size=3, stride=2, padding=1, bias=False),
-                                              nn.Flatten(-2)))
-
-        mlp_ratio = 4
-        ff_hidden_dim = int(mlp_ratio * hidden_dim)
-        head_dim = hidden_dim // num_heads
-        num_kv_heads = num_heads
-        layers = []
+        layers = [nn.Flatten(-2)]
         for _ in range(num_layers):
-            self_attn = MultiHeadAttention(embed_dim=hidden_dim,
+            self_attn = MultiHeadAttention(embed_dim=encoder_embed_dim,
                                            num_heads=num_heads,
                                            num_kv_heads=num_heads,
                                            head_dim=head_dim,
-                                           q_proj=nn.Linear(hidden_dim, num_heads * head_dim, bias=False),
-                                           k_proj=nn.Linear(hidden_dim, num_kv_heads * head_dim, bias=False),
-                                           v_proj=nn.Linear(hidden_dim, num_kv_heads * head_dim, bias=False),
-                                           output_proj=nn.Linear(hidden_dim, hidden_dim, bias=False),
+                                           q_proj=nn.Linear(encoder_embed_dim, num_heads * head_dim, bias=False),
+                                           k_proj=nn.Linear(encoder_embed_dim, num_kv_heads * head_dim, bias=False),
+                                           v_proj=nn.Linear(encoder_embed_dim, num_kv_heads * head_dim, bias=False),
+                                           output_proj=nn.Linear(encoder_embed_dim, encoder_embed_dim, bias=False),
                                            pos_embeddings=None,
                                            attn_dropout=0.0,
                                            is_causal=False)
 
-            mlp = FeedForward(gate_proj=nn.Linear(hidden_dim, ff_hidden_dim),
-                              down_proj=nn.Linear(ff_hidden_dim, hidden_dim),
+            mlp = FeedForward(gate_proj=nn.Linear(encoder_embed_dim, hidden_dim),
+                              down_proj=nn.Linear(hidden_dim, encoder_embed_dim),
                               up_proj=None)
 
             layer = TransformerSelfAttentionLayer(attn=self_attn,
                                                   mlp=mlp,
-                                                  sa_norm=RMSNorm(hidden_dim, eps=1e-5),
-                                                  mlp_norm=RMSNorm(hidden_dim, eps=1e-5),
+                                                  sa_norm=RMSNorm(encoder_embed_dim, eps=1e-5),
+                                                  mlp_norm=RMSNorm(encoder_embed_dim, eps=1e-5),
                                                   sa_scale=TanhGate(),
                                                   mlp_scale=TanhGate())
             layers.append(layer)
-        layers.append(nn.Linear(hidden_dim, decoder_embed_dim))
+        layers.append(nn.Linear(encoder_embed_dim, decoder_embed_dim))
         self.adapter = nn.Sequential(*layers)
 
-    def forward(self, encoder_hidden_states: list[torch.Tensor]) -> torch.Tensor:
-        os = []
-        for idx, hidden_state in enumerate(encoder_hidden_states):
-            os.append(self.pruning[idx](hidden_state).transpose(-1, -2))
-        return self.adapter(torch.cat(os, dim=1))
+    def forward(self, encoder_hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.adapter(encoder_hidden_states)
 
 
 class PartyModel(nn.Module):
@@ -267,7 +255,7 @@ class PartyModel(nn.Module):
     def __init__(self,
                  encoder: nn.Module,
                  decoder: nn.Module,
-                 encoder_embed_dims: list[int],
+                 encoder_embed_dim: int,
                  decoder_embed_dim: int,
                  adapter_num_layers: int = 4,
                  adapter_num_heads: int = 8):
@@ -277,7 +265,7 @@ class PartyModel(nn.Module):
 
         self.adapter = PartyAdapter(adapter_num_layers,
                                     adapter_num_heads,
-                                    encoder_embed_dims,
+                                    encoder_embed_dim,
                                     decoder_embed_dim)
 
         self.line_embedding = PromptEncoder(decoder_embed_dim)
@@ -446,7 +434,7 @@ class PartyModel(nn.Module):
         Computes the encoder embeddings *without* adding the curve positional
         embeddings.
         """
-        encoder_hidden_states = self.encoder(encoder_input)
+        encoder_hidden_states = self.encoder(encoder_input)[0]
         return self.adapter(encoder_hidden_states)
 
     @torch.inference_mode()

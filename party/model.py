@@ -76,7 +76,7 @@ class RecognitionModel(L.LightningModule):
                  warmup: int = 15000,
                  encoder: str = 'convnextv2_base.fcmae_ft_in22k_in1k',
                  encoder_input_size: tuple[int, int] = (2560, 1920),
-                 encoder_idxs: list[int] = (2, 3),
+                 encoder_idxs: list[int] = (2,),
                  decoder: str = 'mittagessen/bytellama_oscar',
                  pretrained: bool = True,
                  freeze_encoder: bool = False,
@@ -94,14 +94,14 @@ class RecognitionModel(L.LightningModule):
                                      features_only=True,
                                      out_indices=encoder_idxs)
 
-        encoder_max_seq_len = sum((encoder_input_size[0]//red * encoder_input_size[1] // red)//4 for red in backbone.feature_info.reduction())
+        encoder_max_seq_len = sum((encoder_input_size[0]//red * encoder_input_size[1] // red) for red in backbone.feature_info.reduction())
 
         decoder_model = bytellama_vision_decoder(pretrained=decoder if pretrained else None,
                                                  encoder_max_seq_len=encoder_max_seq_len)
 
         self.model = PartyModel(encoder=backbone,
                                 decoder=decoder_model,
-                                encoder_embed_dims=backbone.feature_info.channels(),
+                                encoder_embed_dim=backbone.feature_info.channels()[0],
                                 decoder_embed_dim=decoder_model.tok_embeddings.embedding_dim)
 
         if freeze_encoder:
