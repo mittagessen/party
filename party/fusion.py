@@ -207,7 +207,7 @@ class PartyAdapter(nn.Module):
         hidden_dim = int(mlp_ratio * encoder_embed_dim)
         head_dim = encoder_embed_dim // num_heads
         num_kv_heads = num_heads
-        layers = [nn.Flatten(-2)]
+        layers = []
         for _ in range(num_layers):
             self_attn = MultiHeadAttention(embed_dim=encoder_embed_dim,
                                            num_heads=num_heads,
@@ -236,7 +236,7 @@ class PartyAdapter(nn.Module):
         self.adapter = nn.Sequential(*layers)
 
     def forward(self, encoder_hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.adapter(encoder_hidden_states)
+        return self.adapter(encoder_hidden_states.flatten(-2).transpose(-1, -2))
 
 
 class PartyModel(nn.Module):
