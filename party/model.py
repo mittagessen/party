@@ -77,7 +77,7 @@ class RecognitionModel(L.LightningModule):
                  encoder: str = 'convnextv2_base.fcmae_ft_in22k_in1k',
                  encoder_input_size: tuple[int, int] = (2560, 1920),
                  encoder_idxs: list[int] = (2,),
-                 decoder: str = 'mittagessen/bytellama_oscar',
+                 decoder: str = 'mittagessen/bytellama-40m-oscar',
                  pretrained: bool = True,
                  freeze_encoder: bool = False,
                  batch_size: int = 16,
