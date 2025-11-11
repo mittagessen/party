@@ -107,7 +107,7 @@ def bytellama_vision_decoder(vocab_size: int = TOKEN_NUM,
 
     rope = Llama3ScaledRoPE(dim=head_dim, max_seq_len=config['max_seq_len'], base=config['rope_base'])
 
-    for idx in range(1, num_layers + 1):
+    for idx in range(1, config['num_layers'] + 1):
 
         # Self attention layers for text decoder
         self_attn = MultiHeadAttention(
@@ -181,7 +181,7 @@ def bytellama_vision_decoder(vocab_size: int = TOKEN_NUM,
         from safetensors import safe_open
         with safe_open(weight_path, framework='pt') as f:
             state_dict = {k: f.get_tensor(k) for k in f.keys()}
-        decoder.load_state_dict(state_dict, strict=False)
+        decoder.load_state_dict(state_dict, strict=True)
 
     return decoder
 
