@@ -18,13 +18,12 @@ party.cli.train
 
 Command line driver for recognition training.
 """
+import click
 import logging
 
-import click
-from threadpoolctl import threadpool_limits
-
-from party.default_specs import RECOGNITION_HYPER_PARAMS
+from itertools import repeat
 from party.tokenizer import ISO_TO_LANG
+from threadpoolctl import threadpool_limits
 
 from .util import _expand_gt, _validate_manifests, message, to_ptl_device
 
@@ -121,11 +120,11 @@ def compile(ctx, output, files, normalization, normalize_whitespace,
 @click.option('--resume', default=None, type=click.Path(exists=True), help='Path to checkpoint to resume from')
 @click.option('-o', '--output', type=click.Path(file_okay=False, dir_okay=True), default='checkpoints', help='Output directory for checkpoints.')
 @click.option('-t', '--training-files', default=None, multiple=True,
-              callback=_validate_manifests, type=click.File(mode='r', lazy=True),
-              help='Manifest file(s) with additional paths to training data')
+              type=click.File(mode='r', lazy=True), help='Manifest file(s) with '
+              ' additional paths to training data')
 @click.option('-e', '--evaluation-files', default=None, multiple=True,
-              callback=_validate_manifests, type=click.File(mode='r', lazy=True),
-              help='Manifest file(s) with paths to evaluation data.')
+              type=click.File(mode='r', lazy=True), help='Manifest file(s) with '
+              ' paths to evaluation data.')
 @click.option('-B', '--batch-size', type=int, help='batch sample size')
 @click.option('--val-batch-size', type=int, help='validation batch sample size')
 @click.option('-F', '--freq',
@@ -187,6 +186,7 @@ def compile(ctx, output, files, normalization, normalize_whitespace,
               'between boxes and curves.')
 @click.option('--accumulate-grad-batches', type=int, help='Number of batches to accumulate gradient across.')
 @click.option('--validate-before-train/--no-validate-before-train', default=True, help='Enables validation run before first training run.')
+@click.option('--sampling-weights', type=click.UNPROCESSED, hidden=True)
 @click.argument('ground_truth', nargs=-1, callback=_expand_gt, type=click.Path(exists=False, dir_okay=False))
 def train(ctx, **kwargs):
     """
@@ -199,6 +199,18 @@ def train(ctx, **kwargs):
     training_files = params.pop('training_files', [])
     evaluation_files = params.pop('evaluation_files', [])
     ground_truth = list(params.pop('ground_truth', []))
+    sampling_weights = iter(params.pop('sampling_weights', repeat(1)))
+
+    weights = len(ground_truth) * [1,]
+    for training_file in training_files:
+        manifest_contents = _validate_manifests(ctx, None, training_file)
+        weights.extend([next(sampling_weights),] * len(manifest_contents))
+        ground_truth.extend(manifest_contents)
+
+    ev_files = []
+    for evaluation_file in evaluation_files:
+        ev_files.extend(_validate_manifests(ctx, None, training_file))
+    evaluation_files = ev_files
 
     if not (0 <= params.get('freq') <= 1) and params.get('freq') % 1.0 != 0:
         raise click.BadOptionUsage('freq', 'freq needs to be either in the interval [0,1.0] or a positive integer.')

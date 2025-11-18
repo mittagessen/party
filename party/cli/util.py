@@ -29,7 +29,11 @@ import lightning as L
 
 from lightning.pytorch.callbacks import BaseFinetuning
 
-from typing import Any
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from os import PathLike
+
 
 logging.captureWarnings(True)
 logger = logging.getLogger('party')
