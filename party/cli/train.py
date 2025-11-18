@@ -186,7 +186,7 @@ def compile(ctx, output, files, normalization, normalize_whitespace,
               'between boxes and curves.')
 @click.option('--accumulate-grad-batches', type=int, help='Number of batches to accumulate gradient across.')
 @click.option('--validate-before-train/--no-validate-before-train', default=True, help='Enables validation run before first training run.')
-@click.option('--sampling-weights', type=click.UNPROCESSED, hidden=True)
+@click.option('--sampling-weights', type=click.UNPROCESSED, default=repeat(1), hidden=True)
 @click.argument('ground_truth', nargs=-1, callback=_expand_gt, type=click.Path(exists=False, dir_okay=False))
 def train(ctx, **kwargs):
     """
