@@ -7,8 +7,10 @@ train:
   # training data manifests
   training_files: 
     - /home/mittagessen/party_dataset/train.lst
+    - /home/mittagessen/party_dataset/train_2.lst
   evaluation_files: 
     - /home/mittagessen/party_dataset/val.lst
+  # 
   # directory to save checkpoints in
   output: /home/mittagessen/party_models
   # text transforms
