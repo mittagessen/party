@@ -203,13 +203,13 @@ def train(ctx, **kwargs):
 
     weights = len(ground_truth) * [1,]
     for training_file in training_files:
-        manifest_contents = _validate_manifests(ctx, None, training_file)
+        manifest_contents = _validate_manifests(ctx, None, [training_file])
         weights.extend([next(sampling_weights),] * len(manifest_contents))
         ground_truth.extend(manifest_contents)
 
     ev_files = []
     for evaluation_file in evaluation_files:
-        ev_files.extend(_validate_manifests(ctx, None, training_file))
+        ev_files.extend(_validate_manifests(ctx, None, [evaluation_file]))
     evaluation_files = ev_files
 
     if not (0 <= params.get('freq') <= 1) and params.get('freq') % 1.0 != 0:
@@ -235,8 +235,6 @@ def train(ctx, **kwargs):
     from lightning.pytorch.callbacks import RichModelSummary, ModelCheckpoint, RichProgressBar
 
     torch.set_float32_matmul_precision('high')
-
-    ground_truth.extend(training_files)
 
     if len(ground_truth) == 0:
         raise click.UsageError('No training data was provided to the train command. Use `-t` or the `ground_truth` argument.')
@@ -270,6 +268,7 @@ def train(ctx, **kwargs):
         data_module = TextLineDataModule(training_data=ground_truth,
                                          evaluation_data=evaluation_files,
                                          num_workers=ctx.meta['workers'],
+                                         sampling_weights=weights,
                                          **params)
 
     trainer = Trainer(accelerator=accelerator,

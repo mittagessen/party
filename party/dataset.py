@@ -324,11 +324,11 @@ class TextLineDataModule(L.LightningDataModule):
             weights = list(chain(*[(weight,) * ppf for weight, ppf in zip(self.train_set.pages_per_file, self.hparams.sampling_weights)]))
             sampler = WeightedRandomSampler(weights,
                                             replacement=True,
-                                            num_samples=self.train_set.num_batches // world_size),
+                                            num_samples=self.train_set.num_batches // world_size)
         else:
             sampler = RandomSampler(self.train_set,
                                     replacement=True,
-                                    num_samples=self.train_set.num_batches // world_size),
+                                    num_samples=self.train_set.num_batches // world_size)
 
         return DataLoader(self.train_set,
                           num_workers=self.hparams.num_workers,
