@@ -68,7 +68,7 @@ def _baseline_to_bbox(line: 'BaselineLine') -> 'BBoxLine':
     return BBoxLine(**d)
 
 
-class PartyModel(BaseModel, nn.Module):
+class PartyModel(nn.Module, BaseModel):
     """
     The party fusion model.
 
