@@ -86,7 +86,7 @@ class PartyTextLineDataModule(L.LightningDataModule):
                                                      batch_size=data_config.val_batch_size)
             if len(self.train_set) == 0:
                 raise ValueError('No valid training data provided. Please add some.')
-            if len(self.val_set) == 0:
+            if self.val_set.max_seq_len == 0:
                 raise ValueError('No valid validation data provided. Please add some.')
             self.train_set.max_seq_len = max(self.train_set.max_seq_len, self.val_set.max_seq_len)
             self.val_set.max_seq_len = self.train_set.max_seq_len
