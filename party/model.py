@@ -212,6 +212,7 @@ class PartyRecognitionModel(L.LightningModule):
         if stage in [None, 'fit']:
             if self.net is None:
                 self.net = create_model('PartyModel',
+                                        pretrained=True,
                                         image_size=self.trainer.datamodule.hparams.data_config.image_size)
 
             if self.hparams.config.freeze_encoder:
