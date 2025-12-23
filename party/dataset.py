@@ -21,7 +21,6 @@ import torch
 import ctypes
 import torch.nn.functional as F
 import numpy as np
-import lightning.pytorch as L
 
 import tempfile
 import pyarrow as pa
@@ -29,19 +28,15 @@ import pyarrow as pa
 from pathlib import Path
 from itertools import islice
 
-from torch.distributed import get_rank, get_world_size, is_initialized
-
 from typing import (TYPE_CHECKING, Any, Callable, Literal, Optional, Union,
                     Sequence)
 
-from itertools import chain
+from PIL import Image
 from functools import partial
 from torchvision.transforms import v2
-from torch.utils.data import (Dataset, DataLoader, IterableDataset,
-                              get_worker_info, RandomSampler,
-                              WeightedRandomSampler)
+from torch.utils.data import Dataset, IterableDataset, get_worker_info
+from torch.distributed import get_rank, get_world_size, is_initialized
 
-from PIL import Image
 
 from scipy.special import comb
 
@@ -52,7 +47,7 @@ if TYPE_CHECKING:
     from os import PathLike
     from kraken.containers import Segmentation
 
-__all__ = ['TextLineDataModule']
+__all__ = ['BinnedBaselineDataset', 'ValidationBaselineDataset', 'get_default_transforms', 'collate_null']
 
 import logging
 
@@ -77,8 +72,8 @@ def batched(iterable, n, *, strict=False):
         yield batch
 
 
-def get_default_transforms(dtype=torch.float32):
-    return v2.Compose([v2.Resize((2560, 1920)),
+def get_default_transforms(image_size: tuple[int, int] = (2560, 1920), dtype=torch.float32):
+    return v2.Compose([v2.Resize(image_size),
                        v2.ToImage(),
                        v2.ToDtype(dtype, scale=True),
                        v2.Normalize(mean=[0.4850, 0.4560, 0.4060], std=[0.2290, 0.2240, 0.2250])])
@@ -271,81 +266,6 @@ def collate_sequences(im, page_data, max_seq_len: int, index: int):
             'curves': curves,
             'boxes': boxes,
             'index': index}
-
-
-class TextLineDataModule(L.LightningDataModule):
-    def __init__(self,
-                 training_data: list[Union[str, 'PathLike']],
-                 evaluation_data: list[Union[str, 'PathLike']],
-                 prompt_mode: Literal['boxes', 'curves', 'both'] = 'both',
-                 augmentation: bool = False,
-                 batch_size: int = 16,
-                 val_batch_size: Optional[int] = None,
-                 num_workers: int = 8,
-                 sampling_weights: Optional[list[float]] = None,
-                 **kwargs):
-        super().__init__()
-
-        if sampling_weights is not None and len(sampling_weights) != len(sampling_weights):
-            raise ValueError('Per-file sampling weights need to be same length as training_data.')
-
-        self.save_hyperparameters()
-        self.hparams.val_batch_size = batch_size if not val_batch_size else val_batch_size
-
-        self.im_transforms = get_default_transforms()
-
-        # tokenizer is stateless so we can just initiate it here
-        tokenizer = OctetTokenizer()
-
-        self.pad_id = tokenizer.pad_id
-        self.bos_id = tokenizer.bos_id
-        self.eos_id = tokenizer.eos_id
-
-        self.num_classes = tokenizer.max_label + 1
-
-    def setup(self, stage: str):
-        """
-        Actually builds the datasets.
-        """
-        self.train_set = BinnedBaselineDataset(self.hparams.training_data,
-                                               im_transforms=self.im_transforms,
-                                               augmentation=self.hparams.augmentation,
-                                               batch_size=self.hparams.batch_size)
-        self.val_set = ValidationBaselineDataset(self.hparams.evaluation_data,
-                                                 im_transforms=self.im_transforms,
-                                                 augmentation=self.hparams.augmentation,
-                                                 batch_size=self.hparams.val_batch_size)
-        self.train_set.max_seq_len = max(self.train_set.max_seq_len, self.val_set.max_seq_len)
-        self.val_set.max_seq_len = self.train_set.max_seq_len
-
-    def train_dataloader(self):
-        world_size = get_world_size() if is_initialized() else 1
-        if self.hparams.sampling_weights:
-            weights = list(chain(*[(weight,) * ppf for weight, ppf in zip(self.train_set.pages_per_file, self.hparams.sampling_weights)]))
-            sampler = WeightedRandomSampler(weights,
-                                            replacement=True,
-                                            num_samples=self.train_set.num_batches // world_size)
-        else:
-            sampler = RandomSampler(self.train_set,
-                                    replacement=True,
-                                    num_samples=self.train_set.num_batches // world_size)
-
-        return DataLoader(self.train_set,
-                          num_workers=self.hparams.num_workers,
-                          batch_size=1,
-                          sampler=sampler,
-                          pin_memory=True,
-                          shuffle=False,
-                          collate_fn=collate_null)
-
-    def val_dataloader(self):
-        return DataLoader(self.val_set,
-                          shuffle=False,
-                          batch_size=1,
-                          num_workers=self.hparams.num_workers,
-                          pin_memory=True,
-                          collate_fn=collate_null,
-                          worker_init_fn=_validation_worker_init_fn)
 
 
 class BinnedBaselineDataset(Dataset):

@@ -22,7 +22,7 @@ import os
 import yaml
 import glob
 import logging
-from typing import List, Optional, Tuple
+from typing import Optional
 
 import click
 import lightning as L
@@ -96,7 +96,7 @@ def message(msg, **styles):
         click.secho(msg, **styles)
 
 
-def to_ptl_device(device: str) -> Tuple[str, Optional[List[int]]]:
+def to_ptl_device(device: str) -> tuple[str, Optional[list[int]]]:
     if device.strip() == 'auto':
         return 'auto', 'auto'
     devices = device.split(',')

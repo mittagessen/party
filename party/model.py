@@ -20,16 +20,26 @@ import logging
 import lightning.pytorch as L
 
 from torch import nn
-from lightning.pytorch.callbacks import EarlyStopping
+from itertools import chain
 from torch.optim import lr_scheduler
-
-from typing import Literal
+from kraken.models import create_model
 
 from torchmetrics.aggregation import MeanMetric
+from typing import Optional, TYPE_CHECKING, Union
+from lightning.pytorch.callbacks import EarlyStopping
+from torch.distributed import get_world_size, is_initialized
+from kraken.train.utils import configure_optimizer_and_lr_scheduler
+from torch.utils.data import RandomSampler, WeightedRandomSampler, DataLoader
 
-from party.fusion import bytellama_vision_decoder, PartyModel
+from party.dataset import (collate_null, get_default_transforms,
+                           BinnedBaselineDataset, ValidationBaselineDataset,
+                           _validation_worker_init_fn)
+from party.configs import PartyRecognitionTrainingConfig, PartyRecognitionTrainingDataConfig
 
-import timm
+if TYPE_CHECKING:
+    from os import PathLike
+    from kraken.models import BaseModel
+
 logger = logging.getLogger(__name__)
 
 
@@ -54,75 +64,110 @@ def model_step(model, criterion, batch):
     return criterion(logits, targets)
 
 
-class RecognitionModel(L.LightningModule):
+class PartyTextLineDataModule(L.LightningDataModule):
+    def __init__(self, data_config: PartyRecognitionTrainingDataConfig):
+        super().__init__()
+        if data_config.sampling_weights is not None and len(data_config.sampling_weights) != len(data_config.training_data):
+            raise ValueError('Per-file sampling weights need to be same length as training_data.')
+
+        self.save_hyperparameters()
+        self.hparams.data_config.val_batch_size = data_config.batch_size if not data_config.val_batch_size else data_config.val_batch_size
+
+        im_transforms = get_default_transforms(image_size=data_config.image_size)
+
+        if data_config.training_data and data_config.evaluation_data:
+            self.train_set = BinnedBaselineDataset(data_config.training_data,
+                                                   im_transforms=im_transforms,
+                                                   augmentation=data_config.augment,
+                                                   batch_size=data_config.batch_size)
+            self.val_set = ValidationBaselineDataset(data_config.evaluation_data,
+                                                     im_transforms=im_transforms,
+                                                     augmentation=data_config.augment,
+                                                     batch_size=data_config.val_batch_size)
+            if len(self.train_set) == 0:
+                raise ValueError('No valid training data provided. Please add some.')
+            if len(self.val_set) == 0:
+                raise ValueError('No valid validation data provided. Please add some.')
+            self.train_set.max_seq_len = max(self.train_set.max_seq_len, self.val_set.max_seq_len)
+            self.val_set.max_seq_len = self.train_set.max_seq_len
+        elif data_config.test_data:
+            self.test_set = ValidationBaselineDataset(data_config.test_data,
+                                                      im_transforms=im_transforms,
+                                                      augmentation=data_config.augment,
+                                                      batch_size=data_config.val_batch_size)
+            if len(self.test_set) == 0:
+                raise ValueError('No valid test data provided. Please add some.')
+        else:
+            raise ValueError('Invalid specification of training/evaluation/test data.')
+
+    def train_dataloader(self):
+        world_size = get_world_size() if is_initialized() else 1
+        if self.hparams.sampling_weights:
+            weights = list(chain(*[(weight,) * ppf for weight, ppf in zip(self.train_set.pages_per_file, self.hparams.sampling_weights)]))
+            sampler = WeightedRandomSampler(weights,
+                                            replacement=True,
+                                            num_samples=self.train_set.num_batches // world_size)
+        else:
+            sampler = RandomSampler(self.train_set,
+                                    replacement=True,
+                                    num_samples=self.train_set.num_batches // world_size)
+
+        return DataLoader(self.train_set,
+                          num_workers=self.hparams.num_workers,
+                          batch_size=1,
+                          sampler=sampler,
+                          pin_memory=True,
+                          shuffle=False,
+                          collate_fn=collate_null)
+
+    def val_dataloader(self):
+        return DataLoader(self.val_set,
+                          shuffle=False,
+                          batch_size=1,
+                          num_workers=self.hparams.data_config.num_workers,
+                          pin_memory=True,
+                          collate_fn=collate_null,
+                          worker_init_fn=_validation_worker_init_fn)
+
+    def test_dataloader(self):
+        return DataLoader(self.test_set,
+                          shuffle=False,
+                          batch_size=1,
+                          num_workers=self.hparams.data_config.num_workers,
+                          pin_memory=True,
+                          collate_fn=collate_null,
+                          worker_init_fn=_validation_worker_init_fn)
+
+
+class PartyRecognitionModel(L.LightningModule):
     """
     A LightningModule encapsulating the training setup for a text
     recognition model.
     """
     def __init__(self,
-                 quit: Literal['fixed', 'early'] = 'fixed',
-                 lag: int = 10,
-                 optimizer: str = 'Mars',
-                 lr: float = 1e-3,
-                 momentum: float = 0.9,
-                 weight_decay: float = 1e-3,
-                 schedule: Literal['cosine', 'exponential', 'step', 'reduceonplateau', 'constant'] = 'cosine',
-                 step_size: int = 10,
-                 gamma: float = 0.1,
-                 sched_factor: float = 0.1,
-                 sched_patience: int = 5,
-                 cos_max: float = 30,
-                 cos_min_lr: float = 1e-4,
-                 warmup: int = 15000,
-                 encoder: str = 'convnextv2_base.fcmae_ft_in22k_in1k',
-                 encoder_input_size: tuple[int, int] = (2560, 1920),
-                 encoder_idxs: list[int] = (2,),
-                 decoder: str = 'mittagessen/bytellama-40m-oscar',
-                 pretrained: bool = True,
-                 freeze_encoder: bool = False,
-                 batch_size: int = 16,
-                 **kwargs):
+                 config: PartyRecognitionTrainingConfig,
+                 model: Optional['BaseModel'] = None):
         super().__init__()
+        self.save_hyperparameters(ignore=['model'])
 
-        self.best_epoch = -1
-        self.best_metric = 0.0
-        self.best_model = None
+        if model:
+            self.net = model
 
-        self.save_hyperparameters()
-        backbone = timm.create_model(encoder,
-                                     pretrained=pretrained,
-                                     features_only=True,
-                                     out_indices=encoder_idxs)
-
-        encoder_max_seq_len = sum((encoder_input_size[0]//red * encoder_input_size[1] // red) for red in backbone.feature_info.reduction())
-
-        decoder_model = bytellama_vision_decoder(pretrained=decoder if pretrained else None,
-                                                 encoder_max_seq_len=encoder_max_seq_len)
-
-        self.model = PartyModel(encoder=backbone,
-                                decoder=decoder_model,
-                                encoder_embed_dim=backbone.feature_info.channels()[0],
-                                decoder_embed_dim=decoder_model.tok_embeddings.embedding_dim)
-
-        if freeze_encoder:
-            for param in self.model.encoder.parameters():
-                param.requires_grad = False
-            for param in self.model.adapter.parameters():
-                param.requires_grad = False
-
-        self.model.train()
+            if self.net.model_type not in [None, 'recognition']:
+                raise ValueError(f'Model {model} is of type {self.net.model_type} while `recognition` is expected.')
+        else:
+            self.net = None
 
         self.criterion = nn.CrossEntropyLoss()
-        self.model_step = model_step
-
         self.val_mean = MeanMetric()
 
+        self.model_step = model_step
+
     def forward(self, x, curves):
-        return self.model(encoder_input=x,
-                          encoder_curves=curves)
+        return self.net(encoder_input=x, encoder_curves=curves)
 
     def training_step(self, batch, batch_idx):
-        loss = self.model_step(self.model, self.criterion, batch)
+        loss = self.model_step(self.net, self.criterion, batch)
         self.log('train_loss',
                  loss,
                  batch_size=batch['tokens'].shape[0],
@@ -148,10 +193,10 @@ class RecognitionModel(L.LightningModule):
 
         if batch['curves'] is not None:
             for batch_tokens, batch_targets, batch_curves in zip(tokens.split(batch_size), targets.split(batch_size), batch['curves'].split(batch_size)):
-                logits = self.model(tokens=tokens,
-                                    encoder_input=batch['image'],
-                                    encoder_curves=batch['curves'],
-                                    encoder_boxes=None)
+                logits = self.net(tokens=tokens,
+                                  encoder_input=batch['image'],
+                                  encoder_curves=batch['curves'],
+                                  encoder_boxes=None)
 
                 logits = logits.reshape(-1, logits.shape[-1])
                 loss = nn.CrossEntropyLoss(reduction='none')(logits, targets)
@@ -159,10 +204,10 @@ class RecognitionModel(L.LightningModule):
 
         if batch['boxes'] is not None:
             for batch_tokens, batch_targets, batch_boxes in zip(tokens.split(batch_size), targets.split(batch_size), batch['boxes'].split(batch_size)):
-                logits = self.model(tokens=tokens,
-                                    encoder_input=batch['image'],
-                                    encoder_curves=None,
-                                    encoder_boxes=batch['boxes'])
+                logits = self.net(tokens=tokens,
+                                  encoder_input=batch['image'],
+                                  encoder_curves=None,
+                                  encoder_boxes=batch['boxes'])
 
                 logits = logits.reshape(-1, logits.shape[-1])
                 loss = nn.CrossEntropyLoss(reduction='none')(logits, targets)
@@ -175,43 +220,69 @@ class RecognitionModel(L.LightningModule):
             self.log('global_step', self.global_step, on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
         self.val_mean.reset()
 
-    def save_checkpoint(self, filename):
-        self.trainer.save_checkpoint(filename)
+    def setup(self, stage: Optional[str] = None):
+        if stage in [None, 'fit']:
+            if self.net is None:
+                self.net = create_model('PartyModel',
+                                        image_size=self.trainer.datamodule.hparams.data_config.image_size)
+
+            if self.hparams.config.freeze_encoder:
+                for param in self.net.encoder.parameters():
+                    param.requires_grad = False
+                for param in self.net.adapter.parameters():
+                    param.requires_grad = False
+
+    def on_save_checkpoint(self, checkpoint):
+        """
+        Save hyperparameters a second time so we can set parameters that
+        shouldn't be overwritten in on_load_checkpoint.
+        """
+        checkpoint['_module_config'] = self.hparams.config
+
+    def on_load_checkpoint(self, checkpoint):
+        """
+        Reconstruct the model from the spec here and not in setup() as
+        otherwise the weight loading will fail.
+        """
+        if not isinstance(checkpoint['_module_config'], PartyRecognitionTrainingConfig):
+            raise ValueError('Checkpoint is not a party model.')
+
+        data_config = checkpoint['datamodule_hyper_parameters']['data_config']
+        self.net = create_model('PartyModel',
+                                image_size=data_config.image_size)
 
     @classmethod
-    def load_from_repo(cls, id=None, *args, **kwargs):
+    def load_from_repo(cls,
+                       id: str,
+                       config: PartyRecognitionTrainingConfig):
         """
-        Loads weights from a huggingface hub repository.
+        Loads weights from HTRMoPo.
         """
         from htrmopo import get_model
-        from safetensors.torch import load_file
-
-        module = cls(*args, **kwargs, pretrained=False)
 
         model_path = get_model(id) / 'model.safetensors'
-        module.model.load_state_dict(load_file(model_path))
-        module.model.train()
-        return module
+        return cls.load_from_weights(path=model_path, config=config)
 
     @classmethod
-    def load_from_safetensors(cls, file=None, *args, **kwargs):
+    def load_from_weights(cls,
+                          path: Union[str, 'PathLike'],
+                          config: PartyRecognitionTrainingConfig) -> 'PartyRecognitionModel':
         """
-        Loads weights from a huggingface hub repository.
+        Initializes the module from a model weights file.
         """
-        from safetensors.torch import load_file
-
-        module = cls(*args, **kwargs, pretrained=False)
-        module.model.load_state_dict(load_file(file))
-        module.model.train()
-        return module
+        from kraken.models import load_models
+        models = load_models(path, tasks=['recognition'])
+        if len(models) != 1:
+            raise ValueError(f'Found {len(models)} segmentation models in model file.')
+        return cls(config=config, model=models[0])
 
     def configure_callbacks(self):
         callbacks = []
         if self.hparams.quit == 'early':
             callbacks.append(EarlyStopping(monitor='val_metric',
                                            mode='min',
-                                           patience=self.hparams.lag,
-                                           stopping_threshold=1.0))
+                                           patience=self.hparams.config.lag,
+                                           stopping_threshold=0.0))
 
         return callbacks
 
@@ -222,28 +293,24 @@ class RecognitionModel(L.LightningModule):
     # batch-wise learning rate warmup. In lr_scheduler_step() calls to the
     # scheduler are then only performed at the end of the epoch.
     def configure_optimizers(self):
-        return _configure_optimizer_and_lr_scheduler(self.hparams,
-                                                     self.model,
-                                                     loss_tracking_mode='min')
+        return configure_optimizer_and_lr_scheduler(self.hparams.config,
+                                                    self.net.parameters(),
+                                                    len_train_set=len(self.trainer.datamodule.train_set),
+                                                    loss_tracking_mode='min')
 
     def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_closure):
         # update params
         optimizer.step(closure=optimizer_closure)
 
-        # linear warmup between 0 and the initial learning rate `lr` in `warmup`
+        # linear warmup between 0 and the initial learning rate `lrate` in `warmup`
         # steps.
-        if self.hparams.warmup and self.trainer.global_step < self.hparams.warmup:
-            lr_scale = min(1.0, float(self.trainer.global_step + 1) / self.hparams.warmup)
+        if self.hparams.config.warmup and self.trainer.global_step < self.hparams.config.warmup:
+            lr_scale = min(1.0, float(self.trainer.global_step + 1) / self.hparams.config.warmup)
             for pg in optimizer.param_groups:
-                if 'lr_scale' in pg:
-                    lr_scale = pg['lr_scale'] * lr_scale
-                if self.hparams.optimizer not in ['Adam8bit', 'Adam4bit', 'AdamW8bit', 'AdamW4bit', 'AdamWFp8']:
-                    pg['lr'] = lr_scale * self.hparams.lr
-                else:
-                    pg['lr'].fill_(lr_scale * self.hparams.lr)
+                pg["lr"] = lr_scale * self.hparams.config.lrate
 
     def lr_scheduler_step(self, scheduler, metric):
-        if not self.hparams.warmup or self.trainer.global_step >= self.hparams.warmup:
+        if not self.hparams.config.warmup or self.trainer.global_step >= self.hparams.config.warmup:
             # step OneCycleLR each batch if not in warmup phase
             if isinstance(scheduler, lr_scheduler.OneCycleLR):
                 scheduler.step()
@@ -253,80 +320,3 @@ class RecognitionModel(L.LightningModule):
                     scheduler.step()
                 else:
                     scheduler.step(metric)
-
-
-def _configure_optimizer_and_lr_scheduler(hparams, model, loss_tracking_mode='min'):
-    optimizer = hparams.get("optimizer")
-    lr = hparams.get("lr")
-    momentum = hparams.get("momentum")
-    weight_decay = hparams.get("weight_decay")
-    schedule = hparams.get("schedule")
-    gamma = hparams.get("gamma")
-    cos_max = hparams.get("cos_max")
-    cos_min_lr = hparams.get("cos_min_lr")
-    step_size = hparams.get("step_size")
-    sched_factor = hparams.get("sched_factor")
-    sched_patience = hparams.get("sched_patience")
-    completed_epochs = hparams.get("completed_epochs", 0)
-
-    encoder_params = []
-    rest_params = []
-
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-        if 'encoder' in name:
-            encoder_params.append(param)
-        else:
-            rest_params.append(param)
-
-    param_groups = [{'params': encoder_params, 'lr': lr / 10.},
-                    {'params': rest_params, 'lr': lr}]
-
-    # XXX: Warmup is not configured here because it needs to be manually done in optimizer_step()
-    logger.debug(f'Constructing {optimizer} optimizer (lr: {lr}, momentum: {momentum})')
-    if optimizer in ['Adam', 'AdamW']:
-        optim = getattr(torch.optim, optimizer)(param_groups, lr=lr, weight_decay=weight_decay)
-    elif optimizer in ['Adam8bit', 'Adam4bit', 'AdamW8bit', 'AdamW4bit', 'AdamWFp8']:
-        import torchao.prototype.low_bit_optim
-        optim = getattr(torchao.prototype.low_bit_optim, optimizer)(param_groups, lr=lr, weight_decay=weight_decay)
-    elif optimizer == 'Mars':
-        from timm.optim import Mars
-        optim = Mars(param_groups, lr=lr, weight_decay=weight_decay, caution=True)
-    else:
-        optim = getattr(torch.optim, optimizer)(param_groups,
-                                                lr=lr,
-                                                momentum=momentum,
-                                                weight_decay=weight_decay)
-    lr_sched = {}
-    if schedule == 'exponential':
-        lr_sched = {'scheduler': lr_scheduler.ExponentialLR(optim, gamma, last_epoch=completed_epochs-1),
-                    'interval': 'step'}
-    elif schedule == 'cosine':
-        lr_sched = {'scheduler': lr_scheduler.CosineAnnealingLR(optim,
-                                                                cos_max,
-                                                                cos_min_lr,
-                                                                last_epoch=completed_epochs-1),
-                    'interval': 'step'}
-    elif schedule == 'step':
-        lr_sched = {'scheduler': lr_scheduler.StepLR(optim, step_size, gamma, last_epoch=completed_epochs-1),
-                    'interval': 'step'}
-    elif schedule == 'reduceonplateau':
-        lr_sched = {'scheduler': lr_scheduler.ReduceLROnPlateau(optim,
-                                                                mode=loss_tracking_mode,
-                                                                factor=sched_factor,
-                                                                patience=sched_patience),
-                    'interval': 'step'}
-    elif schedule != 'constant':
-        raise ValueError(f'Unsupported learning rate scheduler {schedule}.')
-
-    ret = {'optimizer': optim}
-    if lr_sched:
-        ret['lr_scheduler'] = lr_sched
-
-    if schedule == 'reduceonplateau':
-        lr_sched['monitor'] = 'val_accuracy'
-        lr_sched['strict'] = False
-        lr_sched['reduce_on_plateau'] = True
-
-    return ret
