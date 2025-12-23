@@ -31,6 +31,8 @@ from torch.distributed import get_world_size, is_initialized
 from kraken.train.utils import configure_optimizer_and_lr_scheduler
 from torch.utils.data import RandomSampler, WeightedRandomSampler, DataLoader
 
+from party.tokenizer import OFFSET, LANG_OFFSET
+from party.modules import NoisyTeacherForcing
 from party.dataset import (collate_null, get_default_transforms,
                            BinnedBaselineDataset, ValidationBaselineDataset,
                            _validation_worker_init_fn)
@@ -44,13 +46,14 @@ logger = logging.getLogger(__name__)
 
 
 @torch.compile(dynamic=False)
-def model_step(model, criterion, batch):
+def model_step(model, ntf, criterion, batch):
     tokens = batch['tokens']
+    targets = ntf(tokens.clone()[..., 1:])
     # shift the tokens to create targets
     ignore_idxs = torch.full((tokens.shape[0], 1),
                              criterion.ignore_index,
                              dtype=tokens.dtype, device=tokens.device)
-    targets = torch.hstack((tokens[..., 1:], ignore_idxs)).reshape(-1)
+    targets = torch.hstack((targets, ignore_idxs)).reshape(-1)
 
     # our tokens already contain BOS/EOS tokens so we just run it
     # through the model after replacing ignored indices.
@@ -153,13 +156,18 @@ class PartyRecognitionModel(L.LightningModule):
         self.criterion = nn.CrossEntropyLoss()
         self.val_mean = MeanMetric()
 
+        p_nft = self.hparams.config.noisy_teacher_forcing
+        self.noisy_teacher_forcing = nn.Identity() if p_nft == 0. else NoisyTeacherForcing(min_label=OFFSET,
+                                                                                           max_label=LANG_OFFSET,
+                                                                                           p=p_nft)
+
         self.model_step = model_step
 
     def forward(self, x, curves):
         return self.net(encoder_input=x, encoder_curves=curves)
 
     def training_step(self, batch, batch_idx):
-        loss = self.model_step(self.net, self.criterion, batch)
+        loss = self.model_step(self.net, self.noisy_teacher_forcing, self.criterion, batch)
         self.log('train_loss',
                  loss,
                  batch_size=batch['tokens'].shape[0],

@@ -20,6 +20,7 @@ class PartyRecognitionTrainingConfig(TrainingConfig):
         kwargs.setdefault('warmup', 1000)
         kwargs.setdefault('accumulate_grad_batches', 4)
         kwargs.setdefault('augment', True)
+        kwargs.setdefault('noisy_teacher_forcing', 0.1)
         super().__init__(**kwargs)
 
 
