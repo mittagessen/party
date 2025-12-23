@@ -67,8 +67,6 @@ def model_step(model, criterion, batch):
 class PartyTextLineDataModule(L.LightningDataModule):
     def __init__(self, data_config: PartyRecognitionTrainingDataConfig):
         super().__init__()
-        if data_config.sampling_weights is not None and len(data_config.sampling_weights) != len(data_config.training_data):
-            raise ValueError('Per-file sampling weights need to be same length as training_data.')
 
         self.save_hyperparameters()
         self.hparams.data_config.val_batch_size = data_config.batch_size if not data_config.val_batch_size else data_config.val_batch_size
@@ -102,15 +100,9 @@ class PartyTextLineDataModule(L.LightningDataModule):
 
     def train_dataloader(self):
         world_size = get_world_size() if is_initialized() else 1
-        if self.hparams.sampling_weights:
-            weights = list(chain(*[(weight,) * ppf for weight, ppf in zip(self.train_set.pages_per_file, self.hparams.sampling_weights)]))
-            sampler = WeightedRandomSampler(weights,
-                                            replacement=True,
-                                            num_samples=self.train_set.num_batches // world_size)
-        else:
-            sampler = RandomSampler(self.train_set,
-                                    replacement=True,
-                                    num_samples=self.train_set.num_batches // world_size)
+        sampler = RandomSampler(self.train_set,
+                                replacement=True,
+                                num_samples=self.train_set.num_batches // world_size)
 
         return DataLoader(self.train_set,
                           num_workers=self.hparams.num_workers,
@@ -189,29 +181,25 @@ class PartyRecognitionModel(L.LightningModule):
         # through the model after replacing ignored indices.
         tokens.masked_fill_(tokens == self.criterion.ignore_index, 0)
 
-        batch_size = self.hparams.batch_size
-
         if batch['curves'] is not None:
-            for batch_tokens, batch_targets, batch_curves in zip(tokens.split(batch_size), targets.split(batch_size), batch['curves'].split(batch_size)):
-                logits = self.net(tokens=tokens,
-                                  encoder_input=batch['image'],
-                                  encoder_curves=batch['curves'],
-                                  encoder_boxes=None)
+            logits = self.net(tokens=tokens,
+                              encoder_input=batch['image'],
+                              encoder_curves=batch['curves'],
+                              encoder_boxes=None)
 
-                logits = logits.reshape(-1, logits.shape[-1])
-                loss = nn.CrossEntropyLoss(reduction='none')(logits, targets)
-                self.val_mean.update(loss)
+            logits = logits.reshape(-1, logits.shape[-1])
+            loss = nn.CrossEntropyLoss(reduction='none')(logits, targets)
+            self.val_mean.update(loss)
 
         if batch['boxes'] is not None:
-            for batch_tokens, batch_targets, batch_boxes in zip(tokens.split(batch_size), targets.split(batch_size), batch['boxes'].split(batch_size)):
-                logits = self.net(tokens=tokens,
-                                  encoder_input=batch['image'],
-                                  encoder_curves=None,
-                                  encoder_boxes=batch['boxes'])
+            logits = self.net(tokens=tokens,
+                              encoder_input=batch['image'],
+                              encoder_curves=None,
+                              encoder_boxes=batch['boxes'])
 
-                logits = logits.reshape(-1, logits.shape[-1])
-                loss = nn.CrossEntropyLoss(reduction='none')(logits, targets)
-                self.val_mean.update(loss)
+            logits = logits.reshape(-1, logits.shape[-1])
+            loss = nn.CrossEntropyLoss(reduction='none')(logits, targets)
+            self.val_mean.update(loss)
         return loss
 
     def on_validation_epoch_end(self):
@@ -278,7 +266,7 @@ class PartyRecognitionModel(L.LightningModule):
 
     def configure_callbacks(self):
         callbacks = []
-        if self.hparams.quit == 'early':
+        if self.hparams.config.quit == 'early':
             callbacks.append(EarlyStopping(monitor='val_metric',
                                            mode='min',
                                            patience=self.hparams.config.lag,

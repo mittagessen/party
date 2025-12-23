@@ -31,7 +31,6 @@ class PartyRecognitionTrainingDataConfig(RecognitionTrainingDataConfig):
         self.val_batch_size = kwargs.pop('val_batch_size', None)
         self.image_size = kwargs.pop('image_size', (2560, 1920))
         self.prompt_mode = kwargs.pop('prompt_mode', 'both')
-        self.sampling_weights = kwargs.pop('sampling_weights', None)
 
         kwargs.setdefault('batch_size', 16)
 

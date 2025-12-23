@@ -175,7 +175,6 @@ def compile(ctx, **params):
 @click.option('--warmup', type=int, help='Number of steps to ramp up to `lrate` initial learning rate.')
 @click.option('--augment/--no-augment', help='Enable image augmentation')
 @click.option('--accumulate-grad-batches', type=int, help='Number of batches to accumulate gradient across.')
-@click.option('--sampling-weights', type=click.UNPROCESSED, default=repeat(1), hidden=True)
 @click.option('-t', '--training-files', 'training_data', multiple=True, type=click.File(mode='r', lazy=True),
               help='File(s) with additional paths to training data')
 @click.option('-e', '--evaluation-files', 'evaluation_data', default=None, multiple=True,
@@ -201,12 +200,9 @@ def train(ctx, **kwargs):
     ground_truth = list(params.pop('ground_truth', []))
 
     train_from_scratch = params.pop('train_from_scratch', None)
-    sampling_weights = iter(params.pop('sampling_weights', repeat(1)))
 
-    weights = len(ground_truth) * [1,]
     for training_file in training_data:
         manifest_contents = _validate_manifests(ctx, None, [training_file])
-        weights.extend([next(sampling_weights),] * len(manifest_contents))
         ground_truth.extend(manifest_contents)
 
     if len(ground_truth) == 0:
