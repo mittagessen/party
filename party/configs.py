@@ -10,6 +10,8 @@ class PartyRecognitionTrainingConfig(TrainingConfig):
     def __init__(self, **kwargs):
         self.freeze_encoder = kwargs.pop('freeze_encoder', False)
         self.train_from_scratch = kwargs.pop('train_from_scratch', False)
+        self.noisy_teacher_forcing = kwargs.pop('noisy_teacher_forcing', 0.1)
+
         kwargs.setdefault('quit', 'fixed')
         kwargs.setdefault('epochs', 12)
         kwargs.setdefault('lrate', 5e-4)
@@ -20,7 +22,6 @@ class PartyRecognitionTrainingConfig(TrainingConfig):
         kwargs.setdefault('warmup', 1000)
         kwargs.setdefault('accumulate_grad_batches', 4)
         kwargs.setdefault('augment', True)
-        kwargs.setdefault('noisy_teacher_forcing', 0.1)
         super().__init__(**kwargs)
 
 
