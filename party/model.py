@@ -105,7 +105,7 @@ class PartyTextLineDataModule(L.LightningDataModule):
                                 num_samples=self.train_set.num_batches // world_size)
 
         return DataLoader(self.train_set,
-                          num_workers=self.hparams.num_workers,
+                          num_workers=self.hparams.data_config.num_workers,
                           batch_size=1,
                           sampler=sampler,
                           pin_memory=True,
