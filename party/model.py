@@ -153,10 +153,10 @@ class PartyRecognitionModel(L.LightningModule):
         else:
             self.net = None
 
-        self.criterion = nn.CrossEntropyLoss()
+        self.criterion = nn.CrossEntropyLoss(label_smoothing=config.label_smoothing)
         self.val_mean = MeanMetric()
 
-        p_nft = self.hparams.config.noisy_teacher_forcing
+        p_nft = config.noisy_teacher_forcing
         self.noisy_teacher_forcing = nn.Identity() if p_nft == 0. else NoisyTeacherForcing(min_label=OFFSET,
                                                                                            max_label=LANG_OFFSET,
                                                                                            p=p_nft)

@@ -174,7 +174,8 @@ def compile(ctx, **params):
 @click.option('--freeze-encoder/--no-freeze-encoder', help='Switch to freeze the encoder')
 @click.option('--warmup', type=int, help='Number of steps to ramp up to `lrate` initial learning rate.')
 @click.option('--augment/--no-augment', help='Enable image augmentation')
-@click.option('--noisy-teacher-forcing', type=float, help='Probability that each individual target token is altered for NTF.')
+@click.option('--noisy-teacher-forcing', type=click.FloatRange(0.0, 1.0), help='Probability that each individual target token is altered for NTF.')
+@click.option('--label-smoothing', type=type=click.FloatRange(0.0, 1.0), help='Amount of label smoothing')
 @click.option('--accumulate-grad-batches', type=int, help='Number of batches to accumulate gradient across.')
 @click.option('-t', '--training-files', 'training_data', multiple=True, type=click.File(mode='r', lazy=True),
               help='File(s) with additional paths to training data')
