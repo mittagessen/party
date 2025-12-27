@@ -246,6 +246,7 @@ class PartyRecognitionModel(L.LightningModule):
 
         data_config = checkpoint['datamodule_hyper_parameters']['data_config']
         self.net = create_model('PartyModel',
+                                pretrained=True,
                                 image_size=data_config.image_size)
 
     @classmethod
