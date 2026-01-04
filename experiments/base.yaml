@@ -5,18 +5,17 @@ workers: 4  # because of page-wise sampling it is not necessary to scale worker
 threads: 1
 train:
   # training data manifests
-  training_files: 
+  training_data: 
     - /home/mittagessen/party_dataset/train.lst
     - /home/mittagessen/party_dataset/train_2.lst
-  evaluation_files: 
+  evaluation_data: 
     - /home/mittagessen/party_dataset/val.lst
-  # 
   # directory to save checkpoints in
-  output: /home/mittagessen/party_models
+  checkpoint_path: /home/mittagessen/party_models
   # text transforms
   normalization: NFD
   normalize_whitespace: true
-  # whether to train on bbox, baseline, or both line prompts
+  # whether to train on `boxes`, `curves`, or `both` line prompt types
   prompt_mode: both
   # base configuration of training epochs and LR schedule
   epochs: 24
@@ -25,6 +24,8 @@ train:
   cos_max: 18
   cos_min_lr: 5e-6
   warmup: 1000
+  label_smoothing: 0.1
+  noisy_teacher_forcing: 0.1
   augmentation: true
   validate_before_train: false
   # effective batch size params
