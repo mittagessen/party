@@ -365,7 +365,7 @@ class BinnedBaselineDataset(Dataset):
 
         else:
             sample = []
-            for x in np.random.choice(len(page_data), self.batch_size, replace=True, shuffle=False):
+            for x in np.random.choice(len(page_data), self.batch_size, replace=True):
                 line = page_data[x]
                 tokens = torch.tensor(self.tokenizer.encode(line['text'], langs=[lang], add_bos=True, add_eos=True), dtype=torch.int32)
                 curve = torch.tensor(line['curve']).view(4, 2) if not return_boxes else None
