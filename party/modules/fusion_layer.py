@@ -15,7 +15,7 @@ class FusionLayer(nn.Module):
 
     Deep Fusion model architectures combine pretrained encoder models with pretrained
     language models by infusing the encoder outputs into the middle layers of the LLM.
-    This allows the language model to interpret the enocder outputs as text and
+    This allows the language model to interpret the encoder outputs as text and
     "understand" any modality for which you can train an encoder. To enable the language model
     to adapt to the encoder outputs, the FusionLayer fuses a new learnable layer to an existing
     decoder (language model) layer. This additional layer can take the encoder embeddings and
@@ -63,7 +63,7 @@ class FusionLayer(nn.Module):
 
     def _state_dict_hook(self, state_dict, prefix, *args, **kwargs):
         """Remove "layer" from the original layer in the state_dict
-        name. This keeps the orginal state dict name for the layer
+        name. This keeps the original state dict name for the layer
         from before fusing with the FusionLayer.
 
         [!Note] This update changes the order of the OrderedDict

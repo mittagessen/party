@@ -48,7 +48,7 @@ Checkpoints need to be converted into a safetensors format before being usable f
 
 ## Inference
 
-Inference and teseting requires a working [kraken](https://kraken.re) installation.
+Inference and testing requires a working [kraken](https://kraken.re) installation.
 
 To recognize text in pre-segmented page images in PageXML or ALTO with the pretrained model run:
 
