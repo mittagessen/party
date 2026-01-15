@@ -327,8 +327,8 @@ class BinnedBaselineDataset(Dataset):
                 self.max_seq_len = max(int.from_bytes(raw_metadata[b'max_octets_in_line'], 'little'), self.max_seq_len)
 
         if augmentation:
-            from party.augmentation import DefaultAugmenter
-            self.aug = DefaultAugmenter()
+            from party.augmentation import Augmenter
+            self.aug = Augmenter()
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         item = self.arrow_table.column('pages')[index].as_py()
@@ -339,14 +339,6 @@ class BinnedBaselineDataset(Dataset):
         except Exception:
             return self[0]
 
-        im = self.transforms(im)
-        if self.aug:
-            im = im.permute((1, 2, 0)).numpy()
-            o = self.aug(image=im)
-            im = torch.tensor(o['image'].transpose(2, 0, 1))
-
-        # sample randomly between baselines
-        sample = []
         if self.prompt_mode == 'both':
             rng = np.random.default_rng()
             return_boxes = rng.choice([False, True], 1)
@@ -354,12 +346,34 @@ class BinnedBaselineDataset(Dataset):
             return_boxes = True
         else:
             return_boxes = False
-        for x in rng.choice(len(page_data), self.batch_size, replace=True, shuffle=False):
-            line = page_data[x]
-            tokens = torch.tensor(self.tokenizer.encode(line['text'], langs=[lang], add_bos=True, add_eos=True), dtype=torch.int32)
-            curve = torch.tensor(line['curve']).view(4, 2) if not return_boxes else None
-            bbox = torch.tensor(line['bbox']).view(4, 2) if return_boxes else None
-            sample.append((tokens, curve, bbox))
+
+        if self.aug:
+            all_lines = []
+            for line in page_data:
+                tokens = torch.tensor(self.tokenizer.encode(line['text'], langs=[lang], add_bos=True, add_eos=True), dtype=torch.int32)
+                curve = torch.tensor(line['curve']).view(4, 2) if not return_boxes else None
+                bbox = torch.tensor(line['bbox']).view(4, 2) if return_boxes else None
+                all_lines.append((tokens, curve, bbox))
+
+            im, valid_lines = self.aug(np.array(im), all_lines)
+
+            if not valid_lines:
+                return self[np.random.randint(len(self))]
+            
+            indices = np.random.choice(len(valid_lines), self.batch_size, replace=True)
+            sample = [valid_lines[i] for i in indices]
+
+        else:
+            sample = []
+            for x in np.random.choice(len(page_data), self.batch_size, replace=True, shuffle=False):
+                line = page_data[x]
+                tokens = torch.tensor(self.tokenizer.encode(line['text'], langs=[lang], add_bos=True, add_eos=True), dtype=torch.int32)
+                curve = torch.tensor(line['curve']).view(4, 2) if not return_boxes else None
+                bbox = torch.tensor(line['bbox']).view(4, 2) if return_boxes else None
+                sample.append((tokens, curve, bbox))
+
+        im = self.transforms(im)
+
         return collate_sequences(im.unsqueeze(0), sample, self.max_seq_len, index)
 
     def __len__(self) -> int:
@@ -416,8 +430,8 @@ class ValidationBaselineDataset(IterableDataset):
                 self.max_seq_len = max(int.from_bytes(raw_metadata[b'max_octets_in_line'], 'little'), self.max_seq_len)
 
         if augmentation:
-            from party.augmentation import DefaultAugmenter
-            self.aug = DefaultAugmenter()
+            from party.augmentation import Augmenter
+            self.aug = Augmenter(crop=False, perspective=False)
 
     def __iter__(self):
         device_rank, world_size = (get_rank(), get_world_size()) if is_initialized() else (0, 1)
@@ -435,14 +449,7 @@ class ValidationBaselineDataset(IterableDataset):
             item = self.arrow_table.column('pages')[idx].as_py()
             logger.debug(f'Attempting to load {item["im"]}')
             im, lang, page_data = item['im'], item['lang'], item['lines']
-            im = Image.open(io.BytesIO(im)).convert('RGB')
-            im = self.transforms(im)
-            if self.aug:
-                im = im.permute((1, 2, 0)).numpy()
-                o = self.aug(image=im)
-                im = torch.tensor(o['image'].transpose(2, 0, 1))
-
-            im = im.unsqueeze(0)
+            pil_im = Image.open(io.BytesIO(im)).convert('RGB')
 
             if self.prompt_mode == 'both':
                 return_boxes = True
@@ -455,23 +462,34 @@ class ValidationBaselineDataset(IterableDataset):
                 return_curves = True
 
             for lines in batched(page_data, self.batch_size):
-                curves = []
-                boxes = []
-                tokens = []
+                sample = []
                 for line in lines:
-                    if return_curves:
-                        curves.append(torch.tensor(line['curve']).view(4, 2))
-                    if return_boxes:
-                        boxes.append(torch.tensor(line['bbox']).view(4, 2))
-                    tokens.append(torch.tensor(self.tokenizer.encode(line['text'], langs=[lang], add_bos=True, add_eos=True), dtype=torch.int32))
+                    text = torch.tensor(self.tokenizer.encode(line['text'], langs=[lang], add_bos=True, add_eos=True), dtype=torch.int32)
+                    curve = torch.tensor(line['curve']).view(4, 2) if return_curves else None
+                    box = torch.tensor(line['bbox']).view(4, 2) if return_boxes else None
+                    sample.append((text, curve, box))
+
+                if self.aug:
+                    aug_im, sample = self.aug(np.array(pil_im), sample)
+                    im = self.transforms(aug_im)
+                else:
+                    im = self.transforms(pil_im)
+
+                im = im.unsqueeze(0)
+
+                # unpack sample
+                tokens = [s[0] for s in sample]
+                curves = [s[1] for s in sample if s[1] is not None]
+                boxes = [s[2] for s in sample if s[2] is not None]
 
                 tokens = torch.stack([F.pad(x, pad=(0, self.max_seq_len-len(x)), value=-100) for x in tokens]).long()
-                boxes = torch.stack(boxes) if len(boxes) else None
-                curves = torch.stack(curves) if len(curves) else None
+                boxes = torch.stack(boxes) if len(boxes) > 0 else None
+                curves = torch.stack(curves) if len(curves) > 0 else None
                 yield {'image': im,
                        'boxes': boxes,
                        'curves': curves,
                        'tokens': tokens}
+
 
 
 class TestBaselineDataset(Dataset):
