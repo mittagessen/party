@@ -184,9 +184,9 @@ class Augmenter(torch.nn.Module):
     def __init__(self,
                  image_size: tuple[int, int] = (2560, 1920)):
         super().__init__()
-        self.crop = RandomResizedCrop(size=image_size)
-        self.rotate = RandomRotation()
-        self.perspective = RandomPerspectiveWarp()
+        self.crop = RandomResizedCrop(size=image_size, p=0.1)
+        self.rotate = RandomRotation(p=0.1)
+        self.perspective = RandomPerspectiveWarp(p=0.1)
 
         self.photometric_transforms = v2.Compose([v2.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.5, hue=0.1),
                                                   v2.RandomGrayscale(),
