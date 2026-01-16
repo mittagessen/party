@@ -283,8 +283,6 @@ class BinnedBaselineDataset(Dataset):
     assumption that each page contains the same number of lines).
 
     Args:
-        im_transforms: Function taking an PIL.Image and returning a tensor
-                       suitable for forward passes.
         prompt_mode: Select line prompt sampling mode: `boxes` for bbox-only,
                      `curves` for curves-only, and `both` for randomly
                      switching between the two.
@@ -295,14 +293,14 @@ class BinnedBaselineDataset(Dataset):
     def __init__(self,
                  files: Sequence[Union[str, 'PathLike']],
                  im_transforms: Callable[[Any], torch.Tensor] = None,
+                 augmentation: Callable[[Any], torch.Tensor] = None,
                  prompt_mode: Literal['boxes', 'curves', 'both'] = 'both',
-                 augmentation: bool = False,
                  batch_size: int = 32) -> None:
         super().__init__()
         self.files = files
-        self.transforms = im_transforms
         self.prompt_mode = prompt_mode
-        self.aug = None
+        self.transforms = im_transforms
+        self.aug = augmentation
         self.batch_size = batch_size
         self.max_seq_len = 0
         self._len = 0
@@ -326,10 +324,6 @@ class BinnedBaselineDataset(Dataset):
                 self._len += int.from_bytes(raw_metadata[b'num_lines'], 'little')
                 self.max_seq_len = max(int.from_bytes(raw_metadata[b'max_octets_in_line'], 'little'), self.max_seq_len)
 
-        if augmentation:
-            from party.augmentation import Augmenter
-            self.aug = Augmenter()
-
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         item = self.arrow_table.column('pages')[index].as_py()
         logger.debug(f'Attempting to load {item["im"]}')
@@ -347,32 +341,20 @@ class BinnedBaselineDataset(Dataset):
         else:
             return_boxes = False
 
-        if self.aug:
-            all_lines = []
-            for line in page_data:
-                tokens = torch.tensor(self.tokenizer.encode(line['text'], langs=[lang], add_bos=True, add_eos=True), dtype=torch.int32)
-                curve = torch.tensor(line['curve']).view(4, 2) if not return_boxes else None
-                bbox = torch.tensor(line['bbox']).view(4, 2) if return_boxes else None
-                all_lines.append((tokens, curve, bbox))
+        lines = []
+        for line in page_data:
+            tokens = torch.tensor(self.tokenizer.encode(line['text'], langs=[lang], add_bos=True, add_eos=True), dtype=torch.int32)
+            curve = torch.tensor(line['curve']).view(4, 2) if not return_boxes else None
+            bbox = torch.tensor(line['bbox']).view(4, 2) if return_boxes else None
+            lines.append((tokens, curve, bbox))
 
-            im, valid_lines = self.aug(np.array(im), all_lines)
-
-            if not valid_lines:
-                return self[np.random.randint(len(self))]
-            
-            indices = np.random.choice(len(valid_lines), self.batch_size, replace=True)
-            sample = [valid_lines[i] for i in indices]
-
-        else:
-            sample = []
-            for x in np.random.choice(len(page_data), self.batch_size, replace=True):
-                line = page_data[x]
-                tokens = torch.tensor(self.tokenizer.encode(line['text'], langs=[lang], add_bos=True, add_eos=True), dtype=torch.int32)
-                curve = torch.tensor(line['curve']).view(4, 2) if not return_boxes else None
-                bbox = torch.tensor(line['bbox']).view(4, 2) if return_boxes else None
-                sample.append((tokens, curve, bbox))
-
+        if self.aug is not None:
+            im, lines = self.aug(im, lines)
+        if not lines:
+            return self[np.random.randint(len(self))]
         im = self.transforms(im)
+        indices = np.random.choice(len(lines), self.batch_size, replace=True)
+        sample = [lines[i] for i in indices]
 
         return collate_sequences(im.unsqueeze(0), sample, self.max_seq_len, index)
 
@@ -397,19 +379,16 @@ class ValidationBaselineDataset(IterableDataset):
         prompt_mode: Select line prompt sampling mode: `boxes` for bbox-only,
                      `curves` for curves-only, and `both` for randomly
                      switching between the two.
-        augmentation: Enables augmentation.
     """
     def __init__(self,
                  files: Sequence[Union[str, 'PathLike']],
                  im_transforms: Callable[[Any], torch.Tensor] = None,
                  prompt_mode: Literal['boxes', 'curves', 'both'] = 'both',
-                 augmentation: bool = False,
                  batch_size: int = 32) -> None:
         super().__init__()
         self.files = files
         self.transforms = im_transforms
         self.prompt_mode = prompt_mode
-        self.aug = None
         self.batch_size = batch_size
         self.max_seq_len = 0
 
@@ -447,10 +426,6 @@ class ValidationBaselineDataset(IterableDataset):
             im, lang, page_data = item['im'], item['lang'], item['lines']
             im = Image.open(io.BytesIO(im)).convert('RGB')
             im = self.transforms(im)
-            if self.aug:
-                im = im.permute((1, 2, 0)).numpy()
-                o = self.aug(image=im)
-                im = torch.tensor(o['image'].transpose(2, 0, 1))
 
             im = im.unsqueeze(0)
 

@@ -30,5 +30,5 @@ class NoisyTeacherForcing(nn.Module):
         noise = torch.randint_like(x, low=self.min_label, high=self.max_label)
         prob = torch.rand_like(x, dtype=torch.float)
         # mask out EOS token
-        prob[:,0] = 1
+        prob[:, 0] = 1
         return torch.where(prob>self.p, x, noise)

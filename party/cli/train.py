@@ -23,7 +23,6 @@ import logging
 import importlib
 
 from pathlib import Path
-from itertools import repeat
 from party.tokenizer import ISO_TO_LANG
 from threadpoolctl import threadpool_limits
 from kraken.registry import OPTIMIZERS, SCHEDULERS, STOPPERS
@@ -219,12 +218,6 @@ def train(ctx, **kwargs):
         raise click.BadOptionsUsage('load', 'load/resume/train_from_scratch options are mutually exclusive.')
     elif resume is None and load is None and train_from_scratch is False:
         load = '10.5281/zenodo.15075344'
-
-    if params.get('augment'):
-        try:
-            import albumentations  # NOQA
-        except ImportError:
-            raise click.BadOptionUsage('augment', 'augmentation needs the `albumentations` package installed.')
 
     import torch
 

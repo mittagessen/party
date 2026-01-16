@@ -20,7 +20,6 @@ import logging
 import lightning.pytorch as L
 
 from torch import nn
-from itertools import chain
 from torch.optim import lr_scheduler
 from kraken.models import create_model
 
@@ -29,7 +28,7 @@ from typing import Optional, TYPE_CHECKING, Union
 from lightning.pytorch.callbacks import EarlyStopping
 from torch.distributed import get_world_size, is_initialized
 from kraken.train.utils import configure_optimizer_and_lr_scheduler
-from torch.utils.data import RandomSampler, WeightedRandomSampler, DataLoader
+from torch.utils.data import RandomSampler, DataLoader
 
 from party.tokenizer import OFFSET, LANG_OFFSET
 from party.modules import NoisyTeacherForcing
@@ -75,15 +74,19 @@ class PartyTextLineDataModule(L.LightningDataModule):
         self.hparams.data_config.val_batch_size = data_config.batch_size if not data_config.val_batch_size else data_config.val_batch_size
 
         im_transforms = get_default_transforms(image_size=data_config.image_size)
+        if data_config.augment:
+            from party.augmentation import Augmenter
+            augmentation = Augmenter(image_size=data_config.image_size)
+        else:
+            augmentation = None
 
         if data_config.training_data and data_config.evaluation_data:
             self.train_set = BinnedBaselineDataset(data_config.training_data,
                                                    im_transforms=im_transforms,
-                                                   augmentation=data_config.augment,
+                                                   augmentation=augmentation,
                                                    batch_size=data_config.batch_size)
             self.val_set = ValidationBaselineDataset(data_config.evaluation_data,
                                                      im_transforms=im_transforms,
-                                                     augmentation=data_config.augment,
                                                      batch_size=data_config.val_batch_size)
             if len(self.train_set) == 0:
                 raise ValueError('No valid training data provided. Please add some.')
@@ -94,7 +97,6 @@ class PartyTextLineDataModule(L.LightningDataModule):
         elif data_config.test_data:
             self.test_set = ValidationBaselineDataset(data_config.test_data,
                                                       im_transforms=im_transforms,
-                                                      augmentation=data_config.augment,
                                                       batch_size=data_config.val_batch_size)
             if len(self.test_set) == 0:
                 raise ValueError('No valid test data provided. Please add some.')
