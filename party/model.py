@@ -74,11 +74,10 @@ class PartyTextLineDataModule(L.LightningDataModule):
         self.hparams.data_config.val_batch_size = data_config.batch_size if not data_config.val_batch_size else data_config.val_batch_size
 
         im_transforms = get_default_transforms(image_size=data_config.image_size)
+        augmentation = None
         if data_config.augment:
             from party.augmentation import Augmenter
             augmentation = Augmenter(image_size=data_config.image_size)
-        else:
-            augmentation = None
 
         if data_config.training_data and data_config.evaluation_data:
             self.train_set = BinnedBaselineDataset(data_config.training_data,

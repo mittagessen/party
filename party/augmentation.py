@@ -29,6 +29,15 @@ logger = logging.getLogger(__name__)
 
 def _transform_points(points, M, size):
     w, h = size
+
+    # use inverse matrix for forward mapping of points
+    if M.shape[0] == 2:
+        M = torch.cat([M, torch.tensor([[0.0, 0.0, 1.0]])], dim=0)
+        M = torch.inverse(M)
+        M = M[:2, :]
+    else:
+        M = torch.inverse(M)
+
     points = points * torch.tensor([w, h], dtype=torch.float32)
     # into homogeneous coordinates
     points = torch.cat([points, torch.ones(points.shape[0], 1)], dim=-1)
@@ -88,7 +97,10 @@ class RandomResizedCrop(torch.nn.Module):
 
 
 class RandomRotation(torch.nn.Module):
-    def __init__(self, degrees: tuple[float, float] = (-5.0, 5.0), interpolation=InterpolationMode.BILINEAR, p: float = 0.5):
+    def __init__(self, 
+                 degrees: tuple[float, float] = (-5.0, 5.0),
+                 interpolation=InterpolationMode.BILINEAR,
+                 p: float = 0.5):
         super().__init__()
         self.degrees = degrees
         self.interpolation = interpolation
@@ -129,7 +141,10 @@ class RandomRotation(torch.nn.Module):
 
 
 class RandomPerspectiveWarp(torch.nn.Module):
-    def __init__(self, distortion_scale: float = 0.2, p: float = 0.5, interpolation=InterpolationMode.BILINEAR):
+    def __init__(self,
+                 distortion_scale: float = 0.2,
+                 p: float = 0.5,
+                 interpolation=InterpolationMode.BILINEAR):
         super().__init__()
         self.distortion_scale = distortion_scale
         self.p = p
@@ -174,6 +189,7 @@ class Augmenter(torch.nn.Module):
         self.perspective = RandomPerspectiveWarp()
 
         self.photometric_transforms = v2.Compose([v2.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.5, hue=0.1),
+                                                  v2.RandomGrayscale(),
                                                   v2.GaussianBlur(kernel_size=3)])
 
     def forward(self, image, lines) -> tuple[torch.Tensor, list]:
