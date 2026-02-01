@@ -1,8 +1,8 @@
 precision: bf16-mixed
 device: auto
-workers: 4  # because of page-wise sampling it is not necessary to scale worker
+num_workers: 4  # because of page-wise sampling it is not necessary to scale worker
             # number with batch size.
-threads: 1
+num_threads: 1
 train:
   # training data manifests
   training_data: 
