@@ -444,12 +444,14 @@ class ValidationBaselineDataset(IterableDataset):
                 curves = []
                 boxes = []
                 tokens = []
+                texts = []
                 for line in lines:
                     if return_curves:
                         curves.append(torch.tensor(line['curve']).view(4, 2))
                     if return_boxes:
                         boxes.append(torch.tensor(line['bbox']).view(4, 2))
                     tokens.append(torch.tensor(self.tokenizer.encode(line['text'], langs=[lang], add_bos=True, add_eos=True), dtype=torch.int32))
+                    texts.append(line['text'])
 
                 tokens = torch.stack([F.pad(x, pad=(0, self.max_seq_len-len(x)), value=-100) for x in tokens]).long()
                 boxes = torch.stack(boxes) if len(boxes) else None
@@ -457,7 +459,8 @@ class ValidationBaselineDataset(IterableDataset):
                 yield {'image': im,
                        'boxes': boxes,
                        'curves': curves,
-                       'tokens': tokens}
+                       'tokens': tokens,
+                       'text': texts}
 
 
 class TestBaselineDataset(Dataset):
