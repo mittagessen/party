@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 """
 Rewrites images stored in JPEG-XL format inside party arrow dataset files
 to JPEG, overwriting the original files in place.
