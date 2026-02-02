@@ -29,12 +29,14 @@ def rewrite_arrow_file(path: str) -> None:
         page = page_scalar.as_py()
         im_bytes = page['im']
         im = Image.open(io.BytesIO(im_bytes))
+        fmt = 'JPEG' if im.format == 'JPEG XL' else im.format
         if im.format == 'JPEG XL':
-            im = im.convert('RGB')
-            buf = io.BytesIO()
-            im.save(buf, format='JPEG', quality=95)
-            page['im'] = buf.getvalue()
             converted += 1
+        im = im.convert('RGB')
+        im = im.resize((2560, 1920))
+        buf = io.BytesIO()
+        im.save(buf, format=fmt, quality=95)
+        page['im'] = buf.getvalue()
         new_rows.append(pa.scalar(page, page_struct))
 
     print(f'{path}: converted {converted}/{len(new_rows)} pages')
