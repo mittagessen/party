@@ -114,6 +114,7 @@ class PartyTextLineDataModule(L.LightningDataModule):
                           sampler=sampler,
                           pin_memory=True,
                           shuffle=False,
+                          prefetch_factor=4,
                           collate_fn=collate_null)
 
     def val_dataloader(self):
