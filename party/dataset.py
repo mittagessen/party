@@ -33,6 +33,7 @@ from typing import (TYPE_CHECKING, Any, Callable, Literal, Optional, Union,
 
 from PIL import Image
 from functools import partial
+from torchvision.io import decode_image, ImageReadMode
 from torchvision.transforms import v2
 from torch.utils.data import Dataset, IterableDataset, get_worker_info
 from torch.distributed import get_rank, get_world_size, is_initialized
@@ -329,7 +330,7 @@ class BinnedBaselineDataset(Dataset):
         logger.debug(f'Attempting to load {item["im"]}')
         im, lang, page_data = item['im'], item['lang'], item['lines']
         try:
-            im = Image.open(io.BytesIO(im)).convert('RGB')
+            im = decode_image(torch.frombuffer(bytearray(im), dtype=torch.uint8), mode=ImageReadMode.RGB)
         except Exception:
             return self[0]
 
@@ -424,7 +425,7 @@ class ValidationBaselineDataset(IterableDataset):
             item = self.arrow_table.column('pages')[idx].as_py()
             logger.debug(f'Attempting to load {item["im"]}')
             im, lang, page_data = item['im'], item['lang'], item['lines']
-            im = Image.open(io.BytesIO(im)).convert('RGB')
+            im = decode_image(torch.frombuffer(bytearray(im), dtype=torch.uint8), mode=ImageReadMode.RGB)
             im = self.transforms(im)
 
             im = im.unsqueeze(0)
