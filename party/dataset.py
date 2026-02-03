@@ -41,7 +41,7 @@ from torch.distributed import get_rank, get_world_size, is_initialized
 
 from scipy.special import comb
 
-from party.tokenizer import OctetTokenizer, LANG_TO_ISO
+from party.tokenizer import OctetTokenizer
 
 
 if TYPE_CHECKING:
@@ -140,10 +140,10 @@ def compile(files: Optional[list[Union[str, 'PathLike']]] = None,
 
     # pyarrow structs
     line_struct = pa.struct([('text', pa.string()),
+                             ('lang', pa.list_(pa.string())),
                              ('curve', pa.list_(pa.float32())),
                              ('bbox', pa.list_(pa.float32()))])
     page_struct = pa.struct([('im', pa.binary()),
-                             ('lang', pa.string()),
                              ('lines', pa.list_(line_struct))])
 
     tokenizer = OctetTokenizer()
@@ -188,10 +188,6 @@ def compile(files: Optional[list[Union[str, 'PathLike']]] = None,
                                 break
                             except Exception:
                                 continue
-                        # parse language by traversing path component
-                        for part in Path(file).parts[::-1]:
-                            if (lang := LANG_TO_ISO.get(part, 'und')) != 'und':
-                                break
                     except Exception:
                         continue
                     if im_path is None:
@@ -211,8 +207,10 @@ def compile(files: Optional[list[Union[str, 'PathLike']]] = None,
                             if not line.baseline:
                                 logger.info('No baseline given for line')
                                 continue
+                            line_langs = line.language if line.language else ['und']
                             max_octets_in_line = max(len(tokenizer.encode(text, add_bos=False, add_eos=False)), max_octets_in_line)
                             page_data.append(pa.scalar({'text': pa.scalar(text),
+                                                        'lang': line_langs,
                                                         'curve': _to_curve(line.baseline, im_size),
                                                         'bbox': _to_bbox(line.boundary, im_size)},
                                                        line_struct))
@@ -230,7 +228,6 @@ def compile(files: Optional[list[Union[str, 'PathLike']]] = None,
                             with open(im_path, 'rb') as fp:
                                 im = fp.read()
                         ar = pa.array([pa.scalar({'im': im,
-                                                  'lang': lang,
                                                   'lines': page_data}, page_struct)], page_struct)
                         writer.write(pa.RecordBatch.from_arrays([ar], schema=schema))
                         max_lines_in_page = max(len(page_data), max_lines_in_page)
@@ -345,7 +342,7 @@ class BinnedBaselineDataset(Dataset):
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         item = self.arrow_table.column('pages')[index].as_py()
         logger.debug(f'Attempting to load {item["im"]}')
-        im, lang, page_data = item['im'], item['lang'], item['lines']
+        im, page_data = item['im'], item['lines']
         try:
             im = decode_image(torch.frombuffer(bytearray(im), dtype=torch.uint8), mode=ImageReadMode.RGB)
         except Exception:
@@ -361,7 +358,7 @@ class BinnedBaselineDataset(Dataset):
 
         lines = []
         for line in page_data:
-            tokens = torch.tensor(self.tokenizer.encode(line['text'], langs=[lang], add_bos=True, add_eos=True), dtype=torch.int32)
+            tokens = torch.tensor(self.tokenizer.encode(line['text'], langs=line['lang'], add_bos=True, add_eos=True), dtype=torch.int32)
             curve = torch.tensor(line['curve']).view(4, 2) if not return_boxes else None
             bbox = torch.tensor(line['bbox']).view(4, 2) if return_boxes else None
             lines.append((tokens, curve, bbox))
@@ -441,7 +438,7 @@ class ValidationBaselineDataset(IterableDataset):
         for idx in range(replica_rank, len_ds, num_replicas):
             item = self.arrow_table.column('pages')[idx].as_py()
             logger.debug(f'Attempting to load {item["im"]}')
-            im, lang, page_data = item['im'], item['lang'], item['lines']
+            im, page_data = item['im'], item['lines']
             im = decode_image(torch.frombuffer(bytearray(im), dtype=torch.uint8), mode=ImageReadMode.RGB)
             im = self.transforms(im)
 
@@ -467,7 +464,7 @@ class ValidationBaselineDataset(IterableDataset):
                         curves.append(torch.tensor(line['curve']).view(4, 2))
                     if return_boxes:
                         boxes.append(torch.tensor(line['bbox']).view(4, 2))
-                    tokens.append(torch.tensor(self.tokenizer.encode(line['text'], langs=[lang], add_bos=True, add_eos=True), dtype=torch.int32))
+                    tokens.append(torch.tensor(self.tokenizer.encode(line['text'], langs=line['lang'], add_bos=True, add_eos=True), dtype=torch.int32))
                     texts.append(line['text'])
 
                 tokens = torch.stack([F.pad(x, pad=(0, self.max_seq_len-len(x)), value=-100) for x in tokens]).long()
@@ -520,9 +517,10 @@ class TestBaselineDataset(Dataset):
         from kraken.containers import Segmentation, BaselineLine, BBoxLine
 
         item = self.arrow_table.column('pages')[index].as_py()
-        im, lang, page_data = item['im'], item['lang'], item['lines']
+        im, page_data = item['im'], item['lines']
         im = Image.open(io.BytesIO(im)).convert('RGB')
 
+        all_langs = list({lang for line in page_data for lang in line['lang']})
         if self.prompt_mode == 'curves':
             lines = [BaselineLine(id='_foo',
                                   baseline=line['curve'],
@@ -535,7 +533,7 @@ class TestBaselineDataset(Dataset):
                                 script_detection=False,
                                 text_direction='horizontal-lr',
                                 lines=lines,
-                                language=[lang])
+                                language=all_langs)
 
 
 # magic lsq cubic bezier fit function from the internet.

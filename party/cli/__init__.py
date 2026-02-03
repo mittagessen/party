@@ -7,6 +7,7 @@ from rich.logging import RichHandler
 from rich.traceback import install
 
 from .train import train, compile
+from .set_lang import set_lang
 
 from .util import _load_config, to_ptl_device
 
@@ -96,6 +97,7 @@ def cli(ctx, **kwargs):
 
 cli.add_command(compile)
 cli.add_command(train)
+cli.add_command(set_lang)
 
 
 if __name__ == '__main__':
