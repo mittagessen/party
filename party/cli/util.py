@@ -21,6 +21,7 @@ Command line driver helpers
 import os
 import yaml
 import glob
+import difflib
 import logging
 from typing import Optional
 
