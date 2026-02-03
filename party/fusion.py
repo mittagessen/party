@@ -46,7 +46,6 @@ def bytellama_vision_decoder(vocab_size: int = TOKEN_NUM,
                              norm_eps: int = 1e-5,
                              rope_base: int = 10000,
                              encoder_max_seq_len: int = 56700,
-                             fusion_interval: int = 3,
                              pretrained: Optional[str] = None,
                              **kwargs) -> TransformerDecoder:
     """
@@ -54,7 +53,7 @@ def bytellama_vision_decoder(vocab_size: int = TOKEN_NUM,
     attention layers. This includes:
     - Token embeddings
     - num_layers number of CausalSelfAttention blocks
-    - Fused cross attention layers every fusion_interval number of layers
+    - Fused cross attention layers at every layer
     - RMS Norm layer applied to the output of the transformer
     - Final projection into token space
 
@@ -63,15 +62,16 @@ def bytellama_vision_decoder(vocab_size: int = TOKEN_NUM,
         num_layers (int): number of layers in the transformer decoder.
         num_heads (int): number of query heads. For MHA this is also the
             number of heads for key and value.
-        num_kv_heads (int): number of key and value heads. User should ensure
-            `num_heads` % `num_kv_heads` == 0. For standard MHA set `num_kv_heads` == `num_heads`,
-            for GQA `num_kv_heads` < `num_heads`, and for MQA set `num_kv_heads` == 1.
+        num_kv_heads (int): number of key and value heads for self-attention.
+            User should ensure `num_heads` % `num_kv_heads` == 0. For standard
+            MHA set `num_kv_heads` == `num_heads`, for GQA
+            `num_kv_heads` < `num_heads`, and for MQA set `num_kv_heads` == 1.
+            Cross-attention always uses full MHA (`num_kv_heads` == `num_heads`).
         embed_dim (int): embedding dimension for self-attention.
         max_seq_len (int): maximum sequence length the model will be run with, as used
             by :func:`~party.modules.KVCache`.
         intermediate_dim (Optional[int]): intermediate dimension for MLP. If not specified,
             this is computed using :func:`~party.modules.scale_hidden_dim_for_mlp`.
-        fusion_interval (int): interval number of layers between fusion layers.
         pretrained (str): huggingface hub identifier of pretrained bytellama
                           weights. All hyperparameters will except
                           encoder_max_seq_len will be ignored.
@@ -89,8 +89,7 @@ def bytellama_vision_decoder(vocab_size: int = TOKEN_NUM,
               'attn_dropout': attn_dropout,
               'norm_eps': norm_eps,
               'rope_base': rope_base,
-              'encoder_max_seq_len': encoder_max_seq_len,
-              'fusion_interval': fusion_interval}
+              'encoder_max_seq_len': encoder_max_seq_len}
 
     if pretrained:
         from huggingface_hub import hf_hub_download
@@ -107,7 +106,7 @@ def bytellama_vision_decoder(vocab_size: int = TOKEN_NUM,
 
     for idx in range(1, config['num_layers'] + 1):
 
-        # Self attention layers for text decoder
+        # Self attention layers for text decoder (GQA)
         self_attn = MultiHeadAttention(
             embed_dim=config['embed_dim'],
             num_heads=config['num_heads'],
@@ -129,39 +128,35 @@ def bytellama_vision_decoder(vocab_size: int = TOKEN_NUM,
             mlp_norm=RMSNorm(dim=config['embed_dim'], eps=1e-5),
         )
 
-        # cross attention layers, mixing text and vision,
-        # placed every `fusion_interval` layers
-        if idx % config['fusion_interval'] == 0:
-            attn = MultiHeadAttention(
-                embed_dim=config['embed_dim'],
-                num_heads=config['num_heads'],
-                num_kv_heads=num_kv_heads,
-                head_dim=head_dim,
-                q_proj=nn.Linear(config['embed_dim'], config['num_heads'] * head_dim, bias=False),
-                k_proj=nn.Linear(config['embed_dim'], num_kv_heads * head_dim, bias=False),
-                v_proj=nn.Linear(config['embed_dim'], num_kv_heads * head_dim, bias=False),
-                output_proj=nn.Linear(config['embed_dim'], config['embed_dim'], bias=False),
-                q_norm=RMSNorm(dim=head_dim, eps=1e-05),
-                k_norm=RMSNorm(dim=head_dim, eps=1e-05),
-                pos_embeddings=rope,
-                max_seq_len=config['encoder_max_seq_len'],
-                is_causal=False,
-                attn_dropout=0.0,
-            )
+        # Cross attention layer at every layer (full MHA)
+        xattn = MultiHeadAttention(
+            embed_dim=config['embed_dim'],
+            num_heads=config['num_heads'],
+            num_kv_heads=config['num_heads'],
+            head_dim=head_dim,
+            q_proj=nn.Linear(config['embed_dim'], config['num_heads'] * head_dim, bias=False),
+            k_proj=nn.Linear(config['embed_dim'], config['num_heads'] * head_dim, bias=False),
+            v_proj=nn.Linear(config['embed_dim'], config['num_heads'] * head_dim, bias=False),
+            output_proj=nn.Linear(config['embed_dim'], config['embed_dim'], bias=False),
+            q_norm=RMSNorm(dim=head_dim, eps=1e-05),
+            k_norm=RMSNorm(dim=head_dim, eps=1e-05),
+            pos_embeddings=rope,
+            max_seq_len=config['encoder_max_seq_len'],
+            is_causal=False,
+            attn_dropout=0.0,
+        )
 
-            mlp = llama3_mlp(dim=config['embed_dim'], hidden_dim=hidden_dim)
-            xattn_layer = TransformerCrossAttentionLayer(
-                attn=attn,
-                mlp=mlp,
-                ca_norm=RMSNorm(dim=config['embed_dim']),
-                mlp_norm=RMSNorm(dim=config['embed_dim']),
-                ca_scale=TanhGate(),
-                mlp_scale=TanhGate(),
-            )
-            fusion_layer = FusionLayer(layer=decoder_layer, fusion_layer=xattn_layer)
-            layers.append(fusion_layer)
-        else:
-            layers.append(decoder_layer)
+        xattn_mlp = llama3_mlp(dim=config['embed_dim'], hidden_dim=hidden_dim)
+        xattn_layer = TransformerCrossAttentionLayer(
+            attn=xattn,
+            mlp=xattn_mlp,
+            ca_norm=RMSNorm(dim=config['embed_dim']),
+            mlp_norm=RMSNorm(dim=config['embed_dim']),
+            ca_scale=TanhGate(),
+            mlp_scale=TanhGate(),
+        )
+        fusion_layer = FusionLayer(layer=decoder_layer, fusion_layer=xattn_layer)
+        layers.append(fusion_layer)
 
     tok_embeddings = nn.Embedding(config['vocab_size'], config['embed_dim'])
     output_proj = nn.Linear(config['embed_dim'], config['vocab_size'], bias=False)
