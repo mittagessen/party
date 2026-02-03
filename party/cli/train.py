@@ -52,6 +52,10 @@ logging.getLogger("lightning.fabric.utilities.seed").setLevel(logging.ERROR)
               help='Ground truth normalization')
 @click.option('-n', '--normalize-whitespace/--no-normalize-whitespace',
               help='Normalizes unicode whitespace')
+@click.option('-r', '--resize', nargs=2, type=int, default=None,
+              help='Resize images to fixed (height, width)')
+@click.option('--allow-textless/--no-allow-textless', default=False,
+              help='Include lines without text in the dataset')
 @click.argument('ground_truth', nargs=-1, type=click.Path(exists=True, dir_okay=False))
 def compile(ctx, **params):
     """
@@ -88,6 +92,8 @@ def compile(ctx, **params):
                         params['output'],
                         normalization=params['normalization'],
                         normalize_whitespace=params['normalize_whitespace'],
+                        resize=tuple(params['resize']) if params['resize'] else None,
+                        allow_textless=params['allow_textless'],
                         callback=_update_bar)
 
     message(f'Output file written to {params["output"]}')

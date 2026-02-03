@@ -28,8 +28,8 @@ import pyarrow as pa
 from pathlib import Path
 from itertools import islice
 
-from typing import (TYPE_CHECKING, Any, Callable, Literal, Optional, Union,
-                    Sequence)
+from typing import (TYPE_CHECKING, Any, Callable, Literal, Optional, Tuple,
+                    Union, Sequence)
 
 from PIL import Image
 from functools import partial
@@ -117,6 +117,8 @@ def compile(files: Optional[list[Union[str, 'PathLike']]] = None,
             normalize_whitespace: bool = True,
             normalization: Optional[Literal['NFD', 'NFC', 'NFKD', 'NFKC']] = None,
             max_line_tokens: int = 384,
+            resize: Optional[Tuple[int, int]] = None,
+            allow_textless: bool = False,
             callback: Callable[[int, int], None] = lambda chunk, lines: None) -> None:
     """
     Compiles a collection of XML facsimile files into a binary arrow dataset.
@@ -127,6 +129,8 @@ def compile(files: Optional[list[Union[str, 'PathLike']]] = None,
         normalize_whitespace: whether to normalize all whitespace to ' '
         normalization: Unicode normalization to apply to data.
         max_line_tokens: maximum number of tokens per line
+        resize: optional (height, width) tuple to resize images to
+        allow_textless: if True, include lines without text
         callback: progress callback
     """
     from kraken.lib import functional_im_transforms as F_t
@@ -171,7 +175,15 @@ def compile(files: Optional[list[Union[str, 'PathLike']]] = None,
                         for idx in cand_idxs:
                             try:
                                 with Image.open(image_candidates[idx]) as im:
-                                    im_size = im.size
+                                    if resize:
+                                        im = im.convert('RGB')
+                                        im = im.resize((resize[1], resize[0]), Image.LANCZOS)
+                                        im_size = im.size
+                                        im_buf = io.BytesIO()
+                                        im.save(im_buf, format='JPEG', quality=95)
+                                        resized_im_bytes = im_buf.getvalue()
+                                    else:
+                                        im_size = im.size
                                 im_path = image_candidates[idx]
                                 break
                             except Exception:
@@ -191,9 +203,11 @@ def compile(files: Optional[list[Union[str, 'PathLike']]] = None,
                             text = line.text
                             for func in text_transforms:
                                 text = func(text)
-                            if not text:
+                            if not text and not allow_textless:
                                 logger.info(f'Text line "{line.text}" is empty after transformations')
                                 continue
+                            if not text:
+                                text = ''
                             if not line.baseline:
                                 logger.info('No baseline given for line')
                                 continue
@@ -210,8 +224,11 @@ def compile(files: Optional[list[Union[str, 'PathLike']]] = None,
                         max_octets_in_line = prev_max_octets_in_line
                         continue
                     if len(page_data) > 1:
-                        with open(im_path, 'rb') as fp:
-                            im = fp.read()
+                        if resize:
+                            im = resized_im_bytes
+                        else:
+                            with open(im_path, 'rb') as fp:
+                                im = fp.read()
                         ar = pa.array([pa.scalar({'im': im,
                                                   'lang': lang,
                                                   'lines': page_data}, page_struct)], page_struct)
