@@ -215,12 +215,13 @@ class PartyRecognitionModel(L.LightningModule):
         max_gen_len = self._val_max_seq_len - prompt_len
         eos_token = self.tokenizer.eos_id
 
-        # Resize caches if this batch is smaller than expected
+        # Resize caches if this batch is smaller/larger than expected
         if bsz != self._val_batch_size:
             self.net.setup_caches(batch_size=bsz,
                                   dtype=next(self.net.parameters()).dtype,
                                   encoder_max_seq_len=self.net.encoder_max_seq_len,
                                   decoder_max_seq_len=self._val_max_seq_len)
+            self._val_batch_size = bsz
         self.net.reset_caches()
 
         # Causal mask and position IDs
