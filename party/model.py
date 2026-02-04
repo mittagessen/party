@@ -93,6 +93,12 @@ class PartyTextLineDataModule(L.LightningDataModule):
                 raise ValueError('No valid validation data provided. Please add some.')
             self.train_set.max_seq_len = max(self.train_set.max_seq_len, self.val_set.max_seq_len)
             self.val_set.max_seq_len = self.train_set.max_seq_len
+            logger.info('Training set language statistics:')
+            for lang, count in sorted(self.train_set.lang_counts.items(), key=lambda x: -x[1]):
+                logger.info(f'  {lang}: {count}')
+            logger.info('Validation set language statistics:')
+            for lang, count in sorted(self.val_set.lang_counts.items(), key=lambda x: -x[1]):
+                logger.info(f'  {lang}: {count}')
         elif data_config.test_data:
             self.test_set = ValidationBaselineDataset(data_config.test_data,
                                                       im_transforms=im_transforms,

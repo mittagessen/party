@@ -36,13 +36,7 @@ logger = logging.getLogger('party')
 logging.getLogger("lightning.fabric.utilities.seed").setLevel(logging.ERROR)
 
 
-@click.command('compile',
-               epilog=f"""
-                       Language tags are determined by traversing the path of each XML file
-                       upwards until a component is found that matched one of the following
-                       identifiers:
-                       {', '.join(ISO_TO_LANG.values())}
-               """)
+@click.command('compile')
 @click.pass_context
 @click.option('-o', '--output', type=click.Path(), default='dataset.arrow', help='Output dataset file')
 @click.option('-F', '--files', default=None, multiple=True,
@@ -88,15 +82,19 @@ def compile(ctx, **params):
                 progress.start_task(extract_task)
             progress.update(extract_task, total=total, advance=advance)
 
-        dataset.compile(ground_truth,
-                        params['output'],
-                        normalization=params['normalization'],
-                        normalize_whitespace=params['normalize_whitespace'],
-                        resize=tuple(params['resize']) if params['resize'] else None,
-                        allow_textless=params['allow_textless'],
-                        callback=_update_bar)
+        lang_counts = dataset.compile(ground_truth,
+                                        params['output'],
+                                        normalization=params['normalization'],
+                                        normalize_whitespace=params['normalize_whitespace'],
+                                        resize=tuple(params['resize']) if params['resize'] else None,
+                                        allow_textless=params['allow_textless'],
+                                        callback=_update_bar)
 
     message(f'Output file written to {params["output"]}')
+    if lang_counts:
+        message('Language statistics:')
+        for lang, count in sorted(lang_counts.items(), key=lambda x: -x[1]):
+            message(f'  {lang}: {count}')
 
 
 @click.command('train')
@@ -258,6 +256,14 @@ def train(ctx, **kwargs):
         data_module = PartyTextLineDataModule.load_from_checkpoint(resume)
     else:
         data_module = PartyTextLineDataModule(dm_config)
+
+    if hasattr(data_module, 'train_set'):
+        message('Training set language statistics:')
+        for lang, count in sorted(data_module.train_set.lang_counts.items(), key=lambda x: -x[1]):
+            message(f'  {lang}: {count}')
+        message('Validation set language statistics:')
+        for lang, count in sorted(data_module.val_set.lang_counts.items(), key=lambda x: -x[1]):
+            message(f'  {lang}: {count}')
 
     if not params['verbose']:
         cbs.append(RichProgressBar(leave=True))

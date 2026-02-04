@@ -17,6 +17,7 @@ Utility functions for data loading and training of VGSL networks.
 """
 import io
 import gc
+import json
 import torch
 import ctypes
 import torch.nn.functional as F
@@ -24,6 +25,8 @@ import numpy as np
 
 import tempfile
 import pyarrow as pa
+
+from collections import Counter
 
 from pathlib import Path
 from itertools import islice
@@ -119,7 +122,7 @@ def compile(files: Optional[list[Union[str, 'PathLike']]] = None,
             max_line_tokens: int = 384,
             resize: Optional[Tuple[int, int]] = None,
             allow_textless: bool = False,
-            callback: Callable[[int, int], None] = lambda chunk, lines: None) -> None:
+            callback: Callable[[int, int], None] = lambda chunk, lines: None) -> Counter:
     """
     Compiles a collection of XML facsimile files into a binary arrow dataset.
 
@@ -154,6 +157,7 @@ def compile(files: Optional[list[Union[str, 'PathLike']]] = None,
         text_transforms.append(F_t.text_whitespace_normalize)
 
     num_lines = 0
+    lang_counts = Counter()
     # helper variables to enable padding to longest sequence without iterating
     # over set during training.
     max_lines_in_page = 0
@@ -193,6 +197,7 @@ def compile(files: Optional[list[Union[str, 'PathLike']]] = None,
                     if im_path is None:
                         continue
                     page_data = []
+                    page_lang_counts = Counter()
                     prev_max_octets_in_line = max_octets_in_line
                     for line in page.lines:
                         try:
@@ -208,6 +213,8 @@ def compile(files: Optional[list[Union[str, 'PathLike']]] = None,
                                 logger.info('No baseline given for line')
                                 continue
                             line_langs = line.language if line.language else ['und']
+                            for lang in line_langs:
+                                page_lang_counts[lang] += 1
                             max_octets_in_line = max(len(tokenizer.encode(text, add_bos=False, add_eos=False)), max_octets_in_line)
                             page_data.append(pa.scalar({'text': pa.scalar(text),
                                                         'lang': line_langs,
@@ -222,6 +229,7 @@ def compile(files: Optional[list[Union[str, 'PathLike']]] = None,
                         max_octets_in_line = prev_max_octets_in_line
                         continue
                     if len(page_data) > 1:
+                        lang_counts.update(page_lang_counts)
                         if resize:
                             im = resized_im_bytes
                         else:
@@ -235,7 +243,8 @@ def compile(files: Optional[list[Union[str, 'PathLike']]] = None,
         with pa.memory_map(tmpfile.name, 'rb') as source:
             metadata = {'num_lines': num_lines.to_bytes(4, 'little'),
                         'max_lines_in_page': max_lines_in_page.to_bytes(4, 'little'),
-                        'max_octets_in_line': max_octets_in_line.to_bytes(4, 'little')}
+                        'max_octets_in_line': max_octets_in_line.to_bytes(4, 'little'),
+                        'lang_counts': json.dumps(dict(lang_counts)).encode('utf-8')}
             schema = schema.with_metadata(metadata)
             ds_table = pa.ipc.open_file(source).read_all()
             new_table = ds_table.replace_schema_metadata(metadata)
@@ -243,6 +252,7 @@ def compile(files: Optional[list[Union[str, 'PathLike']]] = None,
                 with pa.ipc.new_file(sink, schema=schema) as writer:
                     for batch in new_table.to_batches():
                         writer.write(batch)
+    return lang_counts
 
 
 def _validation_worker_init_fn(worker_id):
@@ -324,6 +334,7 @@ class BinnedBaselineDataset(Dataset):
 
         self.arrow_table = None
         self.pages_per_file = []
+        self.lang_counts = Counter()
 
         for file in files:
             with pa.memory_map(file, 'rb') as source:
@@ -331,6 +342,8 @@ class BinnedBaselineDataset(Dataset):
                 raw_metadata = ds_table.schema.metadata
                 if not raw_metadata or b'num_lines' not in raw_metadata:
                     raise ValueError(f'{file} does not contain a valid metadata record.')
+                if b'lang_counts' in raw_metadata:
+                    self.lang_counts.update(json.loads(raw_metadata[b'lang_counts']))
                 if not self.arrow_table:
                     self.arrow_table = ds_table
                 else:
@@ -410,6 +423,7 @@ class ValidationBaselineDataset(IterableDataset):
         self.tokenizer = OctetTokenizer()
 
         self.arrow_table = None
+        self.lang_counts = Counter()
 
         for file in files:
             with pa.memory_map(file, 'rb') as source:
@@ -417,6 +431,8 @@ class ValidationBaselineDataset(IterableDataset):
                 raw_metadata = ds_table.schema.metadata
                 if not raw_metadata or b'num_lines' not in raw_metadata:
                     raise ValueError(f'{file} does not contain a valid metadata record.')
+                if b'lang_counts' in raw_metadata:
+                    self.lang_counts.update(json.loads(raw_metadata[b'lang_counts']))
                 if not self.arrow_table:
                     self.arrow_table = ds_table
                 else:
