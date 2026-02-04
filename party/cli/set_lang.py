@@ -27,10 +27,29 @@ from collections import defaultdict
 
 from party.tokenizer import ISO_TO_IDX, LANG_TO_ISO
 
-from .pred import _parse_page_custom, dict_to_page_custom
 
 logging.captureWarnings(True)
 logger = logging.getLogger('party')
+
+
+def _parse_page_custom(s):
+    o = defaultdict(list)
+    s = s.strip()
+    l_chunks = [l_chunk for l_chunk in s.split('}') if l_chunk.strip()]
+    if l_chunks:
+        for chunk in l_chunks:
+            tag, vals = chunk.split('{')
+            tag_vals = {}
+            vals = [val.strip() for val in vals.split(';') if val.strip()]
+            for val in vals:
+                key, *val = val.split(':')
+                tag_vals[key] = ":".join(val)
+            o[tag.strip()].append(tag_vals)
+    return dict(o)
+
+
+def dict_to_page_custom(d) -> str:
+    return ' '.join((' '.join(f'{k} {{' + ';'.join(f'{m.strip()}: {n.strip()}' for m, n in i.items()) + ';}' for i in v)) for k, v in d.items())
 
 
 def _detect_filetype(doc):

@@ -19,8 +19,11 @@ import torch
 import logging
 
 from torch import nn
-from dataclasses import asdict
+import numpy as np
+
+from dataclasses import asdict, replace
 from kraken.models import BaseModel
+from kraken.containers import BaselineOCRRecord, BBoxOCRRecord, BBoxLine
 from lightning.fabric import Fabric
 from collections.abc import Generator
 from typing import Optional, Union, TYPE_CHECKING, Any
@@ -33,7 +36,7 @@ from party.dataset import get_default_transforms, _to_curve, _to_bbox
 if TYPE_CHECKING:
     from PIL import Image
     from kraken.configs import Config
-    from kraken.containers import Segmentation, ocr_record, BaselineLine, BBoxLine
+    from kraken.containers import Segmentation, ocr_record, BaselineLine
 
 logger = logging.getLogger(__name__)
 
@@ -276,6 +279,8 @@ class PartyModel(nn.Module, BaseModel):
             atexit.register(self._line_extraction_pool.terminate)
 
         self.m_dtype = next(self.parameters()).dtype
+        self._batch_size = config.batch_size
+        self._max_generated_tokens = config.max_generated_tokens
 
         # set up caches
         self.setup_caches(batch_size=config.batch_size,
@@ -298,15 +303,73 @@ class PartyModel(nn.Module, BaseModel):
     def predict(self, im: 'Image.Image', segmentation: 'Segmentation') -> Generator['ocr_record', None, None]:
         with self._fabric.init_tensor():
             image_input = self.im_transforms(im).unsqueeze(0)
-            lines = torch.tensor([line.bbox if line.type == 'bbox' else line.baseline for line in segmentation.lines])
-            lines = lines.view(-1, 4, 2)
-            self.len = len(lines)
-            for (pred_text, pred_confs, pred_langs), line in zip(self.predict_string(encoder_input=image_input,
-                                                                                     curves=lines if self.prompt_mode == 'baselines' else None,
-                                                                                     boxes=lines if self.prompt_mode == 'bbox' else None,
-                                                                                     languages=segmentation.language if add_lang_token else None),
-                                                                 segmentation.lines):
-                pass
+
+            cfg_prompt_mode = self._inf_config.prompt_mode
+            if cfg_prompt_mode is not None:
+                if cfg_prompt_mode == 'curves' and segmentation.type == 'bbox':
+                    raise ValueError('Prompt mode set to curves but segmentation is of bounding box type.')
+                prompt_mode = cfg_prompt_mode
+            elif segmentation.type == 'baselines':
+                prompt_mode = 'curves'
+            else:
+                prompt_mode = 'boxes'
+
+            if prompt_mode == 'curves':
+                lines_data = [_curve_prompt_fn(line, im.size) for line in segmentation.lines]
+            else:
+                lines_data = [_box_prompt_fn(line, im.size) for line in segmentation.lines]
+
+            lines = torch.tensor(lines_data).view(-1, 4, 2)
+
+            languages = segmentation.language if self._inf_config.add_lang_token else None
+
+            for (pred_text, pred_confs, pred_langs), line in zip(
+                self.predict_string(encoder_input=image_input,
+                                    curves=lines if prompt_mode == 'curves' else None,
+                                    boxes=lines if prompt_mode == 'boxes' else None,
+                                    languages=languages),
+                segmentation.lines
+            ):
+                line = replace(line, language=list(pred_langs) if pred_langs else None)
+                n_chars = len(pred_text)
+
+                if prompt_mode == 'curves':
+                    if n_chars > 0 and line.baseline:
+                        bl = np.array(line.baseline)
+                        seg_lengths = np.sqrt((np.diff(bl, axis=0)**2).sum(axis=1))
+                        total_length = seg_lengths.sum()
+                        step = total_length / n_chars
+                        cuts = [(int(i * step), int((i + 1) * step)) for i in range(n_chars)]
+                    else:
+                        cuts = []
+
+                    yield BaselineOCRRecord(prediction=pred_text,
+                                            cuts=cuts,
+                                            confidences=pred_confs,
+                                            line=line,
+                                            display_order=False)
+                else:
+                    if n_chars > 0:
+                        if line.type == 'bbox':
+                            xmin, ymin, xmax, ymax = line.bbox
+                        else:
+                            flat_box = [point for pol in line.boundary for point in pol]
+                            xmin, xmax = min(flat_box[::2]), max(flat_box[::2])
+                            ymin, ymax = min(flat_box[1::2]), max(flat_box[1::2])
+                        step = (xmax - xmin) / n_chars
+                        cuts = [((int(xmin + i * step), ymin),
+                                 (int(xmin + (i + 1) * step), ymin),
+                                 (int(xmin + (i + 1) * step), ymax),
+                                 (int(xmin + i * step), ymax))
+                                for i in range(n_chars)]
+                    else:
+                        cuts = []
+
+                    yield BBoxOCRRecord(prediction=pred_text,
+                                        cuts=cuts,
+                                        confidences=pred_confs,
+                                        line=_baseline_to_bbox(line) if line.type != 'bbox' else line,
+                                        display_order=False)
 
     @torch.inference_mode()
     def predict_tokens(self,

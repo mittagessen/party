@@ -1,4 +1,28 @@
-from kraken.configs import TrainingConfig, RecognitionTrainingDataConfig
+from kraken.configs import TrainingConfig, RecognitionTrainingDataConfig, RecognitionInferenceConfig
+
+
+class PartyRecognitionInferenceConfig(RecognitionInferenceConfig):
+    """
+    Configuration for party model inference.
+
+    Args:
+        prompt_mode (one of 'curves', 'boxes', or None, defaults to None):
+            How to embed line positional prompts. If None, the prompt mode is
+            determined from the input segmentation type ('baselines' ->
+            'curves', 'bbox' -> 'boxes'). If set explicitly, lines will be
+            converted to the requested format when possible. Setting 'curves'
+            with a bounding box segmentation will raise a ValueError.
+        max_generated_tokens (int, defaults to 512):
+            Maximum number of tokens to generate per line.
+        add_lang_token (bool, defaults to True):
+            Prepend language tokens from the segmentation's language field to
+            condition the decoder on the input language.
+    """
+    def __init__(self, **kwargs):
+        self.prompt_mode = kwargs.pop('prompt_mode', None)
+        self.max_generated_tokens = kwargs.pop('max_generated_tokens', 512)
+        self.add_lang_token = kwargs.pop('add_lang_token', True)
+        super().__init__(**kwargs)
 
 
 class PartyRecognitionTrainingConfig(TrainingConfig):
