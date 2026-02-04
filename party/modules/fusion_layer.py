@@ -137,11 +137,6 @@ class FusionLayer(nn.Module):
         self.layer.reset_cache()
         self.fusion_layer.reset_cache()
 
-    def teardown_cache(self):
-        """Delete both layers' key value caches."""
-        self.layer.teardown_cache()
-        self.fusion_layer.teardown_cache()
-
     def fusion_params(self) -> List[str]:
         """
         Return parameters of fusion layer.

@@ -78,10 +78,6 @@ class TransformerSelfAttentionLayer(nn.Module):
         """Reset the key value caches."""
         self.attn.reset_cache()
 
-    def teardown_cache(self):
-        """Delete the key value caches."""
-        self.attn.delete_cache()
-
     def forward(
         self,
         x: torch.Tensor,
@@ -201,10 +197,6 @@ class TransformerCrossAttentionLayer(nn.Module):
     def reset_cache(self):
         """Reset the key value caches."""
         self.attn.reset_cache()
-
-    def teardown_cache(self):
-        """Delete the key value caches."""
-        self.attn.delete_cache()
 
     def _skip_mask(self, mask: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         """Some tokens in x may not attend to any encoder inputs
@@ -476,16 +468,6 @@ class TransformerDecoder(nn.Module):
 
         for layer in self.layers:
             layer.reset_cache()
-
-    def teardown_caches(self):
-        """
-        Deletes KV-cache buffers on relevant attention modules, freeing memory
-        and returning the model to a non-cached state.
-        """
-        for layer in self.layers:
-            layer.teardown_cache()
-        self.encoder_max_cache_seq_len = None
-        self.decoder_max_cache_seq_len = None
 
     @torch.compiler.disable
     def chunked_output(self, last_hidden_state: torch.Tensor) -> List[torch.Tensor]:

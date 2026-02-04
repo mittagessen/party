@@ -183,14 +183,6 @@ class PartyModel(nn.Module, BaseModel):
         """
         self.nn['decoder'].reset_caches()
 
-    def teardown_caches(self):
-        """
-        Deletes KV-cache buffers on relevant attention modules, freeing memory
-        and returning the model to a non-cached state suitable for compiled
-        forward passes.
-        """
-        self.nn['decoder'].teardown_caches()
-
     def forward(self,
                 tokens: torch.Tensor,
                 *,
