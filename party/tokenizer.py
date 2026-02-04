@@ -68,12 +68,14 @@ LANG_TO_ISO = {'arabic': 'ara',
                'russian': 'rus',
                'sanskrit': 'san',
                'slovenian': 'slv',
+               'slovak': 'slk',
                'swedish': 'swe',
                'spanish': 'spa',
                'syriac': 'syr',
                'urdu': 'urd',
                'ukrainian': 'ukr',
                'undetermined': 'und',
+               'vietnamese': 'vie',
                'german_shorthand': 'qaa',
                'serbian_cyrl': 'qab',
                'yiddish': 'yid'}
@@ -124,7 +126,9 @@ ISO_TO_IDX = {'ara': 0,
               'lit': 43,
               'pol': 44,
               'gez': 45,
-              'xcl': 46}
+              'xcl': 46,
+              'vie': 47,
+              'slk': 48}
 
 LANG_IDX_TO_ISO = {v: k for k, v in ISO_TO_IDX.items()}
 ISO_TO_LANG = {v: k for k, v in LANG_TO_ISO.items()}
