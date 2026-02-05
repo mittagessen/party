@@ -24,10 +24,9 @@ from torch.optim import lr_scheduler
 from kraken.models import create_model
 
 from torchmetrics.aggregation import MeanMetric
-from typing import Optional, TYPE_CHECKING, Union
+from typing import Optional, TYPE_CHECKING, Union, list, dict, Any
 from lightning.pytorch.callbacks import EarlyStopping
 from torch.distributed import get_world_size, is_initialized
-from kraken.train.utils import configure_optimizer_and_lr_scheduler
 from torch.utils.data import RandomSampler, DataLoader
 
 from party.tokenizer import OFFSET, LANG_OFFSET
@@ -64,6 +63,46 @@ def model_step(model, ntf, criterion, batch):
 
     logits = logits.reshape(-1, logits.shape[-1])
     return criterion(logits, targets)
+
+
+def get_parameter_groups(model, config) -> list[dict[str, Any]]:
+    """Create parameter groups with discriminative learning rates.
+
+    Pretrained group: encoder + decoder base layers (lower LR)
+    New group: adapter + fusion layers + line_embedding (base LR)
+    """
+    base_lr = config.lrate
+    pretrained_params = []
+    new_params = []
+
+    # Encoder params -> pretrained
+    for p in model.nn['encoder'].parameters():
+        if p.requires_grad:
+            pretrained_params.append(p)
+
+    # Adapter params -> new
+    for p in model.nn['adapter'].parameters():
+        if p.requires_grad:
+            new_params.append(p)
+
+    # Line embedding params -> new
+    for p in model.nn['line_embedding'].parameters():
+        if p.requires_grad:
+            new_params.append(p)
+
+    # Decoder params - separate fusion from base
+    for name, p in model.nn['decoder'].named_parameters():
+        if not p.requires_grad:
+            continue
+        if '.fusion_layer.' in name:
+            new_params.append(p)
+        else:
+            pretrained_params.append(p)
+
+    return [
+        {'params': pretrained_params, 'lr': base_lr * config.lr_pretrained_mult, 'name': 'pretrained'},
+        {'params': new_params, 'lr': base_lr, 'name': 'new'},
+    ]
 
 
 class PartyTextLineDataModule(L.LightningDataModule):
@@ -306,21 +345,40 @@ class PartyRecognitionModel(L.LightningModule):
     # batch-wise learning rate warmup. In lr_scheduler_step() calls to the
     # scheduler are then only performed at the end of the epoch.
     def configure_optimizers(self):
-        return configure_optimizer_and_lr_scheduler(self.hparams.config,
-                                                    self.net.parameters(),
-                                                    len_train_set=len(self.trainer.datamodule.train_set),
-                                                    loss_tracking_mode='min')
+        param_groups = get_parameter_groups(self.net, self.hparams.config)
+
+        # Log parameter groups
+        for pg in param_groups:
+            n_params = sum(p.numel() for p in pg['params'])
+            logger.info(f"Param group '{pg['name']}': {n_params:,} params, lr={pg['lr']:.2e}")
+
+        # Store initial LRs for warmup
+        self._initial_lrs = [pg['lr'] for pg in param_groups]
+
+        config = self.hparams.config
+        optimizer = torch.optim.AdamW(param_groups, weight_decay=config.weight_decay)
+
+        # Create scheduler (cosine annealing)
+        scheduler = lr_scheduler.CosineAnnealingLR(
+            optimizer, config.cos_t_max, config.cos_min_lr,
+            last_epoch=config.completed_epochs - 1
+        )
+
+        return {
+            'optimizer': optimizer,
+            'lr_scheduler': {'scheduler': scheduler, 'interval': 'step'}
+        }
 
     def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_closure):
         # update params
         optimizer.step(closure=optimizer_closure)
 
-        # linear warmup between 0 and the initial learning rate `lrate` in `warmup`
-        # steps.
+        # linear warmup between 0 and the initial learning rate in `warmup` steps.
+        # Uses per-group initial LRs for discriminative learning rates.
         if self.hparams.config.warmup and self.trainer.global_step < self.hparams.config.warmup:
             lr_scale = min(1.0, float(self.trainer.global_step + 1) / self.hparams.config.warmup)
-            for pg in optimizer.param_groups:
-                pg["lr"] = lr_scale * self.hparams.config.lrate
+            for pg, initial_lr in zip(optimizer.param_groups, self._initial_lrs):
+                pg["lr"] = lr_scale * initial_lr
 
     def lr_scheduler_step(self, scheduler, metric):
         if not self.hparams.config.warmup or self.trainer.global_step >= self.hparams.config.warmup:

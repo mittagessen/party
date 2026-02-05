@@ -36,6 +36,8 @@ class PartyRecognitionTrainingConfig(TrainingConfig):
         self.train_from_scratch = kwargs.pop('train_from_scratch', False)
         self.noisy_teacher_forcing = kwargs.pop('noisy_teacher_forcing', 0.05)
         self.label_smoothing = kwargs.pop('label_smoothing', 0.0)
+        # LR multiplier for pretrained components (encoder + decoder base layers)
+        self.lr_pretrained_mult = kwargs.pop('lr_pretrained_mult', 0.1)
 
         kwargs.setdefault('quit', 'fixed')
         kwargs.setdefault('epochs', 12)

@@ -134,6 +134,9 @@ def compile(ctx, **params):
               '--lrate',
               type=float,
               help='Learning rate')
+@click.option('--lr-pretrained-mult',
+              type=float,
+              help='Learning rate multiplier for pretrained components (encoder + decoder base layers)')
 @click.option('-m',
               '--momentum',
               type=float,
