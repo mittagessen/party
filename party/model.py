@@ -24,7 +24,7 @@ from torch.optim import lr_scheduler
 from kraken.models import create_model
 
 from torchmetrics.aggregation import MeanMetric
-from typing import Optional, TYPE_CHECKING, Union, list, dict, Any
+from typing import Optional, TYPE_CHECKING, Union, Any
 from lightning.pytorch.callbacks import EarlyStopping
 from torch.distributed import get_world_size, is_initialized
 from torch.utils.data import RandomSampler, DataLoader
