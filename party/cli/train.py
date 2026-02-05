@@ -238,7 +238,7 @@ def train(ctx, **kwargs):
     else:
         val_check_interval = {'val_check_interval': params['freq']}
 
-    cbs = [RichModelSummary(max_depth=2)]
+    cbs = [RichModelSummary(max_depth=3)]
 
     checkpoint_callback = ModelCheckpoint(dirpath=params.pop('checkpoint_path'),
                                           save_top_k=10,
@@ -257,13 +257,29 @@ def train(ctx, **kwargs):
     else:
         data_module = PartyTextLineDataModule(dm_config)
 
-    if hasattr(data_module, 'train_set'):
-        message('Training set language statistics:')
-        for lang, count in sorted(data_module.train_set.lang_counts.items(), key=lambda x: -x[1]):
-            message(f'  {lang}: {count}')
-        message('Validation set language statistics:')
-        for lang, count in sorted(data_module.val_set.lang_counts.items(), key=lambda x: -x[1]):
-            message(f'  {lang}: {count}')
+    from rich.table import Table
+    from rich.console import Console
+
+    all_langs = set(data_module.train_set.lang_counts.keys()) | set(data_module.val_set.lang_counts.keys())
+
+    table = Table(title='Language Statistics')
+    table.add_column('Language', style='cyan')
+    table.add_column('ISO', style='dim')
+    table.add_column('Training', justify='right')
+    table.add_column('Validation', justify='right')
+
+    sorted_langs = sorted(all_langs,
+                          key=lambda x: -(data_module.train_set.lang_counts.get(x, 0) +
+                                          data_module.val_set.lang_counts.get(x, 0)))
+
+    for lang in sorted_langs:
+        train_count = data_module.train_set.lang_counts.get(lang, 0)
+        val_count = data_module.val_set.lang_counts.get(lang, 0)
+        lang_name = ISO_TO_LANG.get(lang, lang).replace('_', ' ').title()
+        table.add_row(lang_name, lang, str(train_count), str(val_count))
+
+    console = Console()
+    console.print(table)
 
     if not params['verbose']:
         cbs.append(RichProgressBar(leave=True))
