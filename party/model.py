@@ -343,7 +343,7 @@ class PartyRecognitionModel(L.LightningModule):
     #
     # All schedulers are created internally with a frequency of step to enable
     # batch-wise learning rate warmup. In lr_scheduler_step() calls to the
-    # scheduler are then only performed at the end of the epoch.
+    # scheduler are performed at every step.
     def configure_optimizers(self):
         param_groups = get_parameter_groups(self.net, self.hparams.config)
 
@@ -358,10 +358,12 @@ class PartyRecognitionModel(L.LightningModule):
         config = self.hparams.config
         optimizer = torch.optim.AdamW(param_groups, weight_decay=config.weight_decay)
 
-        # Create scheduler (cosine annealing)
+        # Create scheduler (cosine annealing with step-wise updates)
+        world_size = get_world_size() if is_initialized() else 1
+        steps_per_epoch = self.trainer.datamodule.train_set.num_batches // world_size
         scheduler = lr_scheduler.CosineAnnealingLR(
-            optimizer, config.cos_t_max, config.cos_min_lr,
-            last_epoch=config.completed_epochs - 1
+            optimizer, config.cos_t_max * steps_per_epoch, config.cos_min_lr,
+            last_epoch=config.completed_epochs * steps_per_epoch - 1
         )
 
         return {
@@ -382,8 +384,7 @@ class PartyRecognitionModel(L.LightningModule):
 
     def lr_scheduler_step(self, scheduler, metric):
         if not self.hparams.config.warmup or self.trainer.global_step >= self.hparams.config.warmup:
-            # step OneCycleLR each batch if not in warmup phase
-            if isinstance(scheduler, lr_scheduler.OneCycleLR):
+            if isinstance(scheduler, (lr_scheduler.OneCycleLR, lr_scheduler.CosineAnnealingLR)):
                 scheduler.step()
             # step every other scheduler epoch-wise
             elif self.trainer.is_last_batch:
