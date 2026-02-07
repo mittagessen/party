@@ -1,0 +1,36 @@
+precision: bf16-mixed
+device: auto
+num_workers: 8  # because of page-wise sampling it is not necessary to scale worker
+             # number with batch size.
+num_threads: 1
+train:
+  train_from_scratch: true
+  # training data manifests
+  training_data:
+     - /home/bkiessling/party_train.lst
+  evaluation_data:
+    - /home/bkiessling/party_val.lst
+  # directory to save checkpoints in
+  checkpoint_path: /home/bkiessling/experiments/base_partyv2
+  # text transforms
+  normalization: NFD
+  normalize_whitespace: true
+  # whether to train on bbox, baseline, or both line prompts
+  prompt_mode: both
+  # base configuration of training epochs and LR schedule
+  optimizer: AdamW
+  epochs: 12
+  lrate: 1e-4
+  weight_decay: 0.01
+  schedule: cosine
+  cos_t_max: 12
+  cos_min_lr: 5e-6
+  warmup: 5000
+  augment: true
+  validate_before_train: false
+  # effective batch size params
+  batch_size: 32
+  val_batch_size: 64
+  accumulate_grad_batches: 8
+  noisy_teacher_forcing: 0.02
+  label_smoothing: 0.0

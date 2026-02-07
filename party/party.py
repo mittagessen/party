@@ -111,7 +111,7 @@ class PartyModel(nn.Module, BaseModel):
         encoder_sizes = [(image_size[0] // red, image_size[1] // red)
                          for red in encoder_reductions]
 
-        num_prompt_samples = 128
+        num_prompt_samples = 512
 
         # encoder_max_seq_len is sized for the decoder's cross-attention
         # (attends to the prompt output, not the full adapter output)

@@ -120,7 +120,7 @@ class PromptCrossAttention(nn.Module):
         # Cross-attention + self-attention blocks
         self.layers = nn.ModuleList()
         for _ in range(num_layers):
-            cross_attn = MultiHeadAttention(
+            x_attn = MultiHeadAttention(
                 embed_dim=embed_dim,
                 num_heads=num_heads,
                 num_kv_heads=num_heads,
@@ -129,12 +129,14 @@ class PromptCrossAttention(nn.Module):
                 k_proj=nn.Linear(embed_dim, num_heads * head_dim, bias=False),
                 v_proj=nn.Linear(embed_dim, num_heads * head_dim, bias=False),
                 output_proj=nn.Linear(embed_dim, embed_dim, bias=False),
+                q_norm=RMSNorm(dim=head_dim, eps=1e-05),
+                k_norm=RMSNorm(dim=head_dim, eps=1e-05),
                 pos_embeddings=None,
                 attn_dropout=0.0,
                 is_causal=False,
             )
-            cross_attn_layer = TransformerCrossAttentionLayer(
-                attn=cross_attn,
+            x_attn_layer = TransformerCrossAttentionLayer(
+                attn=x_attn,
                 mlp=FeedForward(
                     gate_proj=nn.Linear(embed_dim, hidden_dim),
                     down_proj=nn.Linear(hidden_dim, embed_dim),
@@ -173,7 +175,7 @@ class PromptCrossAttention(nn.Module):
             )
 
             self.layers.append(nn.ModuleDict({
-                'cross_attn': cross_attn_layer,
+                'x_attn': x_attn_layer,
                 'self_attn': self_attn_layer,
             }))
 
@@ -222,7 +224,7 @@ class PromptCrossAttention(nn.Module):
 
         # Cross-attend into encoder, then self-attend among prompt tokens
         for layer in self.layers:
-            h = layer['cross_attn'](h, encoder_input=encoder_features)
+            h = layer['x_attn'](h, encoder_input=encoder_features)
             h = layer['self_attn'](h)
 
         return h
