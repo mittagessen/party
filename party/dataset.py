@@ -87,7 +87,6 @@ def _to_curve(baseline, im_size, min_points: int = 8):
     """
     Converts poly(base)lines to Bezier curves.
     """
-    print(f'{baseline} {im_size}')
     from shapely.geometry import LineString
 
     baseline = np.array(baseline)
@@ -96,7 +95,6 @@ def _to_curve(baseline, im_size, min_points: int = 8):
         baseline = np.stack([np.array(ls.interpolate(x, normalized=True).coords)[0] for x in np.linspace(0, 1, 8)])
     # control points
     curve = np.concatenate(([baseline[0]], bezier_fit(baseline), [baseline[-1]]))/im_size
-    print(curve)
     curve = curve.flatten()
     return pa.scalar(curve, type=pa.list_(pa.float32()))
 
@@ -215,7 +213,6 @@ def compile(files: Optional[list[Union[str, 'PathLike']]] = None,
                                                        line_struct))
                             num_lines += 1
                         except Exception:
-                            raise
                             continue
                     # skip pages with lines longer than max_line_tokens
                     if max_octets_in_line > max_line_tokens:
