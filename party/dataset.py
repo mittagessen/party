@@ -87,6 +87,7 @@ def _to_curve(baseline, im_size, min_points: int = 8):
     """
     Converts poly(base)lines to Bezier curves.
     """
+    print(f'{baseline} {im_size}')
     from shapely.geometry import LineString
 
     baseline = np.array(baseline)
@@ -95,6 +96,7 @@ def _to_curve(baseline, im_size, min_points: int = 8):
         baseline = np.stack([np.array(ls.interpolate(x, normalized=True).coords)[0] for x in np.linspace(0, 1, 8)])
     # control points
     curve = np.concatenate(([baseline[0]], bezier_fit(baseline), [baseline[-1]]))/im_size
+    print(curve)
     curve = curve.flatten()
     return pa.scalar(curve, type=pa.list_(pa.float32()))
 
@@ -171,35 +173,25 @@ def compile(files: Optional[list[Union[str, 'PathLike']]] = None,
             with pa.ipc.new_file(sink, schema) as writer:
                 for file in files:
                     try:
-                        page = XMLPage(file).to_container()
+                        page = XMLPage(file)
+                        seg = page.to_container()
                         # pick image format with smallest size
-                        image_candidates = list(set(page.imagename.with_suffix(x) for x in ['.jxl', '.png']).union([page.imagename]))
-                        cand_idxs = np.argsort([t.stat().st_size if t.exists() else np.inf for t in image_candidates])
-                        im_path = None
-                        for idx in cand_idxs:
-                            try:
-                                with Image.open(image_candidates[idx]) as im:
-                                    if resize:
-                                        im = im.convert('RGB')
-                                        im = im.resize((resize[1], resize[0]), Image.LANCZOS)
-                                        im_size = im.size
-                                        im_buf = io.BytesIO()
-                                        im.save(im_buf, format='JPEG', quality=95)
-                                        resized_im_bytes = im_buf.getvalue()
-                                    else:
-                                        im_size = im.size
-                                im_path = image_candidates[idx]
-                                break
-                            except Exception:
-                                continue
+                        with Image.open(seg.imagename) as im:
+                            if resize:
+                                im = im.convert('RGB')
+                                im = im.resize((resize[1], resize[0]), Image.LANCZOS)
+                                im_buf = io.BytesIO()
+                                im.save(im_buf, format='JPEG', quality=95)
+                                im_bytes = im_buf.getvalue()
+                            else:
+                               with open(seg.imagename, 'rb') as fp:
+                                    im_bytes = fp.read()
                     except Exception:
-                        continue
-                    if im_path is None:
                         continue
                     page_data = []
                     page_lang_counts = Counter()
                     prev_max_octets_in_line = max_octets_in_line
-                    for line in page.lines:
+                    for line in seg.lines:
                         try:
                             text = line.text
                             for func in text_transforms:
@@ -218,11 +210,12 @@ def compile(files: Optional[list[Union[str, 'PathLike']]] = None,
                             max_octets_in_line = max(len(tokenizer.encode(text, add_bos=False, add_eos=False)), max_octets_in_line)
                             page_data.append(pa.scalar({'text': pa.scalar(text),
                                                         'lang': line_langs,
-                                                        'curve': _to_curve(line.baseline, im_size),
-                                                        'bbox': _to_bbox(line.boundary, im_size)},
+                                                        'curve': _to_curve(line.baseline, page.image_size[::-1]),
+                                                        'bbox': _to_bbox(line.boundary, page.image_size[::-1])},
                                                        line_struct))
                             num_lines += 1
                         except Exception:
+                            raise
                             continue
                     # skip pages with lines longer than max_line_tokens
                     if max_octets_in_line > max_line_tokens:
@@ -230,12 +223,7 @@ def compile(files: Optional[list[Union[str, 'PathLike']]] = None,
                         continue
                     if len(page_data) > 1:
                         lang_counts.update(page_lang_counts)
-                        if resize:
-                            im = resized_im_bytes
-                        else:
-                            with open(im_path, 'rb') as fp:
-                                im = fp.read()
-                        ar = pa.array([pa.scalar({'im': im,
+                        ar = pa.array([pa.scalar({'im': im_bytes,
                                                   'lines': page_data}, page_struct)], page_struct)
                         writer.write(pa.RecordBatch.from_arrays([ar], schema=schema))
                         max_lines_in_page = max(len(page_data), max_lines_in_page)
