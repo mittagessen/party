@@ -81,7 +81,6 @@ class PartyModel(nn.Module, BaseModel):
         encoder_embed_dim: Embedding dimension of the encoder
         decoder_embed_dim: Embedding dimension of the decoder
     """
-    user_metadata = {}
     model_type = 'recognition'
     _kraken_min_version = '6.0.0'
     tokenizer = OctetTokenizer()
