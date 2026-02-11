@@ -83,7 +83,7 @@ def get_default_transforms(image_size: tuple[int, int] = (2560, 1920), dtype=tor
                        v2.Normalize(mean=[0.4850, 0.4560, 0.4060], std=[0.2290, 0.2240, 0.2250])])
 
 
-def _to_curve(baseline, im_size, min_points: int = 8):
+def _to_curve(baseline, im_size, min_points: int = 8, clamp_tolerance: float = 0.02):
     """
     Converts poly(base)lines to Bezier curves.
 
@@ -91,6 +91,9 @@ def _to_curve(baseline, im_size, min_points: int = 8):
         baseline:
         im_size: (width, height)
         min_points:
+        clamp_tolerance: normalized distance beyond [0, 1] that is still
+                         clamped. Values exceeding this cause the line to
+                         be skipped (returns None).
     """
     from shapely.geometry import LineString
 
@@ -100,17 +103,28 @@ def _to_curve(baseline, im_size, min_points: int = 8):
         baseline = np.stack([np.array(ls.interpolate(x, normalized=True).coords)[0] for x in np.linspace(0, 1, 8)])
     # control points
     curve = np.concatenate(([baseline[0]], bezier_fit(baseline), [baseline[-1]]))/im_size
+    # reject lines with non-finite or substantially out-of-bounds values
+    if not np.all(np.isfinite(curve)):
+        logger.info('Skipping line with non-finite curve points')
+        return None
+    if np.any(curve < -clamp_tolerance) or np.any(curve > 1 + clamp_tolerance):
+        logger.info('Skipping line with curve points substantially outside image bounds')
+        return None
+    curve = np.clip(curve, 0.0, 1.0)
     curve = curve.flatten()
     return pa.scalar(curve, type=pa.list_(pa.float32()))
 
 
-def _to_bbox(boundary, im_size):
+def _to_bbox(boundary, im_size, clamp_tolerance: float = 0.02):
     """
     Converts a bounding polygon to a bbox in xyxyc_xc_yhw format.
 
     Args:
         boundary:
         im_size: (width, height)
+        clamp_tolerance: normalized distance beyond [0, 1] that is still
+                         clamped. Values exceeding this cause the line to
+                         be skipped (returns None).
     """
     flat_box = [point for pol in boundary for point in pol]
     xmin, xmax = min(flat_box[::2]), max(flat_box[::2])
@@ -120,6 +134,13 @@ def _to_bbox(boundary, im_size):
     cx = (xmin + xmax) / 2
     cy = (ymin + ymax) / 2
     bbox = np.array([[xmin, ymin], [xmax, ymax], [cx, cy], [w, h]]) / im_size
+    if not np.all(np.isfinite(bbox)):
+        logger.info('Skipping line with non-finite bbox values')
+        return None
+    if np.any(bbox < -clamp_tolerance) or np.any(bbox > 1 + clamp_tolerance):
+        logger.info('Skipping line with bbox substantially outside image bounds')
+        return None
+    bbox = np.clip(bbox, 0.0, 1.0)
     bbox = bbox.flatten()
     return pa.scalar(bbox, type=pa.list_(pa.float32()))
 
@@ -214,11 +235,17 @@ def compile(files: Optional[list[Union[str, 'PathLike']]] = None,
                             line_langs = line.language if line.language else ['und']
                             for lang in line_langs:
                                 page_lang_counts[lang] += 1
+                            curve = _to_curve(line.baseline, page.image_size)
+                            if curve is None:
+                                continue
+                            bbox = _to_bbox(line.boundary, page.image_size)
+                            if bbox is None:
+                                continue
                             max_octets_in_line = max(len(tokenizer.encode(text, add_bos=False, add_eos=False)), max_octets_in_line)
                             page_data.append(pa.scalar({'text': pa.scalar(text),
                                                         'lang': line_langs,
-                                                        'curve': _to_curve(line.baseline, page.image_size),
-                                                        'bbox': _to_bbox(line.boundary, page.image_size)},
+                                                        'curve': curve,
+                                                        'bbox': bbox},
                                                        line_struct))
                             num_lines += 1
                         except Exception:
