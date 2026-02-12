@@ -233,6 +233,7 @@ def train(ctx, **kwargs):
 
     from lightning.pytorch import Trainer
     from lightning.pytorch.callbacks import RichModelSummary, ModelCheckpoint, RichProgressBar
+    from kraken.train.utils import KrakenOnExceptionCheckpoint
 
     torch.set_float32_matmul_precision('high')
 
@@ -242,15 +243,19 @@ def train(ctx, **kwargs):
         val_check_interval = {'val_check_interval': params['freq']}
 
     cbs = [RichModelSummary(max_depth=3)]
+    checkpoint_path = params.pop('checkpoint_path')
 
-    checkpoint_callback = ModelCheckpoint(dirpath=params.pop('checkpoint_path'),
+    checkpoint_callback = ModelCheckpoint(dirpath=checkpoint_path,
                                           save_top_k=10,
                                           monitor='val_metric',
                                           mode='min',
                                           auto_insert_metric_name=False,
                                           filename='checkpoint_{epoch:02d}-{val_metric:.4f}')
+    abort_checkpoint_callback = KrakenOnExceptionCheckpoint(dirpath=checkpoint_path,
+                                                            filename='checkpoint_abort')
 
     cbs.append(checkpoint_callback)
+    cbs.append(abort_checkpoint_callback)
 
     dm_config = PartyRecognitionTrainingDataConfig(**params)
     m_config = PartyRecognitionTrainingConfig(**params)
