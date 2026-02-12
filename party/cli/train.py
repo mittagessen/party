@@ -314,12 +314,12 @@ def train(ctx, **kwargs):
         elif load:
             message(f'Loading from checkpoint {load}.')
             if load.endswith('safetensors'):
-                model = PartyRecognitionModel.load_from_safetensors(load, config=m_config)
+                model = PartyRecognitionModel.load_from_weights(load, config=m_config)
             elif load.endswith('ckpt'):
                 model = PartyRecognitionModel.load_from_checkpoint(load, config=m_config)
             else:
                 message(f'Loading from zenodo repository {load}.')
-                model = PartyRecognitionModel.load_from_repo(load)
+                model = PartyRecognitionModel.load_from_repo(load, config=m_config)
         elif resume:
             message(f'Resuming from checkpoint {resume}.')
             model = PartyRecognitionModel.load_from_checkpoint(resume)
