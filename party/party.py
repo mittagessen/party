@@ -22,7 +22,7 @@ from torch import nn
 import numpy as np
 
 from dataclasses import asdict, replace
-from kraken.models import BaseModel
+from kraken.models import RecognitionBaseModel
 from kraken.containers import BaselineOCRRecord, BBoxOCRRecord, BBoxLine
 from lightning.fabric import Fabric
 from collections.abc import Generator
@@ -71,7 +71,7 @@ def _baseline_to_bbox(line: 'BaselineLine') -> 'BBoxLine':
     return BBoxLine(**d)
 
 
-class PartyModel(nn.Module, BaseModel):
+class PartyModel(nn.Module, RecognitionBaseModel):
     """
     The party fusion model.
 
