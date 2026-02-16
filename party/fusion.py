@@ -204,7 +204,8 @@ class PartyMultiScaleAdapter(nn.Module):
                  encoder_embed_dims: list[int],
                  encoder_sizes: list[tuple[int, int]],
                  decoder_embed_dim: int,
-                 ds_factors: list[int] = None):
+                 ds_factors: list[int] = None,
+                 use_pos_embeddings: bool = True):
         super().__init__()
         if ds_factors is None:
             ds_factors = [4, 2, 1]
@@ -259,7 +260,10 @@ class PartyMultiScaleAdapter(nn.Module):
                 layers.append(layer)
             layers.append(nn.Linear(encoder_embed_dim, decoder_embed_dim))
             self.adapter.append(nn.Sequential(*layers))
-            self.pos_embeddings.append(PositionEmbeddingRandom(decoder_embed_dim, ds_size))
+            if use_pos_embeddings:
+                self.pos_embeddings.append(PositionEmbeddingRandom(decoder_embed_dim, ds_size))
+            else:
+                self.pos_embeddings.append(nn.Identity())
 
     def forward(self, encoder_hidden_states: list[torch.Tensor]) -> torch.Tensor:
         os = []

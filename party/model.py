@@ -18,6 +18,7 @@ Training loop interception helpers
 import torch
 import logging
 import lightning.pytorch as L
+import math
 
 from torch import nn
 from torch.optim import lr_scheduler
@@ -357,12 +358,13 @@ class PartyRecognitionModel(L.LightningModule):
 
         config = self.hparams.config
         optimizer = torch.optim.AdamW(param_groups, weight_decay=config.weight_decay)
-        len_train_set = len(self.trainer.datamodule.train_set)
-        batch_size = self.trainer.datamodule.hparams.data_config.batch_size
-        accumulate = self.hparams.config.accumulate_grad_batches
-        num_devices = max(1, self.trainer.num_devices)
-        steps_per_epoch = len_train_set // (batch_size * accumulate * num_devices)
-        
+        world_size = get_world_size() if is_initialized() else 1
+        per_rank_batches = self.trainer.datamodule.train_set.num_batches // world_size
+        accumulate = max(1, self.hparams.config.accumulate_grad_batches)
+        # The train dataloader emits one sampled page-batch per step.
+        # Scheduler steps should follow optimizer steps (after grad accumulation).
+        steps_per_epoch = max(1, math.ceil(per_rank_batches / accumulate))
+
         scheduler = lr_scheduler.CosineAnnealingLR(
             optimizer, config.cos_t_max * steps_per_epoch, config.cos_min_lr,
             last_epoch=config.completed_epochs * steps_per_epoch - 1
