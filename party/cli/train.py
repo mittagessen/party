@@ -195,6 +195,9 @@ def compile(ctx, **params):
               help='Sets line prompt sampling mode: `boxes` for boxes only, '
               '`curves` for curves only, and `both` for randomly switching '
               'between boxes and curves.')
+@click.option('--prompt-num-samples',
+              type=click.IntRange(1),
+              help='Number of filtered prompt tokens produced by PromptCrossAttention.')
 @click.option('--logger',
               'pl_logger',
               type=click.Choice(['tensorboard', 'wandb']),

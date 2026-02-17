@@ -279,7 +279,8 @@ class PartyRecognitionModel(L.LightningModule):
             if self.net is None:
                 self.net = create_model('PartyModel',
                                         pretrained=True,
-                                        image_size=self.trainer.datamodule.hparams.data_config.image_size)
+                                        image_size=self.trainer.datamodule.hparams.data_config.image_size,
+                                        prompt_num_samples=self.hparams.config.prompt_num_samples)
 
             if self.hparams.config.freeze_encoder:
                 for param in self.net.encoder.parameters():
@@ -302,10 +303,12 @@ class PartyRecognitionModel(L.LightningModule):
         if not isinstance(checkpoint['_module_config'], PartyRecognitionTrainingConfig):
             raise ValueError('Checkpoint is not a party model.')
 
+        module_config = checkpoint['_module_config']
         data_config = checkpoint['datamodule_hyper_parameters']['data_config']
         self.net = create_model('PartyModel',
                                 pretrained=True,
-                                image_size=data_config.image_size)
+                                image_size=data_config.image_size,
+                                prompt_num_samples=getattr(module_config, 'prompt_num_samples', 384))
 
     @classmethod
     def load_from_repo(cls,

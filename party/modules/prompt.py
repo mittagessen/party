@@ -104,6 +104,9 @@ def sample_bezier(control_points: torch.Tensor, num_samples: int) -> torch.Tenso
     Returns:
         Sampled points of shape ``[b, num_samples, 2]``.
     """
+    if num_samples <= 1:
+        return control_points[:, 0:1, :]
+
     t = torch.linspace(0, 1, num_samples,
                        device=control_points.device,
                        dtype=control_points.dtype)
@@ -120,29 +123,60 @@ def sample_bezier(control_points: torch.Tensor, num_samples: int) -> torch.Tenso
 
 def sample_box(boxes: torch.Tensor, num_samples: int) -> torch.Tensor:
     """
-    Samples points along the diagonal of bounding boxes.
+    Samples points from multiple center rails inside bounding boxes.
 
-    Samples uniformly from the top-left corner (xmin, ymin) to the
-    bottom-right corner (xmax, ymax). This handles horizontal, vertical,
-    and tilted text lines as the bbox diagonal naturally follows the reading
-    direction.
+    The primary rail tracks the box center along its long axis. Additional
+    rails are offset by a fraction of the minor axis to expose upper/lower
+    context (e.g. ascenders/descenders and distant diacritics).
 
     Args:
         boxes: Box coordinates of shape ``[b, 4, 2]`` where the points are
                ``[[xmin, ymin], [xmax, ymax], [cx, cy], [w, h]]`` with
                coordinates in [0, 1].
-        num_samples: Number of points to sample along the diagonal.
+        num_samples: Number of points to sample across rails.
 
     Returns:
         Sampled points of shape ``[b, num_samples, 2]``.
     """
-    tl = boxes[:, 0:1, :]  # [b, 1, 2] (xmin, ymin)
-    br = boxes[:, 1:2, :]  # [b, 1, 2] (xmax, ymax)
-    t = torch.linspace(0, 1, num_samples,
-                       device=boxes.device,
-                       dtype=boxes.dtype)
-    t = t.unsqueeze(0).unsqueeze(-1)  # [1, N, 1]
-    return tl + t * (br - tl)
+    if num_samples <= 1:
+        return boxes[:, 2:3, :]
+
+    xmin = boxes[:, 0:1, 0]
+    ymin = boxes[:, 0:1, 1]
+    xmax = boxes[:, 1:2, 0]
+    ymax = boxes[:, 1:2, 1]
+    cx = boxes[:, 2:3, 0]
+    cy = boxes[:, 2:3, 1]
+    w = boxes[:, 3:4, 0].abs()
+    h = boxes[:, 3:4, 1].abs()
+    horizontal = (w >= h)
+
+    num_rails = 3
+    rail_offset = 0.35
+    offsets = torch.linspace(-rail_offset, rail_offset, num_rails,
+                             device=boxes.device,
+                             dtype=boxes.dtype)
+    base = num_samples // num_rails
+    rem = num_samples % num_rails
+    counts = [base + (1 if i < rem else 0) for i in range(num_rails)]
+
+    samples = []
+    for offset, count in zip(offsets, counts):
+        if count == 0:
+            continue
+        t = torch.linspace(0, 1, count,
+                           device=boxes.device,
+                           dtype=boxes.dtype).unsqueeze(0)
+        x_h = xmin + t * (xmax - xmin)
+        y_h = cy + offset * h
+        x_v = cx + offset * w
+        y_v = ymin + t * (ymax - ymin)
+
+        x = torch.where(horizontal, x_h, x_v)
+        y = torch.where(horizontal, y_h, y_v)
+        samples.append(torch.stack((x, y), dim=-1))
+
+    return torch.cat(samples, dim=1).clamp(0.0, 1.0)
 
 
 class PromptCrossAttention(nn.Module):
@@ -281,7 +315,10 @@ class PromptCrossAttention(nn.Module):
         h = self.input_proj(h)
         h = h + self.type_embeddings.weight[type_idx]
 
-        encoder_features = encoder_features.expand(b, -1, -1)
+        if encoder_features.size(0) == 1:
+            encoder_features = encoder_features.expand(b, -1, -1)
+        elif encoder_features.size(0) != b:
+            raise ValueError(f'encoder_features batch size ({encoder_features.size(0)}) does not match prompt batch size ({b})')
 
         # Cross-attend into encoder, then self-attend among prompt tokens
         for layer in self.layers:

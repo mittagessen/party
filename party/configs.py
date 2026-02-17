@@ -34,6 +34,7 @@ class PartyRecognitionTrainingConfig(TrainingConfig):
     def __init__(self, **kwargs):
         self.freeze_encoder = kwargs.pop('freeze_encoder', False)
         self.train_from_scratch = kwargs.pop('train_from_scratch', False)
+        self.prompt_num_samples = kwargs.pop('prompt_num_samples', 384)
         self.noisy_teacher_forcing = kwargs.pop('noisy_teacher_forcing', 0.05)
         self.label_smoothing = kwargs.pop('label_smoothing', 0.0)
         # LR multiplier for pretrained components (encoder + decoder base layers)

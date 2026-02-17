@@ -28,7 +28,7 @@ from lightning.fabric import Fabric
 from collections.abc import Generator
 from typing import Optional, Union, TYPE_CHECKING, Any
 
-from party.modules import PromptEncoder
+from party.modules import PromptCrossAttention
 from party.tokenizer import OctetTokenizer
 from party.fusion import PartyMultiScaleAdapter, bytellama_vision_decoder
 from party.dataset import get_default_transforms, _to_curve, _to_bbox
@@ -111,8 +111,12 @@ class PartyModel(nn.Module, RecognitionBaseModel):
         encoder_sizes = [(image_size[0] // red, image_size[1] // red)
                          for red in encoder_reductions]
 
-        self.encoder_max_seq_len = sum((size[0] // ds) * (size[1] // ds)
-                                       for size, ds in zip(encoder_sizes, ds_factors))
+        prompt_num_samples = kwargs.get('prompt_num_samples', 384)
+        prompt_num_layers = kwargs.get('prompt_num_layers', 2)
+        prompt_num_heads = kwargs.get('prompt_num_heads', 8)
+
+        # decoder cross-attention cache length equals the filtered prompt tokens
+        self.encoder_max_seq_len = prompt_num_samples
 
         decoder = bytellama_vision_decoder(pretrained='mittagessen/bytellama-40m-oscar',
                                            encoder_max_seq_len=self.encoder_max_seq_len,
@@ -125,7 +129,10 @@ class PartyModel(nn.Module, RecognitionBaseModel):
                                          encoder_sizes=encoder_sizes,
                                          decoder_embed_dim=decoder_embed_dim,
                                          ds_factors=ds_factors)
-        line_embedding = PromptEncoder(decoder_embed_dim)
+        line_embedding = PromptCrossAttention(embed_dim=decoder_embed_dim,
+                                              num_heads=prompt_num_heads,
+                                              num_layers=prompt_num_layers,
+                                              num_samples=prompt_num_samples)
 
         self.nn = nn.ModuleDict({'encoder': encoder,
                                  'decoder': decoder,
@@ -232,14 +239,12 @@ class PartyModel(nn.Module, RecognitionBaseModel):
         # for new inputs. Previous encoder outputs are cached
         # in the decoder cache.
         if encoder_input is not None:
-            encoder_hidden_states = self.forward_encoder_embeddings(encoder_input)
-            # expand encoder_hidden_states from (1, s_e, d) to (b, s_e, d)
-            encoder_hidden_states = encoder_hidden_states.repeat(tokens.size(0), 1, 1)
-
-            # add line embeddings to encoder hidden states
-            line_embeds = self.nn['line_embedding'](curves=encoder_curves,
-                                                    boxes=encoder_boxes).unsqueeze(1).expand(-1, encoder_hidden_states.size(1), -1)
-            encoder_hidden_states = encoder_hidden_states + line_embeds
+            adapter_output = self.forward_encoder_embeddings(encoder_input)
+            # Prompt cross-attention conditioning: sampled curve/box points
+            # attend into adapter tokens and produce compact line-focused features.
+            encoder_hidden_states = self.nn['line_embedding'](encoder_features=adapter_output,
+                                                              curves=encoder_curves,
+                                                              boxes=encoder_boxes)
 
         output = self.nn['decoder'](tokens=tokens,
                                     mask=mask,
@@ -395,8 +400,8 @@ class PartyModel(nn.Module, RecognitionBaseModel):
             raise ValueError('One of `curves` or `boxes` needs to be set.')
         logger.debug('Computing encoder embeddings')
 
-        encoder_hidden_states = self.forward_encoder_embeddings(encoder_input).repeat(self._batch_size, 1, 1)
-        device = encoder_hidden_states.device
+        adapter_output = self.forward_encoder_embeddings(encoder_input)
+        device = adapter_output.device
 
         _prompt = torch.tensor(self.tokenizer.encode('', langs=languages, add_eos=False),
                                device=device,
@@ -437,17 +442,16 @@ class PartyModel(nn.Module, RecognitionBaseModel):
                                   decoder_max_seq_len=self._max_generated_tokens,
                                   dtype=next(self.nn['encoder'].parameters()).dtype)
 
-            logger.debug('Adding line embeddings to encoder states.')
-            # add line embeddings to encoder hidden states
-            line_embeds = self.nn['line_embedding'](curves=batch if curves is not None else None,
-                                                    boxes=batch if boxes is not None else None).unsqueeze(1).expand(-1, encoder_hidden_states.size(1), -1)
-            exp_encoder_hidden_states = encoder_hidden_states[:bsz, ...] + line_embeds
+            logger.debug('Computing line-focused features via prompt cross-attention.')
+            line_features = self.nn['line_embedding'](encoder_features=adapter_output,
+                                                      curves=batch if curves is not None else None,
+                                                      boxes=batch if boxes is not None else None)
 
             logger.debug('Prefilling cache.')
             # prefill step
             curr_masks = masks[:, :_prompt_length]
             logits = self.forward(tokens=_prompt[:bsz, ...],
-                                  encoder_hidden_states=exp_encoder_hidden_states,
+                                  encoder_hidden_states=line_features,
                                   encoder_mask=encoder_mask[:bsz, ...],
                                   mask=curr_masks,
                                   input_pos=input_pos[:, :_prompt_length].squeeze())
