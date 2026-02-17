@@ -34,3 +34,4 @@ train:
   accumulate_grad_batches: 8
   noisy_teacher_forcing: 0.02
   label_smoothing: 0.0
+  pl_logger: wandb

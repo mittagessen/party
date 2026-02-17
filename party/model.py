@@ -47,14 +47,16 @@ logger = logging.getLogger(__name__)
 @torch.compile(dynamic=False)
 def model_step(model, ntf, criterion, batch):
     tokens = batch['tokens']
-    targets = ntf(tokens.clone()[..., 1:])
     # shift the tokens to create targets
     ignore_idxs = torch.full((tokens.shape[0], 1),
                              criterion.ignore_index,
                              dtype=tokens.dtype, device=tokens.device)
-    targets = torch.hstack((targets, ignore_idxs)).reshape(-1)
+    targets = torch.hstack((tokens[..., 1:], ignore_idxs)).reshape(-1)
 
-    # our tokens already contain BOS/EOS tokens so we just run it
+    # apply noisy teacher forcing to decoder inputs, not the targets
+    tokens = ntf(tokens.clone())
+
+    # our tokens already contain BOS/EOS tokens so we just run them
     # through the model after replacing ignored indices.
     tokens.masked_fill_(tokens == criterion.ignore_index, 0)
     logits = model(tokens=tokens,
@@ -207,7 +209,8 @@ class PartyRecognitionModel(L.LightningModule):
         p_nft = config.noisy_teacher_forcing
         self.noisy_teacher_forcing = nn.Identity() if p_nft == 0. else NoisyTeacherForcing(min_label=OFFSET,
                                                                                            max_label=LANG_OFFSET,
-                                                                                           p=p_nft)
+                                                                                           p=p_nft,
+                                                                                           ignore_index=self.criterion.ignore_index)
 
         self.model_step = model_step
 
