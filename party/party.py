@@ -43,18 +43,22 @@ logger = logging.getLogger(__name__)
 __all__ = ['PartyModel']
 
 
-def _box_prompt_fn(line: Union['BaselineLine', 'BBoxLine'], im_size: tuple[int, int]) -> torch.Tensor:
+def _box_prompt_fn(line: Union['BaselineLine', 'BBoxLine'],
+                   im_size: tuple[int, int]) -> Optional[list[float]]:
     """
     Converts a BBoxLine or BaselineLine to a bounding box representation.
     """
-    return _to_bbox([line.bbox] if line.type == 'bbox' else line.boundary, im_size).as_py()
+    bbox = _to_bbox([line.bbox] if line.type == 'bbox' else line.boundary, im_size)
+    return bbox.as_py() if bbox is not None else None
 
 
-def _curve_prompt_fn(line: 'BaselineLine', im_size: tuple[int, int]) -> torch.Tensor:
+def _curve_prompt_fn(line: 'BaselineLine',
+                     im_size: tuple[int, int]) -> Optional[list[float]]:
     """
     Converts a BaselineLine to a cubic Bézier curve.
     """
-    return _to_curve(line.baseline, im_size).as_py()
+    curve = _to_curve(line.baseline, im_size)
+    return curve.as_py() if curve is not None else None
 
 
 def _baseline_to_bbox(line: 'BaselineLine') -> 'BBoxLine':
@@ -314,21 +318,34 @@ class PartyModel(nn.Module, RecognitionBaseModel):
             else:
                 prompt_mode = 'boxes'
 
-            if prompt_mode == 'curves':
-                lines_data = [_curve_prompt_fn(line, im.size) for line in segmentation.lines]
-            else:
-                lines_data = [_box_prompt_fn(line, im.size) for line in segmentation.lines]
+            valid_lines = []
+            valid_line_indices = []
+            lines_data = []
+            for idx, line in enumerate(segmentation.lines):
+                line_data = _curve_prompt_fn(line, im.size) if prompt_mode == 'curves' else _box_prompt_fn(line, im.size)
+                if line_data is None:
+                    logger.info(f'Skipping line {idx} due to invalid prompt geometry.')
+                    continue
+                valid_lines.append(line)
+                valid_line_indices.append(idx)
+                lines_data.append(line_data)
+
+            if not lines_data:
+                logger.warning('No valid line prompts available for inference.')
+                return
 
             lines = torch.tensor(lines_data).view(-1, 4, 2)
 
             languages = segmentation.language if self._inf_config.add_lang_token else None
+            if isinstance(languages, (list, tuple)) and len(languages) == len(segmentation.lines):
+                languages = [languages[idx] for idx in valid_line_indices]
 
             for (pred_text, pred_confs, pred_langs), line in zip(
                 self.predict_string(encoder_input=image_input,
                                     curves=lines if prompt_mode == 'curves' else None,
                                     boxes=lines if prompt_mode == 'boxes' else None,
                                     languages=languages),
-                segmentation.lines
+                valid_lines
             ):
                 line = replace(line, language=list(pred_langs) if pred_langs else None)
                 n_chars = len(pred_text)

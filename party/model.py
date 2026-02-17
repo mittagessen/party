@@ -155,15 +155,17 @@ class PartyTextLineDataModule(L.LightningDataModule):
         sampler = RandomSampler(self.train_set,
                                 replacement=True,
                                 num_samples=self.train_set.num_batches // world_size)
+        dataloader_kwargs = {'num_workers': self.hparams.data_config.num_workers,
+                             'batch_size': 1,
+                             'sampler': sampler,
+                             'pin_memory': True,
+                             'shuffle': False,
+                             'collate_fn': collate_null}
 
-        return DataLoader(self.train_set,
-                          num_workers=self.hparams.data_config.num_workers,
-                          batch_size=1,
-                          sampler=sampler,
-                          pin_memory=True,
-                          shuffle=False,
-                          prefetch_factor=4,
-                          collate_fn=collate_null)
+        if self.hparams.data_config.num_workers > 0:
+            dataloader_kwargs['prefetch_factor'] = 4
+
+        return DataLoader(self.train_set, **dataloader_kwargs)
 
     def val_dataloader(self):
         return DataLoader(self.val_set,
@@ -197,8 +199,7 @@ class PartyRecognitionModel(L.LightningModule):
 
         if model:
             self.net = model
-
-            if self.net.model_type not in [None, 'recognition']:
+            if 'recognition' not in self.net.model_type:
                 raise ValueError(f'Model {model} is of type {self.net.model_type} while `recognition` is expected.')
         else:
             self.net = None
@@ -283,9 +284,11 @@ class PartyRecognitionModel(L.LightningModule):
                                         prompt_num_samples=self.hparams.config.prompt_num_samples)
 
             if self.hparams.config.freeze_encoder:
-                for param in self.net.encoder.parameters():
+                encoder = self.net.nn['encoder'] if hasattr(self.net, 'nn') and 'encoder' in self.net.nn else self.net.encoder
+                adapter = self.net.nn['adapter'] if hasattr(self.net, 'nn') and 'adapter' in self.net.nn else self.net.adapter
+                for param in encoder.parameters():
                     param.requires_grad = False
-                for param in self.net.adapter.parameters():
+                for param in adapter.parameters():
                     param.requires_grad = False
 
     def on_save_checkpoint(self, checkpoint):

@@ -301,6 +301,7 @@ def train(ctx, **kwargs):
     trainer = Trainer(accelerator=ctx.meta['accelerator'],
                       devices=ctx.meta['devices'],
                       precision=ctx.meta['precision'],
+                      use_distributed_sampler=False,
                       max_epochs=params['epochs'] if params['quit'] == 'fixed' else -1,
                       min_epochs=params['min_epochs'],
                       enable_progress_bar=True if not ctx.meta['verbose'] else False,
@@ -359,7 +360,7 @@ def train(ctx, **kwargs):
         (entry_point,) = importlib.metadata.entry_points(group='kraken.writers', name=params['weights_format'])
         writer = entry_point.load()
     except ValueError:
-        raise click.UsageError('weights_format', 'Unknown format `{params.get("weights_format")}` for weights.')
+        raise click.UsageError(f'Unknown format `{params.get("weights_format")}` for weights.')
 
     with threadpool_limits(limits=ctx.meta['num_threads']):
         if resume:
