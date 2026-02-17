@@ -97,9 +97,8 @@ class PartyModel(nn.Module, RecognitionBaseModel):
                                               'metrics': []}
         self.user_metadata.update(kwargs)
 
-        # Use a single encoder feature scale (stride 16) as in the previous setup.
-        out_indices = (2,)
-        ds_factors = [1]
+        out_indices = (1, 2, 3)
+        ds_factors = [4, 2, 1]
         fusion_interval = kwargs.get('fusion_interval', 3)
 
         encoder = timm.create_model('convnextv2_base.fcmae_ft_in22k_in1k',
@@ -125,8 +124,7 @@ class PartyModel(nn.Module, RecognitionBaseModel):
                                          encoder_embed_dims=encoder_embed_dims,
                                          encoder_sizes=encoder_sizes,
                                          decoder_embed_dim=decoder_embed_dim,
-                                         ds_factors=ds_factors,
-                                         use_pos_embeddings=False)
+                                         ds_factors=ds_factors)
         line_embedding = PromptEncoder(decoder_embed_dim)
 
         self.nn = nn.ModuleDict({'encoder': encoder,
