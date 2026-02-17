@@ -195,6 +195,11 @@ def compile(ctx, **params):
               help='Sets line prompt sampling mode: `boxes` for boxes only, '
               '`curves` for curves only, and `both` for randomly switching '
               'between boxes and curves.')
+@click.option('--logger',
+              'pl_logger',
+              type=click.Choice(['tensorboard', 'wandb']),
+              default=None,
+              help='Logger to use for training.')
 @click.argument('ground_truth', nargs=-1, callback=_expand_gt, type=click.Path(exists=False, dir_okay=False))
 def train(ctx, **kwargs):
     """
@@ -265,6 +270,28 @@ def train(ctx, **kwargs):
     else:
         data_module = PartyTextLineDataModule(dm_config)
 
+    if params.get('pl_logger') == 'tensorboard':
+        try:
+            import tensorboard  # NOQA
+        except ImportError:
+            raise click.BadOptionUsage('logger', 'tensorboard logger needs the `tensorboard` package installed.')
+
+    if params.get('pl_logger') == 'wandb':
+        try:
+            import wandb  # NOQA
+        except ImportError:
+            raise click.BadOptionUsage('logger', 'wandb logger needs the `wandb` package installed.')
+
+    pl_logger = None
+    if params.get('pl_logger') == 'tensorboard':
+        from lightning.pytorch.loggers import TensorBoardLogger
+        pl_logger = TensorBoardLogger(save_dir=checkpoint_path)
+    elif params.get('pl_logger') == 'wandb':
+        from lightning.pytorch.loggers import WandbLogger
+        pl_logger = WandbLogger(project='party',
+                                save_dir=checkpoint_path,
+                                log_model=False)
+
     if not params['verbose']:
         cbs.append(RichProgressBar(leave=True))
 
@@ -280,6 +307,7 @@ def train(ctx, **kwargs):
                       callbacks=cbs,
                       gradient_clip_val=params['gradient_clip_val'],
                       num_sanity_val_steps=0,
+                      logger=pl_logger if pl_logger else False,
                       **val_check_interval)
 
     if trainer.is_global_zero:
