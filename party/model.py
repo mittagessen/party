@@ -71,41 +71,42 @@ def model_step(model, ntf, criterion, batch):
 def get_parameter_groups(model, config) -> list[dict[str, Any]]:
     """Create parameter groups with discriminative learning rates.
 
-    Pretrained group: encoder + decoder base layers (lower LR)
-    New group: adapter + fusion layers + line_embedding (base LR)
+    Pretrained group: encoder layers (lower LR)
+    Full-LR group: decoder + adapter + fusion + line_embedding (base LR)
     """
     base_lr = config.lrate
-    pretrained_params = []
-    new_params = []
+    encoder_params = []
+    full_lr_params = []
 
-    # Encoder params -> pretrained
+    # Encoder params -> reduced LR
     for p in model.nn['encoder'].parameters():
         if p.requires_grad:
-            pretrained_params.append(p)
+            encoder_params.append(p)
 
-    # Adapter params -> new
+    # Adapter params -> base LR
     for p in model.nn['adapter'].parameters():
         if p.requires_grad:
-            new_params.append(p)
+            full_lr_params.append(p)
 
-    # Line embedding params -> new
+    # Line embedding params -> base LR
     for p in model.nn['line_embedding'].parameters():
         if p.requires_grad:
-            new_params.append(p)
+            full_lr_params.append(p)
 
-    # Decoder params - separate fusion from base
-    for name, p in model.nn['decoder'].named_parameters():
+    # Decoder params -> base LR (including decoder base layers)
+    for _, p in model.nn['decoder'].named_parameters():
         if not p.requires_grad:
             continue
-        if '.fusion_layer.' in name:
-            new_params.append(p)
-        else:
-            pretrained_params.append(p)
+        full_lr_params.append(p)
 
-    return [
-        {'params': pretrained_params, 'lr': base_lr * config.lr_pretrained_mult, 'name': 'pretrained'},
-        {'params': new_params, 'lr': base_lr, 'name': 'new'},
-    ]
+    param_groups = [{'params': encoder_params,
+                     'lr': base_lr * config.lr_pretrained_mult,
+                     'name': 'encoder'},
+                    {'params': full_lr_params,
+                     'lr': base_lr,
+                     'name': 'full_lr'}]
+
+    return param_groups
 
 
 class PartyTextLineDataModule(L.LightningDataModule):
@@ -208,9 +209,12 @@ class PartyRecognitionModel(L.LightningModule):
         self.val_mean = MeanMetric()
 
         p_nft = config.noisy_teacher_forcing
+        self._target_ntf_p = p_nft
+        self._ntf_warmup_steps = max(0, int(getattr(config, 'noisy_teacher_forcing_warmup', 0) or 0))
+        initial_ntf_p = 0.0 if self._ntf_warmup_steps > 0 else p_nft
         self.noisy_teacher_forcing = nn.Identity() if p_nft == 0. else NoisyTeacherForcing(min_label=OFFSET,
                                                                                            max_label=LANG_OFFSET,
-                                                                                           p=p_nft,
+                                                                                           p=initial_ntf_p,
                                                                                            ignore_index=self.criterion.ignore_index)
 
         self.model_step = model_step
@@ -218,7 +222,17 @@ class PartyRecognitionModel(L.LightningModule):
     def forward(self, x, curves):
         return self.net(encoder_input=x, encoder_curves=curves)
 
+    def _update_noisy_teacher_forcing_p(self):
+        if not isinstance(self.noisy_teacher_forcing, NoisyTeacherForcing):
+            return
+        if self._ntf_warmup_steps <= 0:
+            self.noisy_teacher_forcing.p = self._target_ntf_p
+            return
+        ntf_scale = min(1.0, float(self.trainer.global_step + 1) / self._ntf_warmup_steps)
+        self.noisy_teacher_forcing.p = self._target_ntf_p * ntf_scale
+
     def training_step(self, batch, batch_idx):
+        self._update_noisy_teacher_forcing_p()
         loss = self.model_step(self.net, self.noisy_teacher_forcing, self.criterion, batch)
         # Handle NaN/Inf losses in DDP by replacing with zero loss
         # This ensures all processes participate in gradient sync while
