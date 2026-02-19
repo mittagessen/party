@@ -35,10 +35,11 @@ class PartyRecognitionTrainingConfig(TrainingConfig):
         self.freeze_encoder = kwargs.pop('freeze_encoder', False)
         self.train_from_scratch = kwargs.pop('train_from_scratch', False)
         self.prompt_num_samples = kwargs.pop('prompt_num_samples', 384)
-        self.noisy_teacher_forcing = kwargs.pop('noisy_teacher_forcing', 0.05)
+        self.noisy_teacher_forcing = kwargs.pop('noisy_teacher_forcing', 0.02)
+        self.noisy_teacher_forcing_warmup = kwargs.pop('noisy_teacher_forcing_warmup', None)
         self.label_smoothing = kwargs.pop('label_smoothing', 0.0)
-        # LR multiplier for pretrained components (encoder + decoder base layers)
-        self.lr_pretrained_mult = kwargs.pop('lr_pretrained_mult', 0.1)
+        # LR multiplier for pretrained encoder components.
+        self.lr_pretrained_mult = kwargs.pop('lr_pretrained_mult', 0.2)
 
         kwargs.setdefault('quit', 'fixed')
         kwargs.setdefault('epochs', 12)
@@ -48,6 +49,8 @@ class PartyRecognitionTrainingConfig(TrainingConfig):
         kwargs.setdefault('cos_t_max', 12)
         kwargs.setdefault('cos_min_lr', 5e-6)
         kwargs.setdefault('warmup', 1000)
+        if self.noisy_teacher_forcing_warmup is None:
+            self.noisy_teacher_forcing_warmup = kwargs['warmup']
         kwargs.setdefault('accumulate_grad_batches', 4)
         kwargs.setdefault('augment', True)
         super().__init__(**kwargs)

@@ -21,8 +21,8 @@ class NoisyTeacherForcing(nn.Module):
                  p: float,
                  ignore_index: int = -100):
         super().__init__()
-        if not (p > 0.0 and p < 1.0):
-            raise ValueError(f'`p` needs to be between 0 and 1 (is {p})')
+        if not (0.0 <= p <= 1.0):
+            raise ValueError(f'`p` needs to be in [0, 1] (is {p})')
         self.p = p
         self.max_label = max_label
         self.min_label = min_label

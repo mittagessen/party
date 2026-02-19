@@ -17,6 +17,7 @@ train:
   normalize_whitespace: true
   # whether to train on bbox, baseline, or both line prompts
   prompt_mode: both
+  prompt_num_samples: 384
   # base configuration of training epochs and LR schedule
   optimizer: AdamW
   epochs: 12
@@ -33,5 +34,6 @@ train:
   val_batch_size: 64
   accumulate_grad_batches: 8
   noisy_teacher_forcing: 0.02
+  noisy_teacher_forcing_warmup: 10000
   label_smoothing: 0.0
   pl_logger: wandb
