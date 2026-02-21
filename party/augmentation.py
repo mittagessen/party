@@ -203,7 +203,7 @@ class Augmenter(torch.nn.Module):
         """
         image = v2.ToImage()(image)
         image = self.photometric_transforms(image)
-        image, lines = self.crop(image, lines)
+        #image, lines = self.crop(image, lines)
         #image, lines = self.rotate(image, lines)
         #image, lines = self.perspective(image, lines)
         return image, lines
