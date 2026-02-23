@@ -231,6 +231,8 @@ class PromptCrossAttention(nn.Module):
         h = self.base_queries.unsqueeze(0) + cond.unsqueeze(1)
         h = h + self.type_embeddings.weight[type_idx]
 
+        encoder_features = encoder_features.expand(b, -1, -1)
+
         # Cross-attend into encoder, then self-attend among prompt tokens
         for layer in self.layers:
             h = layer['x_attn'](h, encoder_input=encoder_features)
