@@ -105,7 +105,7 @@ class PartyModel(nn.Module, RecognitionBaseModel):
         ds_factors = [4, 2, 1]
         fusion_interval = kwargs.get('fusion_interval', 3)
 
-        encoder = timm.create_model('convnextv2_tiny',
+        encoder = timm.create_model('convnextv2_base.fcmae_ft_in22k_in1k',
                                     pretrained=pretrained,
                                     features_only=True,
                                     out_indices=out_indices)
