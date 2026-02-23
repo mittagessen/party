@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Multimodal prompt encoder"""
+import math
 import torch
 import logging
 
@@ -92,125 +93,42 @@ class PromptEncoder(nn.Module):
         return embeddings
 
 
-def sample_bezier(control_points: torch.Tensor, num_samples: int) -> torch.Tensor:
-    """
-    Samples points along cubic Bézier curves.
-
-    Args:
-        control_points: Control points of shape ``[b, 4, 2]`` (P0, P1, P2, P3)
-                        with coordinates in [0, 1].
-        num_samples: Number of points to sample along each curve.
-
-    Returns:
-        Sampled points of shape ``[b, num_samples, 2]``.
-    """
-    if num_samples <= 1:
-        return control_points[:, 0:1, :]
-
-    t = torch.linspace(0, 1, num_samples,
-                       device=control_points.device,
-                       dtype=control_points.dtype)
-    t = t.unsqueeze(0).unsqueeze(-1)  # [1, N, 1]
-    p0 = control_points[:, 0:1, :]  # [b, 1, 2]
-    p1 = control_points[:, 1:2, :]
-    p2 = control_points[:, 2:3, :]
-    p3 = control_points[:, 3:4, :]
-    return ((1 - t)**3 * p0 +
-            3 * (1 - t)**2 * t * p1 +
-            3 * (1 - t) * t**2 * p2 +
-            t**3 * p3)
-
-
-def sample_box(boxes: torch.Tensor, num_samples: int) -> torch.Tensor:
-    """
-    Samples points from multiple center rails inside bounding boxes.
-
-    The primary rail tracks the box center along its long axis. Additional
-    rails are offset by a fraction of the minor axis to expose upper/lower
-    context (e.g. ascenders/descenders and distant diacritics).
-
-    Args:
-        boxes: Box coordinates of shape ``[b, 4, 2]`` where the points are
-               ``[[xmin, ymin], [xmax, ymax], [cx, cy], [w, h]]`` with
-               coordinates in [0, 1].
-        num_samples: Number of points to sample across rails.
-
-    Returns:
-        Sampled points of shape ``[b, num_samples, 2]``.
-    """
-    if num_samples <= 1:
-        return boxes[:, 2:3, :]
-
-    xmin = boxes[:, 0:1, 0]
-    ymin = boxes[:, 0:1, 1]
-    xmax = boxes[:, 1:2, 0]
-    ymax = boxes[:, 1:2, 1]
-    cx = boxes[:, 2:3, 0]
-    cy = boxes[:, 2:3, 1]
-    w = boxes[:, 3:4, 0].abs()
-    h = boxes[:, 3:4, 1].abs()
-    horizontal = (w >= h)
-
-    num_rails = 3
-    rail_offset = 0.35
-    offsets = torch.linspace(-rail_offset, rail_offset, num_rails,
-                             device=boxes.device,
-                             dtype=boxes.dtype)
-    base = num_samples // num_rails
-    rem = num_samples % num_rails
-    counts = [base + (1 if i < rem else 0) for i in range(num_rails)]
-
-    samples = []
-    for offset, count in zip(offsets, counts):
-        if count == 0:
-            continue
-        t = torch.linspace(0, 1, count,
-                           device=boxes.device,
-                           dtype=boxes.dtype).unsqueeze(0)
-        x_h = xmin + t * (xmax - xmin)
-        y_h = cy + offset * h
-        x_v = cx + offset * w
-        y_v = ymin + t * (ymax - ymin)
-
-        x = torch.where(horizontal, x_h, x_v)
-        y = torch.where(horizontal, y_h, y_v)
-        samples.append(torch.stack((x, y), dim=-1))
-
-    return torch.cat(samples, dim=1).clamp(0.0, 1.0)
-
-
 class PromptCrossAttention(nn.Module):
     """
     Cross-attention prompt encoder that produces line-focused features by
-    sampling points along curves/boxes and cross-attending into encoder
-    features.
+    conditioning learned queries with Fourier-embedded geometry and
+    cross-attending into encoder features.
 
     Args:
         embed_dim: Embedding dimension matching the decoder.
         num_heads: Number of attention heads.
         num_layers: Number of cross-attention + self-attention blocks.
-        num_samples: Number of points sampled along each curve/box.
+        num_samples: Number of learned query tokens.
+        num_freqs: Number of log-spaced Fourier frequencies for geometry encoding.
     """
     def __init__(self,
                  embed_dim: int,
                  num_heads: int = 8,
                  num_layers: int = 2,
-                 num_samples: int = 32) -> None:
+                 num_samples: int = 32,
+                 num_freqs: int = 8) -> None:
         super().__init__()
         self.embed_dim = embed_dim
         self.num_samples = num_samples
         head_dim = embed_dim // num_heads
         hidden_dim = 4 * embed_dim
 
-        # Gaussian Fourier feature matrix
-        self.register_buffer("positional_encoding_gaussian_matrix",
-                             torch.randn((2, embed_dim // 2)))
+        # Log-spaced Fourier frequencies for geometry encoding
+        freqs = 2 ** torch.arange(num_freqs, dtype=torch.float32)
+        self.register_buffer('freqs', freqs, persistent=False)
+        fourier_dim = 8 * (1 + 2 * num_freqs)  # 8 coords × (raw + sin + cos per freq)
+        self.geom_proj = nn.Linear(fourier_dim, embed_dim)
 
-        # Learned type embeddings: 0 = curve point, 1 = box point
+        # Learned base queries
+        self.base_queries = nn.Parameter(torch.randn(num_samples, embed_dim) * 0.02)
+
+        # Learned type embeddings: 0 = curve, 1 = box
         self.type_embeddings = nn.Embedding(2, embed_dim)
-
-        # Project Fourier features to embed_dim
-        self.input_proj = nn.Linear(embed_dim, embed_dim)
 
         # Cross-attention + self-attention blocks
         self.layers = nn.ModuleList()
@@ -274,14 +192,6 @@ class PromptCrossAttention(nn.Module):
                 'self_attn': self_attn_layer,
             }))
 
-    def _positional_embed(self, coords: torch.Tensor) -> torch.Tensor:
-        """Gaussian Fourier features. Input [b, N, 2] -> output [b, N, embed_dim]"""
-        coords = 2 * coords - 1
-        coords = coords.to(self.positional_encoding_gaussian_matrix.dtype)
-        coords = coords @ self.positional_encoding_gaussian_matrix
-        coords = 2 * torch.pi * coords
-        return torch.cat([torch.sin(coords), torch.cos(coords)], dim=-1)
-
     def forward(self,
                 encoder_features: torch.Tensor,
                 curves: Optional[torch.Tensor] = None,
@@ -302,23 +212,24 @@ class PromptCrossAttention(nn.Module):
             raise ValueError('One of curves or boxes must be provided')
 
         if curves is not None:
-            points = sample_bezier(curves, self.num_samples)
+            geom = curves.flatten(-2)
             type_idx = 0
         else:
-            points = sample_box(boxes, self.num_samples)
+            geom = boxes.flatten(-2)
             type_idx = 1
 
-        b = points.size(0)
+        b = geom.size(0)
 
-        # Encode points with Fourier features + type embedding + projection
-        h = self._positional_embed(points)
-        h = self.input_proj(h)
+        freqs = self.freqs.to(dtype=geom.dtype)
+        scaled = geom.unsqueeze(-1) * (2.0 * math.pi * freqs)
+        geom_feat = torch.cat([geom,
+                               torch.sin(scaled).flatten(-2),
+                               torch.cos(scaled).flatten(-2)], dim=-1)
+
+        # Project geometry and condition learned queries
+        cond = self.geom_proj(geom_feat)
+        h = self.base_queries.unsqueeze(0) + cond.unsqueeze(1)
         h = h + self.type_embeddings.weight[type_idx]
-
-        if encoder_features.size(0) == 1:
-            encoder_features = encoder_features.expand(b, -1, -1)
-        elif encoder_features.size(0) != b:
-            raise ValueError(f'encoder_features batch size ({encoder_features.size(0)}) does not match prompt batch size ({b})')
 
         # Cross-attend into encoder, then self-attend among prompt tokens
         for layer in self.layers:
