@@ -196,9 +196,48 @@ def compile(ctx, **params):
               help='Sets line prompt sampling mode: `boxes` for boxes only, '
               '`curves` for curves only, and `both` for randomly switching '
               'between boxes and curves.')
+@click.option('--encoder-name',
+              type=str,
+              help='Timm encoder model name.')
+@click.option('--encoder-out-index',
+              'encoder_out_indices',
+              multiple=True,
+              type=click.IntRange(0),
+              help='Encoder feature indices to expose. Repeat the option for multiple indices.')
+@click.option('--decoder-name',
+              type=str,
+              help='Decoder checkpoint identifier.')
+@click.option('--fusion-interval',
+              type=click.IntRange(1),
+              help='Insert decoder fusion cross-attention every N layers.')
+@click.option('--adapter-component',
+              type=click.Choice(['multiscale',
+                                 'single_scale']),
+              help='Adapter implementation.')
+@click.option('--adapter-num-layers',
+              type=click.IntRange(1),
+              help='Number of adapter transformer layers.')
+@click.option('--adapter-num-heads',
+              type=click.IntRange(1),
+              help='Number of adapter attention heads.')
+@click.option('--adapter-ds-factor',
+              'adapter_ds_factors',
+              multiple=True,
+              type=click.IntRange(1),
+              help='Per-scale downsampling factor for multiscale adapter. Repeat once per encoder output index.')
+@click.option('--line-embedding-component',
+              type=click.Choice(['cross_attention',
+                                 'additive']),
+              help='Line embedding module.')
 @click.option('--prompt-num-samples',
               type=click.IntRange(1),
               help='Number of filtered prompt tokens produced by PromptCrossAttention.')
+@click.option('--prompt-num-layers',
+              type=click.IntRange(1),
+              help='Number of line-embedding transformer layers for cross-attention line embedding.')
+@click.option('--prompt-num-heads',
+              type=click.IntRange(1),
+              help='Number of line-embedding attention heads for cross-attention line embedding.')
 @click.option('--logger',
               'pl_logger',
               type=click.Choice(['tensorboard', 'wandb']),

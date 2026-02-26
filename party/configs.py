@@ -32,9 +32,34 @@ class PartyRecognitionTrainingConfig(TrainingConfig):
     Args:
     """
     def __init__(self, **kwargs):
+        self.encoder_name = kwargs.pop('encoder_name', 'convnextv2_base.fcmae_ft_in22k_in1k')
+        self.encoder_out_indices = tuple(kwargs.pop('encoder_out_indices', (1, 2, 3)))
+        if not self.encoder_out_indices:
+            raise ValueError('encoder_out_indices must not be empty.')
+
+        self.decoder_name = kwargs.pop('decoder_name', 'mittagessen/bytellama-40m-oscar')
+        self.fusion_interval = kwargs.pop('fusion_interval', 3)
+
+        self.adapter_component = kwargs.pop('adapter_component', 'multiscale')
+        if self.adapter_component not in ('multiscale', 'single_scale'):
+            raise ValueError(f'Invalid adapter component {self.adapter_component}. Use one of: multiscale, single_scale.')
+        self.adapter_num_layers = kwargs.pop('adapter_num_layers', 1 if self.adapter_component == 'multiscale' else 4)
+        self.adapter_num_heads = kwargs.pop('adapter_num_heads', 8)
+        self.adapter_ds_factors = list(kwargs.pop('adapter_ds_factors', [4, 2, 1]))
+        if self.adapter_component == 'multiscale' and len(self.adapter_ds_factors) != len(self.encoder_out_indices):
+            raise ValueError('adapter_ds_factors must have the same length as encoder_out_indices for multiscale adapter.')
+        if self.adapter_component == 'single_scale' and len(self.encoder_out_indices) != 1:
+            raise ValueError('single_scale adapter requires exactly one entry in encoder_out_indices.')
+
+        self.line_embedding_component = kwargs.pop('line_embedding_component', 'cross_attention')
+        if self.line_embedding_component not in ('cross_attention', 'additive'):
+            raise ValueError(f'Invalid line embedding component {self.line_embedding_component}. Use one of: cross_attention, additive.')
+        self.prompt_num_samples = kwargs.pop('prompt_num_samples', 384)
+        self.prompt_num_layers = kwargs.pop('prompt_num_layers', 2)
+        self.prompt_num_heads = kwargs.pop('prompt_num_heads', 8)
+
         self.freeze_encoder = kwargs.pop('freeze_encoder', False)
         self.train_from_scratch = kwargs.pop('train_from_scratch', False)
-        self.prompt_num_samples = kwargs.pop('prompt_num_samples', 384)
         self.noisy_teacher_forcing = kwargs.pop('noisy_teacher_forcing', 0.02)
         self.noisy_teacher_forcing_warmup = kwargs.pop('noisy_teacher_forcing_warmup', None)
         self.label_smoothing = kwargs.pop('label_smoothing', 0.0)
