@@ -154,7 +154,11 @@ class SingleScaleAdapter(nn.Module):
         layers.append(nn.Linear(encoder_embed_dim, decoder_embed_dim))
         self.adapter = nn.Sequential(*layers)
 
-    def forward(self, encoder_hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, encoder_hidden_states: Union[torch.Tensor, list[torch.Tensor], tuple[torch.Tensor, ...]]) -> torch.Tensor:
+        if isinstance(encoder_hidden_states, (list, tuple)):
+            if len(encoder_hidden_states) != 1:
+                raise ValueError(f'SingleScaleAdapter expects exactly one encoder feature map, got {len(encoder_hidden_states)}.')
+            encoder_hidden_states = encoder_hidden_states[0]
         return self.adapter(encoder_hidden_states.flatten(-2).transpose(-1, -2))
 
 
