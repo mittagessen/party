@@ -1,14 +1,14 @@
 precision: bf16-mixed
 device: auto
-num_workers: 8
+num_workers: 4
 num_threads: 1
 train:
   train_from_scratch: true
   training_data:
-    - synth_arxiv_train_9k.lst
+    - /home/mittagessen/party_dataset/synth_arxiv_train_9k.lst
   evaluation_data:
-    - synth_arxiv_val_1k.lst
-  checkpoint_path: /home/mittagessen/foo
+    - /home/mittagessen/party_dataset/synth_arxiv_val_1k.lst
+  checkpoint_path: /home/mittagessen/party_models/regression_partyv2_step1_architecture
   pl_logger: wandb
 
   # text transforms
@@ -16,7 +16,7 @@ train:
   normalize_whitespace: true
   prompt_mode: both
 
-  # component-wise model setup (main-like)
+  # recipe 1/3: main-like encoder/adapter, switch to cross-attention line embedding
   encoder_name: convnextv2_base.fcmae_ft_in22k_in1k
   encoder_out_indices: [2]
   decoder_name: mittagessen/bytellama-40m-oscar
@@ -24,9 +24,12 @@ train:
   adapter_component: single_scale
   adapter_num_layers: 4
   adapter_num_heads: 8
-  line_embedding_component: additive
+  line_embedding_component: cross_attention
+  prompt_num_samples: 384
+  prompt_num_layers: 2
+  prompt_num_heads: 8
 
-  # training hyperparameters for synthetic convergence checks
+  # keep optimization recipe fixed across all staged regressions
   optimizer: AdamW
   epochs: 8
   lrate: 5e-4
