@@ -410,6 +410,5 @@ def train(ctx, **kwargs):
 
     score = checkpoint_callback.best_model_score.item()
     weight_path = Path(checkpoint_callback.best_model_path).with_name(f'best_{score:.4f}.{params.get("weights_format")}')
-    model = PartyRecognitionModel.load_from_checkpoint(checkpoint_callback.best_model_path, config=m_config)
-    opath = writer([model.net], weight_path)
-    message(f'Converting best model {checkpoint_callback.best_model_path} (score: {score:.4f}) to weights {opath}')
+    opath = convert_models([checkpoint_callback.best_model_path], weight_path, weights_format=params['weights_format'])
+    message(f'Converting best model {checkpoint_callback.best_model_path} (score: {score:.4f}) to weights file {opath}')
