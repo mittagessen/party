@@ -32,7 +32,7 @@ from party.modules import (MultiHeadAttention, RMSNorm, TanhGate,
 
 logger = logging.getLogger(__name__)
 
-__all__ = ['bytellama_vision_decoder', 'PartyMultiScaleAdapter']
+__all__ = ['bytellama_vision_decoder', 'PromptConditionedMultiScaleAdapter']
 
 
 def bytellama_vision_decoder(vocab_size: int = TOKEN_NUM,
@@ -184,19 +184,18 @@ def bytellama_vision_decoder(vocab_size: int = TOKEN_NUM,
     return decoder
 
 
-class PartyMultiScaleAdapter(nn.Module):
+class PromptConditionedMultiScaleAdapter(nn.Module):
     """
-    Multi-scale adapter head that processes features from multiple encoder
-    stages independently, then concatenates them into a single sequence.
+    Fused visual conditioner that combines multi-scale adaptation and prompt
+    conditioning into a single module. For each scale it:
 
-    Args:
-        num_layers: Number of self-attention layers per scale.
-        num_heads: Number of attention heads per scale.
-        encoder_embed_dims: Channel dimensions for each encoder stage.
-        encoder_sizes: Spatial dimensions (h, w) for each encoder stage.
-        decoder_embed_dim: Output embedding dimension matching the decoder.
-        ds_factors: Downsampling factor per scale. Defaults to [4, 2, 1] which
-                    equalizes the spatial resolution across scales.
+    1. downscales + adapts encoder feature maps to decoder embedding dim
+    2. conditions tokens with a prompt-dependent gate
+    3. scores tokens with a prompt-dependent matcher
+    4. keeps top-k tokens per scale and concatenates them
+
+    The module always returns a fixed number of memory tokens
+    ``num_samples`` for decoder cross-attention.
     """
     def __init__(self,
                  num_layers: int,
@@ -204,22 +203,40 @@ class PartyMultiScaleAdapter(nn.Module):
                  encoder_embed_dims: list[int],
                  encoder_sizes: list[tuple[int, int]],
                  decoder_embed_dim: int,
+                 num_samples: int,
                  ds_factors: list[int] = None,
+                 refine_layers: int = 1,
+                 refine_num_heads: Optional[int] = None,
+                 gate_init: float = 0.0,
+                 min_tokens_per_scale: int = 16,
                  use_pos_embeddings: bool = True):
         super().__init__()
+        if num_samples < 1:
+            raise ValueError('num_samples must be >= 1.')
+        if min_tokens_per_scale < 1:
+            raise ValueError('min_tokens_per_scale must be >= 1.')
         if ds_factors is None:
             ds_factors = [4, 2, 1]
+        if len(encoder_embed_dims) != len(encoder_sizes) or len(encoder_embed_dims) != len(ds_factors):
+            raise ValueError('encoder_embed_dims, encoder_sizes, and ds_factors must have the same length.')
+
+        self.num_samples = num_samples
+        self.min_tokens_per_scale = min_tokens_per_scale
+        self.num_scales = len(encoder_embed_dims)
+        if refine_num_heads is None:
+            refine_num_heads = num_heads
+
         mlp_ratio = 4
         self.adapter = nn.ModuleList()
         self.downsample = nn.ModuleList()
         self.pos_embeddings = nn.ModuleList()
         self.output_sizes: list[tuple[int, int]] = []
+        self.scale_token_lens: list[int] = []
 
         for encoder_embed_dim, size, ds_factor in zip(encoder_embed_dims, encoder_sizes, ds_factors):
             hidden_dim = int(mlp_ratio * encoder_embed_dim)
             head_dim = encoder_embed_dim // num_heads
 
-            # depthwise-separable downsampling convolution
             if ds_factor > 1:
                 self.downsample.append(nn.Sequential(
                     nn.Conv2d(encoder_embed_dim, encoder_embed_dim,
@@ -232,6 +249,7 @@ class PartyMultiScaleAdapter(nn.Module):
                 self.downsample.append(nn.Identity())
             ds_size = (size[0] // ds_factor, size[1] // ds_factor)
             self.output_sizes.append(ds_size)
+            self.scale_token_lens.append(ds_size[0] * ds_size[1])
 
             layers = []
             for _ in range(num_layers):
@@ -265,11 +283,202 @@ class PartyMultiScaleAdapter(nn.Module):
             else:
                 self.pos_embeddings.append(nn.Identity())
 
-    def forward(self, encoder_hidden_states: list[torch.Tensor]) -> torch.Tensor:
-        os = []
+        geom_in_dim = 20  # 8 raw coords + 12 derived box/line stats
+        self.geom_mlp = nn.Sequential(
+            nn.Linear(geom_in_dim, decoder_embed_dim),
+            nn.SiLU(),
+            nn.Linear(decoder_embed_dim, decoder_embed_dim),
+        )
+        self.geom_norm = RMSNorm(decoder_embed_dim, eps=1e-5)
+        self.type_embeddings = nn.Embedding(2, decoder_embed_dim)
+
+        self.gate_token_proj = nn.Linear(decoder_embed_dim, decoder_embed_dim, bias=False)
+        self.gate_prompt_proj = nn.Linear(decoder_embed_dim, decoder_embed_dim, bias=True)
+        self.score_token_proj = nn.Linear(decoder_embed_dim, decoder_embed_dim, bias=False)
+        self.score_prompt_proj = nn.Linear(decoder_embed_dim, decoder_embed_dim, bias=False)
+
+        self.refine_layers = nn.ModuleList()
+        for _ in range(refine_layers):
+            head_dim = decoder_embed_dim // refine_num_heads
+            self_attn = MultiHeadAttention(
+                embed_dim=decoder_embed_dim,
+                num_heads=refine_num_heads,
+                num_kv_heads=refine_num_heads,
+                head_dim=head_dim,
+                q_proj=nn.Linear(decoder_embed_dim, refine_num_heads * head_dim, bias=False),
+                k_proj=nn.Linear(decoder_embed_dim, refine_num_heads * head_dim, bias=False),
+                v_proj=nn.Linear(decoder_embed_dim, refine_num_heads * head_dim, bias=False),
+                output_proj=nn.Linear(decoder_embed_dim, decoder_embed_dim, bias=False),
+                pos_embeddings=None,
+                attn_dropout=0.0,
+                is_causal=False,
+            )
+            layer = TransformerSelfAttentionLayer(
+                attn=self_attn,
+                mlp=FeedForward(
+                    gate_proj=nn.Linear(decoder_embed_dim, 4 * decoder_embed_dim),
+                    down_proj=nn.Linear(4 * decoder_embed_dim, decoder_embed_dim),
+                    up_proj=None,
+                ),
+                sa_norm=RMSNorm(decoder_embed_dim, eps=1e-5),
+                mlp_norm=RMSNorm(decoder_embed_dim, eps=1e-5),
+                sa_scale=TanhGate(),
+                mlp_scale=TanhGate(),
+            )
+            with torch.no_grad():
+                layer.sa_scale.scale.fill_(gate_init)
+                layer.mlp_scale.scale.fill_(gate_init)
+            self.refine_layers.append(layer)
+
+    def _encode_prompt(self,
+                       curves: Optional[torch.Tensor],
+                       boxes: Optional[torch.Tensor],
+                       dtype: torch.dtype,
+                       device: torch.device) -> torch.Tensor:
+        if curves is not None and boxes is not None:
+            raise ValueError('curves and boxes are mutually exclusive.')
+        if curves is None and boxes is None:
+            raise ValueError('One of curves or boxes must be provided.')
+
+        if curves is not None:
+            geom = curves
+            type_idx = 0
+        else:
+            geom = boxes
+            type_idx = 1
+
+        if geom.ndim != 3 or geom.shape[1:] != (4, 2):
+            raise ValueError(f'Expected prompt geometry with shape [b, 4, 2], got {tuple(geom.shape)}.')
+
+        geom = geom.to(device=device, dtype=dtype)
+        flat = geom.flatten(1)  # [b, 8]
+
+        xs = geom[..., 0]
+        ys = geom[..., 1]
+        xmin = xs.min(dim=1, keepdim=True).values
+        xmax = xs.max(dim=1, keepdim=True).values
+        ymin = ys.min(dim=1, keepdim=True).values
+        ymax = ys.max(dim=1, keepdim=True).values
+        cx = 0.5 * (xmin + xmax)
+        cy = 0.5 * (ymin + ymax)
+        w = (xmax - xmin).clamp_min(1e-6)
+        h = (ymax - ymin).clamp_min(1e-6)
+        area = w * h
+        aspect = w / h
+        dx = (geom[:, 3, 0:1] - geom[:, 0, 0:1])
+        dy = (geom[:, 3, 1:2] - geom[:, 0, 1:2])
+        derived = torch.cat([xmin, ymin, xmax, ymax, cx, cy, w, h, area, aspect, dx, dy], dim=1)
+
+        geom_feat = torch.cat([flat, derived], dim=1)
+        prompt_vec = self.geom_mlp(geom_feat)
+        type_embed = self.type_embeddings.weight[type_idx].to(dtype=prompt_vec.dtype, device=prompt_vec.device)
+        prompt_vec = prompt_vec + type_embed.unsqueeze(0)
+        return self.geom_norm(prompt_vec)
+
+    def _allocate_topk(self, seq_lens: list[int]) -> list[int]:
+        total_len = sum(seq_lens)
+        if total_len <= 0:
+            return [0] * len(seq_lens)
+
+        # start from proportional allocation
+        raw = [self.num_samples * s / total_len for s in seq_lens]
+        k = [min(s, max(1, int(x))) for s, x in zip(seq_lens, raw)]
+
+        if self.num_samples >= len(seq_lens):
+            # encourage each scale to keep at least a few tokens when possible
+            for idx, s in enumerate(seq_lens):
+                target = min(s, self.min_tokens_per_scale)
+                if k[idx] < target:
+                    k[idx] = target
+
+        # reduce if over budget
+        while sum(k) > self.num_samples:
+            candidates = [idx for idx, val in enumerate(k) if val > 1]
+            if not candidates:
+                break
+            idx = max(candidates, key=lambda i: k[i] - raw[i])
+            k[idx] -= 1
+
+        # grow if under budget and there is capacity
+        while sum(k) < self.num_samples:
+            capacities = [seq_lens[idx] - k[idx] for idx in range(len(k))]
+            candidates = [idx for idx, cap in enumerate(capacities) if cap > 0]
+            if not candidates:
+                break
+            idx = max(candidates, key=lambda i: raw[i] - k[i])
+            k[idx] += 1
+        return k
+
+    def forward(self,
+                encoder_hidden_states: list[torch.Tensor],
+                curves: Optional[torch.Tensor] = None,
+                boxes: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if not isinstance(encoder_hidden_states, (list, tuple)):
+            raise ValueError('encoder_hidden_states must be a list/tuple of feature maps.')
+        if len(encoder_hidden_states) != self.num_scales:
+            raise ValueError(f'Expected {self.num_scales} feature maps, got {len(encoder_hidden_states)}.')
+
+        ref = encoder_hidden_states[0]
+        prompt_vec = self._encode_prompt(curves=curves,
+                                         boxes=boxes,
+                                         dtype=ref.dtype,
+                                         device=ref.device)
+        batch_size = prompt_vec.size(0)
+
+        seq_lens = []
+        scale_tokens = []
+        scale_scores = []
+
+        prompt_gate = self.gate_prompt_proj(prompt_vec).unsqueeze(1)
+        prompt_score = self.score_prompt_proj(prompt_vec).unsqueeze(1)
+
         for idx, hidden_state in enumerate(encoder_hidden_states):
-            hidden_state = self.downsample[idx](hidden_state)
-            hidden_state = hidden_state.flatten(-2).transpose(-1, -2)
-            hidden_state = self.adapter[idx](hidden_state)
-            os.append(self.pos_embeddings[idx](hidden_state))
-        return torch.cat(os, dim=1)
+            h = self.downsample[idx](hidden_state)
+            h = h.flatten(-2).transpose(-1, -2)
+            h = self.adapter[idx](h)
+            h = self.pos_embeddings[idx](h)
+
+            if h.size(0) == 1 and batch_size > 1:
+                h = h.expand(batch_size, -1, -1)
+            elif h.size(0) != batch_size:
+                raise ValueError(
+                    f'Batch mismatch between encoder features ({h.size(0)}) and prompt geometry ({batch_size}).'
+                )
+
+            gate = torch.sigmoid(self.gate_token_proj(h) + prompt_gate)
+            h = h * gate
+            scores = (self.score_token_proj(h) * prompt_score).sum(dim=-1)
+
+            seq_lens.append(h.size(1))
+            scale_tokens.append(h)
+            scale_scores.append(scores)
+
+        k_alloc = self._allocate_topk(seq_lens)
+        selected = []
+        all_tokens = []
+        for h, scores, k_i in zip(scale_tokens, scale_scores, k_alloc):
+            all_tokens.append(h)
+            if k_i <= 0:
+                continue
+            if k_i >= h.size(1):
+                selected.append(h)
+                continue
+            idx = torch.topk(scores, k=k_i, dim=1).indices
+            gathered = torch.gather(h, 1, idx.unsqueeze(-1).expand(-1, -1, h.size(-1)))
+            selected.append(gathered)
+
+        if not selected:
+            memory = torch.cat(all_tokens, dim=1)
+        else:
+            memory = torch.cat(selected, dim=1)
+
+        if memory.size(1) < self.num_samples:
+            global_token = torch.cat(all_tokens, dim=1).mean(dim=1, keepdim=True)
+            pad = global_token.expand(batch_size, self.num_samples - memory.size(1), -1)
+            memory = torch.cat([memory, pad], dim=1)
+        elif memory.size(1) > self.num_samples:
+            memory = memory[:, :self.num_samples, :]
+
+        for layer in self.refine_layers:
+            memory = layer(memory)
+        return memory

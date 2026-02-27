@@ -28,9 +28,8 @@ from lightning.fabric import Fabric
 from collections.abc import Generator
 from typing import Optional, Union, TYPE_CHECKING, Any
 
-from party.modules import PromptCrossAttention
 from party.tokenizer import OctetTokenizer
-from party.fusion import PartyMultiScaleAdapter, bytellama_vision_decoder
+from party.fusion import PromptConditionedMultiScaleAdapter, bytellama_vision_decoder
 from party.dataset import get_default_transforms, _to_curve, _to_bbox
 
 if TYPE_CHECKING:
@@ -102,7 +101,6 @@ class PartyModel(nn.Module, RecognitionBaseModel):
         self.user_metadata.update(kwargs)
 
         out_indices = (1, 2, 3)
-        ds_factors = [4, 2, 1]
         fusion_interval = kwargs.get('fusion_interval', 3)
 
         encoder = timm.create_model('convnextv2_base.fcmae_ft_in22k_in1k',
@@ -115,10 +113,14 @@ class PartyModel(nn.Module, RecognitionBaseModel):
         encoder_sizes = [(image_size[0] // red, image_size[1] // red)
                          for red in encoder_reductions]
 
+        adapter_num_layers = kwargs.get('adapter_num_layers', 1)
+        adapter_num_heads = kwargs.get('adapter_num_heads', 8)
+        ds_factors = kwargs.get('adapter_ds_factors', [4, 2, 1])
         prompt_num_samples = kwargs.get('prompt_num_samples', 384)
         prompt_num_layers = kwargs.get('prompt_num_layers', 2)
         prompt_num_heads = kwargs.get('prompt_num_heads', 8)
         prompt_gate_init = kwargs.get('prompt_gate_init', 0.0)
+        prompt_min_tokens_per_scale = kwargs.get('prompt_min_tokens_per_scale', 16)
 
         # decoder cross-attention cache length equals the filtered prompt tokens
         self.encoder_max_seq_len = prompt_num_samples
@@ -128,22 +130,23 @@ class PartyModel(nn.Module, RecognitionBaseModel):
                                            fusion_interval=fusion_interval)
         decoder_embed_dim = decoder.tok_embeddings.embedding_dim
 
-        adapter = PartyMultiScaleAdapter(num_layers=1,
-                                         num_heads=8,
-                                         encoder_embed_dims=encoder_embed_dims,
-                                         encoder_sizes=encoder_sizes,
-                                         decoder_embed_dim=decoder_embed_dim,
-                                         ds_factors=ds_factors)
-        line_embedding = PromptCrossAttention(embed_dim=decoder_embed_dim,
-                                              num_heads=prompt_num_heads,
-                                              num_layers=prompt_num_layers,
-                                              num_samples=prompt_num_samples,
-                                              gate_init=prompt_gate_init)
+        visual_conditioner = PromptConditionedMultiScaleAdapter(
+            num_layers=adapter_num_layers,
+            num_heads=adapter_num_heads,
+            encoder_embed_dims=encoder_embed_dims,
+            encoder_sizes=encoder_sizes,
+            decoder_embed_dim=decoder_embed_dim,
+            ds_factors=ds_factors,
+            num_samples=prompt_num_samples,
+            refine_layers=prompt_num_layers,
+            refine_num_heads=prompt_num_heads,
+            gate_init=prompt_gate_init,
+            min_tokens_per_scale=prompt_min_tokens_per_scale,
+        )
 
         self.nn = nn.ModuleDict({'encoder': encoder,
                                  'decoder': decoder,
-                                 'adapter': adapter,
-                                 'line_embedding': line_embedding})
+                                 'visual_conditioner': visual_conditioner})
 
         self.ready_for_generation = False
 
@@ -245,12 +248,10 @@ class PartyModel(nn.Module, RecognitionBaseModel):
         # for new inputs. Previous encoder outputs are cached
         # in the decoder cache.
         if encoder_input is not None:
-            adapter_output = self.forward_encoder_embeddings(encoder_input)
-            # Prompt cross-attention conditioning: sampled curve/box points
-            # attend into adapter tokens and produce compact line-focused features.
-            encoder_hidden_states = self.nn['line_embedding'](encoder_features=adapter_output,
-                                                              curves=encoder_curves,
-                                                              boxes=encoder_boxes)
+            encoder_features = self.forward_encoder_embeddings(encoder_input)
+            encoder_hidden_states = self.nn['visual_conditioner'](encoder_features,
+                                                                  curves=encoder_curves,
+                                                                  boxes=encoder_boxes)
 
         output = self.nn['decoder'](tokens=tokens,
                                     mask=mask,
@@ -261,11 +262,10 @@ class PartyModel(nn.Module, RecognitionBaseModel):
 
     def forward_encoder_embeddings(self, encoder_input):
         """
-        Computes the encoder embeddings *without* adding the curve positional
-        embeddings.
+        Computes encoder feature maps before prompt-conditioned token
+        resampling.
         """
-        encoder_hidden_states = self.nn['encoder'](encoder_input)
-        return self.nn['adapter'](encoder_hidden_states)
+        return self.nn['encoder'](encoder_input)
 
     def prepare_for_inference(self, config: 'Config'):
         """
@@ -419,8 +419,9 @@ class PartyModel(nn.Module, RecognitionBaseModel):
             raise ValueError('One of `curves` or `boxes` needs to be set.')
         logger.debug('Computing encoder embeddings')
 
-        adapter_output = self.forward_encoder_embeddings(encoder_input)
-        device = adapter_output.device
+        encoder_features = self.forward_encoder_embeddings(encoder_input)
+        feature_ref = encoder_features[0] if isinstance(encoder_features, (list, tuple)) else encoder_features
+        device = feature_ref.device
 
         _prompt = torch.tensor(self.tokenizer.encode('', langs=languages, add_eos=False),
                                device=device,
@@ -461,10 +462,10 @@ class PartyModel(nn.Module, RecognitionBaseModel):
                                   decoder_max_seq_len=self._max_generated_tokens,
                                   dtype=next(self.nn['encoder'].parameters()).dtype)
 
-            logger.debug('Computing line-focused features via prompt cross-attention.')
-            line_features = self.nn['line_embedding'](encoder_features=adapter_output,
-                                                      curves=batch if curves is not None else None,
-                                                      boxes=batch if boxes is not None else None)
+            logger.debug('Computing line-focused features via fused visual conditioner.')
+            line_features = self.nn['visual_conditioner'](encoder_hidden_states=encoder_features,
+                                                          curves=batch if curves is not None else None,
+                                                          boxes=batch if boxes is not None else None)
 
             logger.debug('Prefilling cache.')
             # prefill step
