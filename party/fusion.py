@@ -17,6 +17,7 @@
 import json
 import torch
 import logging
+import torch.nn.functional as F
 
 from torch import nn
 from typing import Optional
@@ -32,7 +33,7 @@ from party.modules import (MultiHeadAttention, RMSNorm, TanhGate,
 
 logger = logging.getLogger(__name__)
 
-__all__ = ['bytellama_vision_decoder', 'PromptConditionedMultiScaleAdapter']
+__all__ = ['bytellama_vision_decoder', 'LinePromptedMultiScaleResampler']
 
 
 def bytellama_vision_decoder(vocab_size: int = TOKEN_NUM,
@@ -184,45 +185,50 @@ def bytellama_vision_decoder(vocab_size: int = TOKEN_NUM,
     return decoder
 
 
-class PromptConditionedMultiScaleAdapter(nn.Module):
+class LinePromptedMultiScaleResampler(nn.Module):
     """
-    Fused visual conditioner that combines multi-scale adaptation and prompt
-    conditioning into a single module. For each scale it:
+    Prompt-conditioned visual resampler that builds an ordered line memory for
+    the decoder by soft-pooling encoder tokens around prompt-derived anchors.
 
-    1. downscales + adapts encoder feature maps to decoder embedding dim
-    2. conditions tokens with a prompt-dependent gate
-    3. scores tokens with a prompt-dependent matcher
-    4. keeps top-k tokens per scale and concatenates them
-
-    The module always returns a fixed number of memory tokens
-    ``num_samples`` for decoder cross-attention.
+    The memory layout is:
+    1. `line_num_tokens` ordered tokens sampled along the prompt geometry
+    2. `global_num_tokens` optional page-summary tokens
     """
+
     def __init__(self,
                  num_layers: int,
                  num_heads: int,
                  encoder_embed_dims: list[int],
                  encoder_sizes: list[tuple[int, int]],
                  decoder_embed_dim: int,
-                 num_samples: int,
+                 line_num_tokens: int,
+                 global_num_tokens: int = 0,
                  ds_factors: list[int] = None,
                  refine_layers: int = 1,
                  refine_num_heads: Optional[int] = None,
-                 gate_init: float = 0.0,
-                 min_tokens_per_scale: int = 16,
+                 sigma_u_factor: float = 1.5,
+                 sigma_v_factor: float = 0.5,
                  use_pos_embeddings: bool = True):
         super().__init__()
-        if num_samples < 1:
-            raise ValueError('num_samples must be >= 1.')
-        if min_tokens_per_scale < 1:
-            raise ValueError('min_tokens_per_scale must be >= 1.')
+        if line_num_tokens < 1:
+            raise ValueError('line_num_tokens must be >= 1.')
+        if global_num_tokens < 0:
+            raise ValueError('global_num_tokens must be >= 0.')
+        if sigma_u_factor <= 0.0 or sigma_v_factor <= 0.0:
+            raise ValueError('sigma_u_factor and sigma_v_factor must be > 0.')
         if ds_factors is None:
             ds_factors = [4, 2, 1]
         if len(encoder_embed_dims) != len(encoder_sizes) or len(encoder_embed_dims) != len(ds_factors):
             raise ValueError('encoder_embed_dims, encoder_sizes, and ds_factors must have the same length.')
 
-        self.num_samples = num_samples
-        self.min_tokens_per_scale = min_tokens_per_scale
+        self.line_num_tokens = int(line_num_tokens)
+        self.global_num_tokens = int(global_num_tokens)
+        self.num_samples = self.line_num_tokens + self.global_num_tokens
         self.num_scales = len(encoder_embed_dims)
+        self.sigma_u_factor = float(sigma_u_factor)
+        self.sigma_v_factor = float(sigma_v_factor)
+        self.score_scale = decoder_embed_dim ** -0.5
+
         if refine_num_heads is None:
             refine_num_heads = num_heads
 
@@ -230,10 +236,9 @@ class PromptConditionedMultiScaleAdapter(nn.Module):
         self.adapter = nn.ModuleList()
         self.downsample = nn.ModuleList()
         self.pos_embeddings = nn.ModuleList()
-        self.output_sizes: list[tuple[int, int]] = []
-        self.scale_token_lens: list[int] = []
+        self.scale_embeddings = nn.Parameter(torch.randn(self.num_scales, decoder_embed_dim) * 0.02)
 
-        for encoder_embed_dim, size, ds_factor in zip(encoder_embed_dims, encoder_sizes, ds_factors):
+        for idx, (encoder_embed_dim, size, ds_factor) in enumerate(zip(encoder_embed_dims, encoder_sizes, ds_factors)):
             hidden_dim = int(mlp_ratio * encoder_embed_dim)
             head_dim = encoder_embed_dim // num_heads
 
@@ -247,9 +252,9 @@ class PromptConditionedMultiScaleAdapter(nn.Module):
                 ))
             else:
                 self.downsample.append(nn.Identity())
+
             ds_size = (size[0] // ds_factor, size[1] // ds_factor)
-            self.output_sizes.append(ds_size)
-            self.scale_token_lens.append(ds_size[0] * ds_size[1])
+            self.register_buffer(f'token_coords_{idx}', self._build_token_coords(ds_size), persistent=False)
 
             layers = []
             for _ in range(num_layers):
@@ -283,19 +288,44 @@ class PromptConditionedMultiScaleAdapter(nn.Module):
             else:
                 self.pos_embeddings.append(nn.Identity())
 
-        geom_in_dim = 20  # 8 raw coords + 12 derived box/line stats
-        self.geom_mlp = nn.Sequential(
-            nn.Linear(geom_in_dim, decoder_embed_dim),
+        self.type_embeddings = nn.Embedding(2, decoder_embed_dim)
+        self.prompt_mlp = nn.Sequential(
+            nn.Linear(6, decoder_embed_dim),
             nn.SiLU(),
             nn.Linear(decoder_embed_dim, decoder_embed_dim),
         )
-        self.geom_norm = RMSNorm(decoder_embed_dim, eps=1e-5)
-        self.type_embeddings = nn.Embedding(2, decoder_embed_dim)
+        self.anchor_mlp = nn.Sequential(
+            nn.Linear(9, decoder_embed_dim),
+            nn.SiLU(),
+            nn.Linear(decoder_embed_dim, decoder_embed_dim),
+        )
+        self.prompt_norm = RMSNorm(decoder_embed_dim, eps=1e-5)
+        self.anchor_norm = RMSNorm(decoder_embed_dim, eps=1e-5)
 
-        self.gate_token_proj = nn.Linear(decoder_embed_dim, decoder_embed_dim, bias=False)
-        self.gate_prompt_proj = nn.Linear(decoder_embed_dim, decoder_embed_dim, bias=True)
-        self.score_token_proj = nn.Linear(decoder_embed_dim, decoder_embed_dim, bias=False)
-        self.score_prompt_proj = nn.Linear(decoder_embed_dim, decoder_embed_dim, bias=False)
+        self.line_pos_embeddings = nn.Parameter(torch.randn(self.line_num_tokens, decoder_embed_dim) * 0.02)
+        self.register_buffer('line_progress',
+                             torch.linspace(0.0, 1.0, self.line_num_tokens, dtype=torch.float32),
+                             persistent=False)
+
+        self.line_query_proj = nn.Linear(decoder_embed_dim, decoder_embed_dim, bias=False)
+        self.line_key_proj = nn.Linear(decoder_embed_dim, decoder_embed_dim, bias=False)
+        self.line_value_proj = nn.Linear(decoder_embed_dim, decoder_embed_dim, bias=False)
+        self.line_out_proj = nn.Linear(decoder_embed_dim, decoder_embed_dim, bias=False)
+
+        if self.global_num_tokens:
+            self.global_queries = nn.Parameter(torch.randn(self.global_num_tokens, decoder_embed_dim) * 0.02)
+            self.global_pos_embeddings = nn.Parameter(torch.randn(self.global_num_tokens, decoder_embed_dim) * 0.02)
+            self.global_query_proj = nn.Linear(decoder_embed_dim, decoder_embed_dim, bias=False)
+            self.global_key_proj = nn.Linear(decoder_embed_dim, decoder_embed_dim, bias=False)
+            self.global_value_proj = nn.Linear(decoder_embed_dim, decoder_embed_dim, bias=False)
+            self.global_out_proj = nn.Linear(decoder_embed_dim, decoder_embed_dim, bias=False)
+        else:
+            self.global_queries = None
+            self.global_pos_embeddings = None
+            self.global_query_proj = None
+            self.global_key_proj = None
+            self.global_value_proj = None
+            self.global_out_proj = None
 
         self.refine_layers = nn.ModuleList()
         for _ in range(refine_layers):
@@ -313,101 +343,109 @@ class PromptConditionedMultiScaleAdapter(nn.Module):
                 attn_dropout=0.0,
                 is_causal=False,
             )
-            layer = TransformerSelfAttentionLayer(
-                attn=self_attn,
-                mlp=FeedForward(
-                    gate_proj=nn.Linear(decoder_embed_dim, 4 * decoder_embed_dim),
-                    down_proj=nn.Linear(4 * decoder_embed_dim, decoder_embed_dim),
-                    up_proj=None,
-                ),
-                sa_norm=RMSNorm(decoder_embed_dim, eps=1e-5),
-                mlp_norm=RMSNorm(decoder_embed_dim, eps=1e-5),
-                sa_scale=TanhGate(),
-                mlp_scale=TanhGate(),
+            self.refine_layers.append(
+                TransformerSelfAttentionLayer(
+                    attn=self_attn,
+                    mlp=FeedForward(
+                        gate_proj=nn.Linear(decoder_embed_dim, 4 * decoder_embed_dim),
+                        down_proj=nn.Linear(4 * decoder_embed_dim, decoder_embed_dim),
+                        up_proj=None,
+                    ),
+                    sa_norm=RMSNorm(decoder_embed_dim, eps=1e-5),
+                    mlp_norm=RMSNorm(decoder_embed_dim, eps=1e-5),
+                )
             )
-            with torch.no_grad():
-                layer.sa_scale.scale.fill_(gate_init)
-                layer.mlp_scale.scale.fill_(gate_init)
-            self.refine_layers.append(layer)
+
+        self.output_norm = RMSNorm(decoder_embed_dim, eps=1e-5)
+
+    @staticmethod
+    def _build_token_coords(size: tuple[int, int]) -> torch.Tensor:
+        h, w = size
+        grid = torch.ones((h, w), dtype=torch.float32)
+        y_embed = (grid.cumsum(dim=0) - 0.5) / h
+        x_embed = (grid.cumsum(dim=1) - 0.5) / w
+        return torch.stack([x_embed, y_embed], dim=-1).flatten(0, 1)
+
+    def _sample_curve_anchors(self, curves: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        t = self.line_progress.to(device=curves.device, dtype=curves.dtype)
+        one_minus_t = 1.0 - t
+
+        p0, p1, p2, p3 = curves.unbind(dim=1)
+        points = (
+            (one_minus_t ** 3).view(1, -1, 1) * p0.unsqueeze(1) +
+            (3.0 * one_minus_t ** 2 * t).view(1, -1, 1) * p1.unsqueeze(1) +
+            (3.0 * one_minus_t * t ** 2).view(1, -1, 1) * p2.unsqueeze(1) +
+            (t ** 3).view(1, -1, 1) * p3.unsqueeze(1)
+        )
+
+        deriv = (
+            (3.0 * one_minus_t ** 2).view(1, -1, 1) * (p1 - p0).unsqueeze(1) +
+            (6.0 * one_minus_t * t).view(1, -1, 1) * (p2 - p1).unsqueeze(1) +
+            (3.0 * t ** 2).view(1, -1, 1) * (p3 - p2).unsqueeze(1)
+        )
+        tangents = F.normalize(deriv, dim=-1, eps=1e-6)
+
+        diffs = points[:, 1:, :] - points[:, :-1, :]
+        line_length = diffs.norm(dim=-1).sum(dim=1, keepdim=True).clamp_min(1e-3)
+        bbox_height = (curves[..., 1].amax(dim=1, keepdim=True) -
+                       curves[..., 1].amin(dim=1, keepdim=True)).clamp_min(1.0 / 256.0)
+        return points, tangents, line_length, bbox_height
+
+    def _sample_box_anchors(self, boxes: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        xmin = boxes[:, 0, 0:1]
+        xmax = boxes[:, 1, 0:1]
+        cy = boxes[:, 2, 1:2]
+        width = boxes[:, 3, 0:1].abs().clamp_min(1e-3)
+        height = boxes[:, 3, 1:2].abs().clamp_min(1.0 / 256.0)
+
+        progress = self.line_progress.to(device=boxes.device, dtype=boxes.dtype).view(1, -1, 1)
+        xs = xmin.unsqueeze(1) + progress * (xmax - xmin).unsqueeze(1)
+        ys = cy.unsqueeze(1).expand(-1, self.line_num_tokens, -1)
+        points = torch.cat([xs, ys], dim=-1)
+
+        tangents = torch.zeros_like(points)
+        tangents[..., 0] = 1.0
+        return points, tangents, width, height
 
     def _encode_prompt(self,
                        curves: Optional[torch.Tensor],
                        boxes: Optional[torch.Tensor],
                        dtype: torch.dtype,
-                       device: torch.device) -> torch.Tensor:
+                       device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if curves is not None and boxes is not None:
             raise ValueError('curves and boxes are mutually exclusive.')
         if curves is None and boxes is None:
             raise ValueError('One of curves or boxes must be provided.')
 
         if curves is not None:
-            geom = curves
+            geom = curves.to(device=device, dtype=dtype)
+            if geom.ndim != 3 or geom.shape[1:] != (4, 2):
+                raise ValueError(f'Expected curve prompts with shape [b, 4, 2], got {tuple(geom.shape)}.')
+            points, tangents, line_length, line_height = self._sample_curve_anchors(geom)
             type_idx = 0
         else:
-            geom = boxes
+            geom = boxes.to(device=device, dtype=dtype)
+            if geom.ndim != 3 or geom.shape[1:] != (4, 2):
+                raise ValueError(f'Expected box prompts with shape [b, 4, 2], got {tuple(geom.shape)}.')
+            points, tangents, line_length, line_height = self._sample_box_anchors(geom)
             type_idx = 1
 
-        if geom.ndim != 3 or geom.shape[1:] != (4, 2):
-            raise ValueError(f'Expected prompt geometry with shape [b, 4, 2], got {tuple(geom.shape)}.')
+        normals = torch.stack([-tangents[..., 1], tangents[..., 0]], dim=-1)
+        line_dir = F.normalize(points[:, -1, :] - points[:, 0, :], dim=-1, eps=1e-6)
+        line_center = points.mean(dim=1)
+        prompt_feat = torch.cat([line_center, line_dir, line_length, line_height], dim=-1)
+        prompt_vec = self.prompt_mlp(prompt_feat)
+        prompt_vec = prompt_vec + self.type_embeddings.weight[type_idx].to(device=device, dtype=dtype).unsqueeze(0)
+        prompt_vec = self.prompt_norm(prompt_vec)
 
-        geom = geom.to(device=device, dtype=dtype)
-        flat = geom.flatten(1)  # [b, 8]
+        sigma_u = (line_length / max(self.line_num_tokens - 1, 1)).clamp_min(1.0 / 512.0) * self.sigma_u_factor
+        sigma_v = line_height.clamp_min(1.0 / 256.0) * self.sigma_v_factor
+        return points, tangents, normals, prompt_vec, torch.cat([sigma_u, sigma_v], dim=-1)
 
-        xs = geom[..., 0]
-        ys = geom[..., 1]
-        xmin = xs.min(dim=1, keepdim=True).values
-        xmax = xs.max(dim=1, keepdim=True).values
-        ymin = ys.min(dim=1, keepdim=True).values
-        ymax = ys.max(dim=1, keepdim=True).values
-        cx = 0.5 * (xmin + xmax)
-        cy = 0.5 * (ymin + ymax)
-        w = (xmax - xmin).clamp_min(1e-6)
-        h = (ymax - ymin).clamp_min(1e-6)
-        area = w * h
-        aspect = w / h
-        dx = (geom[:, 3, 0:1] - geom[:, 0, 0:1])
-        dy = (geom[:, 3, 1:2] - geom[:, 0, 1:2])
-        derived = torch.cat([xmin, ymin, xmax, ymax, cx, cy, w, h, area, aspect, dx, dy], dim=1)
-
-        geom_feat = torch.cat([flat, derived], dim=1)
-        prompt_vec = self.geom_mlp(geom_feat)
-        type_embed = self.type_embeddings.weight[type_idx].to(dtype=prompt_vec.dtype, device=prompt_vec.device)
-        prompt_vec = prompt_vec + type_embed.unsqueeze(0)
-        return self.geom_norm(prompt_vec)
-
-    def _allocate_topk(self, seq_lens: list[int]) -> list[int]:
-        total_len = sum(seq_lens)
-        if total_len <= 0:
-            return [0] * len(seq_lens)
-
-        # start from proportional allocation
-        raw = [self.num_samples * s / total_len for s in seq_lens]
-        k = [min(s, max(1, int(x))) for s, x in zip(seq_lens, raw)]
-
-        if self.num_samples >= len(seq_lens):
-            # encourage each scale to keep at least a few tokens when possible
-            for idx, s in enumerate(seq_lens):
-                target = min(s, self.min_tokens_per_scale)
-                if k[idx] < target:
-                    k[idx] = target
-
-        # reduce if over budget
-        while sum(k) > self.num_samples:
-            candidates = [idx for idx, val in enumerate(k) if val > 1]
-            if not candidates:
-                break
-            idx = max(candidates, key=lambda i: k[i] - raw[i])
-            k[idx] -= 1
-
-        # grow if under budget and there is capacity
-        while sum(k) < self.num_samples:
-            capacities = [seq_lens[idx] - k[idx] for idx in range(len(k))]
-            candidates = [idx for idx, cap in enumerate(capacities) if cap > 0]
-            if not candidates:
-                break
-            idx = max(candidates, key=lambda i: raw[i] - k[i])
-            k[idx] += 1
-        return k
+    def _refine_memory(self, memory: torch.Tensor) -> torch.Tensor:
+        for layer in self.refine_layers:
+            memory = layer(memory)
+        return self.output_norm(memory)
 
     def forward(self,
                 encoder_hidden_states: list[torch.Tensor],
@@ -419,19 +457,16 @@ class PromptConditionedMultiScaleAdapter(nn.Module):
             raise ValueError(f'Expected {self.num_scales} feature maps, got {len(encoder_hidden_states)}.')
 
         ref = encoder_hidden_states[0]
-        prompt_vec = self._encode_prompt(curves=curves,
-                                         boxes=boxes,
-                                         dtype=ref.dtype,
-                                         device=ref.device)
+        points, tangents, normals, prompt_vec, sigmas = self._encode_prompt(curves=curves,
+                                                                             boxes=boxes,
+                                                                             dtype=ref.dtype,
+                                                                             device=ref.device)
         batch_size = prompt_vec.size(0)
+        sigma_u = sigmas[:, 0:1].unsqueeze(-1)
+        sigma_v = sigmas[:, 1:2].unsqueeze(-1)
 
-        seq_lens = []
         scale_tokens = []
-        scale_scores = []
-
-        prompt_gate = self.gate_prompt_proj(prompt_vec).unsqueeze(1)
-        prompt_score = self.score_prompt_proj(prompt_vec).unsqueeze(1)
-
+        scale_coords = []
         for idx, hidden_state in enumerate(encoder_hidden_states):
             h = self.downsample[idx](hidden_state)
             h = h.flatten(-2).transpose(-1, -2)
@@ -445,40 +480,54 @@ class PromptConditionedMultiScaleAdapter(nn.Module):
                     f'Batch mismatch between encoder features ({h.size(0)}) and prompt geometry ({batch_size}).'
                 )
 
-            gate = torch.sigmoid(self.gate_token_proj(h) + prompt_gate)
-            h = h * gate
-            scores = (self.score_token_proj(h) * prompt_score).sum(dim=-1)
-
-            seq_lens.append(h.size(1))
+            h = h + self.scale_embeddings[idx].view(1, 1, -1).to(dtype=h.dtype, device=h.device)
+            coords = getattr(self, f'token_coords_{idx}').to(device=h.device, dtype=h.dtype)
             scale_tokens.append(h)
-            scale_scores.append(scores)
+            scale_coords.append(coords.unsqueeze(0).expand(batch_size, -1, -1))
 
-        k_alloc = self._allocate_topk(seq_lens)
-        selected = []
-        all_tokens = []
-        for h, scores, k_i in zip(scale_tokens, scale_scores, k_alloc):
-            all_tokens.append(h)
-            if k_i <= 0:
-                continue
-            if k_i >= h.size(1):
-                selected.append(h)
-                continue
-            idx = torch.topk(scores, k=k_i, dim=1).indices
-            gathered = torch.gather(h, 1, idx.unsqueeze(-1).expand(-1, -1, h.size(-1)))
-            selected.append(gathered)
+        tokens = torch.cat(scale_tokens, dim=1)
+        coords = torch.cat(scale_coords, dim=1)
 
-        if not selected:
-            memory = torch.cat(all_tokens, dim=1)
+        progress = self.line_progress.to(device=tokens.device, dtype=tokens.dtype).view(1, -1, 1)
+        anchor_feat = torch.cat([points,
+                                 tangents,
+                                 normals,
+                                 progress.expand(batch_size, -1, -1),
+                                 sigmas[:, 0:1].unsqueeze(1).expand(-1, self.line_num_tokens, -1),
+                                 sigmas[:, 1:2].unsqueeze(1).expand(-1, self.line_num_tokens, -1)],
+                                dim=-1)
+        anchor_tokens = self.anchor_mlp(anchor_feat)
+        anchor_tokens = anchor_tokens + prompt_vec.unsqueeze(1) + self.line_pos_embeddings.unsqueeze(0).to(dtype=tokens.dtype,
+                                                                                                           device=tokens.device)
+        anchor_tokens = self.anchor_norm(anchor_tokens)
+
+        line_queries = self.line_query_proj(anchor_tokens)
+        token_keys = self.line_key_proj(tokens)
+        token_values = self.line_value_proj(tokens)
+
+        delta = coords.unsqueeze(1) - points.unsqueeze(2)
+        u = (delta * tangents.unsqueeze(2)).sum(dim=-1)
+        v = (delta * normals.unsqueeze(2)).sum(dim=-1)
+        geom_logits = -0.5 * ((u / sigma_u) ** 2 + (v / sigma_v) ** 2)
+        content_logits = torch.einsum('bld,bsd->bls', line_queries, token_keys) * self.score_scale
+        line_weights = torch.softmax(geom_logits + content_logits, dim=-1)
+        line_memory = torch.einsum('bls,bsd->bld', line_weights, token_values)
+        line_memory = self.line_out_proj(line_memory) + anchor_tokens
+
+        if self.global_num_tokens:
+            global_queries = self.global_queries.unsqueeze(0).to(dtype=tokens.dtype, device=tokens.device)
+            global_queries = global_queries + self.global_pos_embeddings.unsqueeze(0).to(dtype=tokens.dtype,
+                                                                                        device=tokens.device)
+            global_queries = global_queries + prompt_vec.unsqueeze(1)
+
+            global_q = self.global_query_proj(global_queries)
+            global_k = self.global_key_proj(tokens)
+            global_v = self.global_value_proj(tokens)
+            global_weights = torch.softmax(torch.einsum('bgd,bsd->bgs', global_q, global_k) * self.score_scale, dim=-1)
+            global_memory = torch.einsum('bgs,bsd->bgd', global_weights, global_v)
+            global_memory = self.global_out_proj(global_memory) + global_queries
+            memory = torch.cat([line_memory, global_memory], dim=1)
         else:
-            memory = torch.cat(selected, dim=1)
+            memory = line_memory
 
-        if memory.size(1) < self.num_samples:
-            global_token = torch.cat(all_tokens, dim=1).mean(dim=1, keepdim=True)
-            pad = global_token.expand(batch_size, self.num_samples - memory.size(1), -1)
-            memory = torch.cat([memory, pad], dim=1)
-        elif memory.size(1) > self.num_samples:
-            memory = memory[:, :self.num_samples, :]
-
-        for layer in self.refine_layers:
-            memory = layer(memory)
-        return memory
+        return self._refine_memory(memory)

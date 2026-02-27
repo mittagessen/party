@@ -45,11 +45,12 @@ class PartyRecognitionTrainingConfig(TrainingConfig):
         self.adapter_ds_factors = list(kwargs.pop('adapter_ds_factors', [4, 2, 1]))
         if len(self.adapter_ds_factors) != len(self.encoder_out_indices):
             raise ValueError('adapter_ds_factors must have the same length as encoder_out_indices.')
-        self.prompt_num_samples = kwargs.pop('prompt_num_samples', 384)
+        self.line_num_tokens = kwargs.pop('line_num_tokens', 128)
+        self.global_num_tokens = kwargs.pop('global_num_tokens', 8)
         self.prompt_num_layers = kwargs.pop('prompt_num_layers', 2)
         self.prompt_num_heads = kwargs.pop('prompt_num_heads', 8)
-        self.prompt_gate_init = kwargs.pop('prompt_gate_init', 0.0)
-        self.prompt_min_tokens_per_scale = kwargs.pop('prompt_min_tokens_per_scale', 16)
+        self.prompt_sigma_u_factor = kwargs.pop('prompt_sigma_u_factor', 1.5)
+        self.prompt_sigma_v_factor = kwargs.pop('prompt_sigma_v_factor', 0.5)
 
         self.freeze_encoder = kwargs.pop('freeze_encoder', False)
         self.train_from_scratch = kwargs.pop('train_from_scratch', False)
