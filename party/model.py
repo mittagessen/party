@@ -232,6 +232,7 @@ def _build_party_model_from_components(config: PartyRecognitionTrainingConfig,
     prompt_num_samples = int(getattr(config, 'prompt_num_samples', 384))
     prompt_num_layers = int(getattr(config, 'prompt_num_layers', 2))
     prompt_num_heads = int(getattr(config, 'prompt_num_heads', 8))
+    prompt_gate_init = float(getattr(config, 'prompt_gate_init', 0.0))
 
     decoder_name = getattr(config, 'decoder_name', 'mittagessen/bytellama-40m-oscar')
     fusion_interval = int(getattr(config, 'fusion_interval', 3))
@@ -277,7 +278,8 @@ def _build_party_model_from_components(config: PartyRecognitionTrainingConfig,
         line_embedding = PromptCrossAttention(embed_dim=decoder_embed_dim,
                                               num_heads=prompt_num_heads,
                                               num_layers=prompt_num_layers,
-                                              num_samples=prompt_num_samples)
+                                              num_samples=prompt_num_samples,
+                                              gate_init=prompt_gate_init)
     else:
         line_embedding = PromptEncoder(decoder_embed_dim)
 

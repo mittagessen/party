@@ -238,6 +238,9 @@ def compile(ctx, **params):
 @click.option('--prompt-num-heads',
               type=click.IntRange(1),
               help='Number of line-embedding attention heads for cross-attention line embedding.')
+@click.option('--prompt-gate-init',
+              type=float,
+              help='Initial value for PromptCrossAttention tanh gates.')
 @click.option('--logger',
               'pl_logger',
               type=click.Choice(['tensorboard', 'wandb']),

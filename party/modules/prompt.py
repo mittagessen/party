@@ -105,16 +105,20 @@ class PromptCrossAttention(nn.Module):
         num_layers: Number of cross-attention + self-attention blocks.
         num_samples: Number of learned query tokens.
         num_freqs: Number of log-spaced Fourier frequencies for geometry encoding.
+        gate_init: Initial value for tanh gates in cross/self attention prompt
+                   blocks. 0.0 keeps gates closed at initialization.
     """
     def __init__(self,
                  embed_dim: int,
                  num_heads: int = 8,
                  num_layers: int = 2,
                  num_samples: int = 32,
-                 num_freqs: int = 8) -> None:
+                 num_freqs: int = 8,
+                 gate_init: float = 0.0) -> None:
         super().__init__()
         self.embed_dim = embed_dim
         self.num_samples = num_samples
+        self.gate_init = float(gate_init)
         head_dim = embed_dim // num_heads
         hidden_dim = 4 * embed_dim
 
@@ -160,6 +164,9 @@ class PromptCrossAttention(nn.Module):
                 ca_scale=TanhGate(),
                 mlp_scale=TanhGate(),
             )
+            with torch.no_grad():
+                x_attn_layer.ca_scale.scale.fill_(self.gate_init)
+                x_attn_layer.mlp_scale.scale.fill_(self.gate_init)
 
             self_attn = MultiHeadAttention(
                 embed_dim=embed_dim,
@@ -186,6 +193,9 @@ class PromptCrossAttention(nn.Module):
                 sa_scale=TanhGate(),
                 mlp_scale=TanhGate(),
             )
+            with torch.no_grad():
+                self_attn_layer.sa_scale.scale.fill_(self.gate_init)
+                self_attn_layer.mlp_scale.scale.fill_(self.gate_init)
 
             self.layers.append(nn.ModuleDict({
                 'x_attn': x_attn_layer,

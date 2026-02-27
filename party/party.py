@@ -118,6 +118,7 @@ class PartyModel(nn.Module, RecognitionBaseModel):
         prompt_num_samples = kwargs.get('prompt_num_samples', 384)
         prompt_num_layers = kwargs.get('prompt_num_layers', 2)
         prompt_num_heads = kwargs.get('prompt_num_heads', 8)
+        prompt_gate_init = kwargs.get('prompt_gate_init', 0.0)
 
         # decoder cross-attention cache length equals the filtered prompt tokens
         self.encoder_max_seq_len = prompt_num_samples
@@ -136,7 +137,8 @@ class PartyModel(nn.Module, RecognitionBaseModel):
         line_embedding = PromptCrossAttention(embed_dim=decoder_embed_dim,
                                               num_heads=prompt_num_heads,
                                               num_layers=prompt_num_layers,
-                                              num_samples=prompt_num_samples)
+                                              num_samples=prompt_num_samples,
+                                              gate_init=prompt_gate_init)
 
         self.nn = nn.ModuleDict({'encoder': encoder,
                                  'decoder': decoder,

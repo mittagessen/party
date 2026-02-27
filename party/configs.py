@@ -57,6 +57,7 @@ class PartyRecognitionTrainingConfig(TrainingConfig):
         self.prompt_num_samples = kwargs.pop('prompt_num_samples', 384)
         self.prompt_num_layers = kwargs.pop('prompt_num_layers', 2)
         self.prompt_num_heads = kwargs.pop('prompt_num_heads', 8)
+        self.prompt_gate_init = kwargs.pop('prompt_gate_init', 0.0)
 
         self.freeze_encoder = kwargs.pop('freeze_encoder', False)
         self.train_from_scratch = kwargs.pop('train_from_scratch', False)
