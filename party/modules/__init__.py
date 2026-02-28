@@ -7,4 +7,4 @@ from .transformer import TransformerCrossAttentionLayer, TransformerSelfAttentio
 from .feed_forward import FeedForward  # NOQA
 from .position_embeddings import PositionEmbeddingRandom  # NOQA
 from .noisy_teacher_forcing import NoisyTeacherForcing  # NOQA
-from .prompt import PromptCrossAttention  # NOQA
+from .prompt import PromptEncoder  # NOQA
