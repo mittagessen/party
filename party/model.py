@@ -10,16 +10,16 @@
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
-# or implied. See the License for the specific language governing
-# permissions and limitations under the License.
+# or implied. See the License for the specific language governing permissions and
+# limitations under the License.
 """
 Training loop interception helpers
 """
-import torch
 import logging
-import lightning.pytorch as L
 import math
 import timm
+import torch
+import lightning.pytorch as L
 
 from torch import nn
 from torch.optim import lr_scheduler
@@ -31,8 +31,8 @@ from torch.distributed import get_world_size, is_initialized
 from torch.utils.data import RandomSampler, DataLoader
 
 from party.tokenizer import OFFSET, LANG_OFFSET
-from party.fusion import bytellama_vision_decoder, LocatorReaderConditioner
-from party.modules import NoisyTeacherForcing
+from party.fusion import bytellama_vision_decoder, PartyMultiScaleAdapter
+from party.modules import NoisyTeacherForcing, PromptCrossAttention, RMSNorm
 from party.dataset import (collate_null, get_default_transforms,
                            BinnedBaselineDataset, ValidationBaselineDataset,
                            _validation_worker_init_fn)
@@ -44,79 +44,100 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+CTC_BLANK = 256
+CTC_NUM_CLASSES = CTC_BLANK + 1
 
-@torch.compile(dynamic=False)
-def model_step(model, ntf, criterion, batch):
-    tokens = batch['tokens']
-    # shift the tokens to create targets
+
+def _build_decoder_targets(tokens: torch.Tensor, ignore_index: int) -> torch.Tensor:
     ignore_idxs = torch.full((tokens.shape[0], 1),
-                             criterion.ignore_index,
-                             dtype=tokens.dtype, device=tokens.device)
-    targets = torch.hstack((tokens[..., 1:], ignore_idxs)).reshape(-1)
+                             ignore_index,
+                             dtype=tokens.dtype,
+                             device=tokens.device)
+    return torch.hstack((tokens[..., 1:], ignore_idxs)).reshape(-1)
 
-    # apply noisy teacher forcing to decoder inputs, not the targets
-    tokens = ntf(tokens.clone())
 
-    # our tokens already contain BOS/EOS tokens so we just run them
-    # through the model after replacing ignored indices.
-    tokens.masked_fill_(tokens == criterion.ignore_index, 0)
-    logits = model(tokens=tokens,
-                   encoder_input=batch['image'],
-                   encoder_curves=batch['curves'],
-                   encoder_boxes=batch['boxes'])
+def _extract_ctc_targets(tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    target_sequences = []
+    target_lengths = []
 
-    logits = logits.reshape(-1, logits.shape[-1])
-    return criterion(logits, targets)
+    for seq in tokens:
+        seq = seq[seq != -100]
+        seq = seq[(seq >= OFFSET) & (seq < LANG_OFFSET)] - OFFSET
+        target_sequences.append(seq.to(dtype=torch.long))
+        target_lengths.append(seq.numel())
+
+    if any(length > 0 for length in target_lengths):
+        flat_targets = torch.cat([seq for seq in target_sequences if seq.numel() > 0])
+    else:
+        flat_targets = torch.empty(0, dtype=torch.long, device=tokens.device)
+
+    return flat_targets, torch.tensor(target_lengths, dtype=torch.long, device=tokens.device)
 
 
 def get_parameter_groups(model, config) -> list[dict[str, Any]]:
-    """Create parameter groups with discriminative learning rates.
-
-    Pretrained group: encoder layers (lower LR)
-    Full-LR group: decoder + visual conditioner (base LR)
-    """
+    """Create parameter groups with discriminative learning rates."""
     base_lr = config.lrate
     encoder_params = []
     full_lr_params = []
 
-    # Encoder params -> reduced LR
     for p in model.nn['encoder'].parameters():
         if p.requires_grad:
             encoder_params.append(p)
 
-    # Visual conditioner params -> base LR
-    for p in model.nn['visual_conditioner'].parameters():
+    for module_name in ('adapter', 'line_embedding', 'ctc_head'):
+        if module_name not in model.nn:
+            continue
+        for p in model.nn[module_name].parameters():
+            if p.requires_grad:
+                full_lr_params.append(p)
+
+    for _, p in model.nn['decoder'].named_parameters():
         if p.requires_grad:
             full_lr_params.append(p)
 
-    # Decoder params -> base LR (including decoder base layers)
-    for _, p in model.nn['decoder'].named_parameters():
-        if not p.requires_grad:
-            continue
-        full_lr_params.append(p)
-
-    param_groups = [{'params': encoder_params,
-                     'lr': base_lr * config.lr_pretrained_mult,
-                     'name': 'encoder'},
-                    {'params': full_lr_params,
-                     'lr': base_lr,
-                     'name': 'full_lr'}]
-
-    return param_groups
+    return [{'params': encoder_params,
+             'lr': base_lr * config.lr_pretrained_mult,
+             'name': 'encoder'},
+            {'params': full_lr_params,
+             'lr': base_lr,
+             'name': 'full_lr'}]
 
 
-class ConfigurablePartyModel(nn.Module):
+class CrossAttentionPartyModel(nn.Module):
     """
-    Training-only party model assembled from explicit component selections.
+    Training-only party model with prompt cross-attention conditioning.
     """
+
     def __init__(self,
                  encoder: nn.Module,
                  decoder: nn.Module,
-                 visual_conditioner: nn.Module):
+                 adapter: nn.Module,
+                 line_embedding: nn.Module,
+                 ctc_head: Optional[nn.Module] = None):
         super().__init__()
-        self.nn = nn.ModuleDict({'encoder': encoder,
-                                 'decoder': decoder,
-                                 'visual_conditioner': visual_conditioner})
+        modules = {'encoder': encoder,
+                   'decoder': decoder,
+                   'adapter': adapter,
+                   'line_embedding': line_embedding}
+        if ctc_head is not None:
+            modules['ctc_head'] = ctc_head
+        self.nn = nn.ModuleDict(modules)
+
+    def forward_encoder_embeddings(self, encoder_input: torch.Tensor) -> torch.Tensor:
+        return self.nn['adapter'](self.nn['encoder'](encoder_input))
+
+    def forward_line_features(self,
+                              encoder_hidden_states: torch.Tensor,
+                              curves: Optional[torch.Tensor] = None,
+                              boxes: Optional[torch.Tensor] = None,
+                              return_ctc_logits: bool = False) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        line_features = self.nn['line_embedding'](encoder_features=encoder_hidden_states,
+                                                  curves=curves,
+                                                  boxes=boxes)
+        ctc_logits = None
+        if return_ctc_logits and 'ctc_head' in self.nn:
+            ctc_logits = self.nn['ctc_head'](line_features)
+        return line_features, ctc_logits
 
     def forward(self,
                 tokens: torch.Tensor,
@@ -129,11 +150,10 @@ class ConfigurablePartyModel(nn.Module):
                 mask: Optional[torch.Tensor] = None,
                 input_pos: Optional[torch.Tensor] = None) -> torch.Tensor:
         if encoder_hidden_states is None and encoder_input is not None:
-            encoder_hidden_states = self.nn['visual_conditioner'](
-                self.nn['encoder'](encoder_input),
-                curves=encoder_curves,
-                boxes=encoder_boxes,
-            )
+            encoder_hidden_states = self.forward_encoder_embeddings(encoder_input)
+            encoder_hidden_states, _ = self.forward_line_features(encoder_hidden_states,
+                                                                  curves=encoder_curves,
+                                                                  boxes=encoder_boxes)
 
         return self.nn['decoder'](tokens=tokens,
                                   mask=mask,
@@ -142,8 +162,8 @@ class ConfigurablePartyModel(nn.Module):
                                   input_pos=input_pos)
 
 
-def _build_party_model_from_components(config: PartyRecognitionTrainingConfig,
-                                       image_size: tuple[int, int]) -> ConfigurablePartyModel:
+def _build_party_model(config: PartyRecognitionTrainingConfig,
+                       image_size: tuple[int, int]) -> CrossAttentionPartyModel:
     encoder_name = config.encoder_name
     encoder_out_indices = tuple(int(idx) for idx in config.encoder_out_indices)
     if not encoder_out_indices:
@@ -152,13 +172,10 @@ def _build_party_model_from_components(config: PartyRecognitionTrainingConfig,
     adapter_num_layers = int(config.adapter_num_layers)
     adapter_num_heads = int(config.adapter_num_heads)
     adapter_ds_factors = list(config.adapter_ds_factors)
-    locator_num_tokens = int(config.locator_num_tokens)
-    reader_num_tokens = int(config.reader_num_tokens)
-    global_num_tokens = int(config.global_num_tokens)
-    conditioner_num_rounds = int(config.conditioner_num_rounds)
+    prompt_num_samples = int(config.prompt_num_samples)
     prompt_num_layers = int(config.prompt_num_layers)
     prompt_num_heads = int(config.prompt_num_heads)
-    conditioner_attn_dropout = float(config.conditioner_attn_dropout)
+    prompt_gate_init = float(config.prompt_gate_init)
 
     decoder_name = config.decoder_name
     fusion_interval = int(config.fusion_interval)
@@ -174,31 +191,34 @@ def _build_party_model_from_components(config: PartyRecognitionTrainingConfig,
     if len(adapter_ds_factors) != len(encoder_out_indices):
         raise ValueError('adapter_ds_factors must have the same length as encoder_out_indices.')
 
-    encoder_max_seq_len = reader_num_tokens + global_num_tokens
     decoder = bytellama_vision_decoder(pretrained=decoder_name,
-                                       encoder_max_seq_len=encoder_max_seq_len,
+                                       encoder_max_seq_len=prompt_num_samples,
                                        fusion_interval=fusion_interval)
     decoder_embed_dim = decoder.tok_embeddings.embedding_dim
 
-    visual_conditioner = LocatorReaderConditioner(
-        num_layers=adapter_num_layers,
-        num_heads=adapter_num_heads,
-        encoder_embed_dims=encoder_channels,
-        encoder_sizes=encoder_sizes,
-        decoder_embed_dim=decoder_embed_dim,
-        ds_factors=adapter_ds_factors,
-        locator_num_tokens=locator_num_tokens,
-        reader_num_tokens=reader_num_tokens,
-        global_num_tokens=global_num_tokens,
-        num_rounds=conditioner_num_rounds,
-        refine_layers=prompt_num_layers,
-        refine_num_heads=prompt_num_heads,
-        attn_dropout=conditioner_attn_dropout,
-    )
+    adapter = PartyMultiScaleAdapter(num_layers=adapter_num_layers,
+                                     num_heads=adapter_num_heads,
+                                     encoder_embed_dims=encoder_channels,
+                                     encoder_sizes=encoder_sizes,
+                                     decoder_embed_dim=decoder_embed_dim,
+                                     ds_factors=adapter_ds_factors)
 
-    return ConfigurablePartyModel(encoder=encoder,
-                                  decoder=decoder,
-                                  visual_conditioner=visual_conditioner)
+    line_embedding = PromptCrossAttention(embed_dim=decoder_embed_dim,
+                                          num_heads=prompt_num_heads,
+                                          num_layers=prompt_num_layers,
+                                          num_samples=prompt_num_samples,
+                                          gate_init=prompt_gate_init)
+
+    ctc_head = None
+    if float(config.ctc_aux_weight) > 0.0:
+        ctc_head = nn.Sequential(RMSNorm(decoder_embed_dim, eps=1e-5),
+                                 nn.Linear(decoder_embed_dim, CTC_NUM_CLASSES))
+
+    return CrossAttentionPartyModel(encoder=encoder,
+                                    decoder=decoder,
+                                    adapter=adapter,
+                                    line_embedding=line_embedding,
+                                    ctc_head=ctc_head)
 
 
 class PartyTextLineDataModule(L.LightningDataModule):
@@ -284,6 +304,7 @@ class PartyRecognitionModel(L.LightningModule):
     A LightningModule encapsulating the training setup for a text
     recognition model.
     """
+
     def __init__(self,
                  config: PartyRecognitionTrainingConfig,
                  model: Optional['BaseModel'] = None):
@@ -298,7 +319,9 @@ class PartyRecognitionModel(L.LightningModule):
             self.net = None
 
         self.criterion = nn.CrossEntropyLoss(label_smoothing=config.label_smoothing)
+        self.ctc_criterion = nn.CTCLoss(blank=CTC_BLANK, zero_infinity=True) if config.ctc_aux_weight > 0.0 else None
         self.val_mean = MeanMetric()
+        self.val_ctc_mean = MeanMetric() if self.ctc_criterion is not None else None
 
         p_nft = config.noisy_teacher_forcing
         self._target_ntf_p = p_nft
@@ -309,7 +332,8 @@ class PartyRecognitionModel(L.LightningModule):
                                                                                            p=initial_ntf_p,
                                                                                            ignore_index=self.criterion.ignore_index)
 
-        self.model_step = model_step
+        self._target_ctc_weight = float(config.ctc_aux_weight)
+        self._ctc_warmup_steps = max(0, int(config.ctc_aux_warmup or 0))
 
     def forward(self, x, curves):
         return self.net(encoder_input=x, encoder_curves=curves)
@@ -323,103 +347,155 @@ class PartyRecognitionModel(L.LightningModule):
         ntf_scale = min(1.0, float(self.trainer.global_step + 1) / self._ntf_warmup_steps)
         self.noisy_teacher_forcing.p = self._target_ntf_p * ntf_scale
 
+    def _current_ctc_weight(self) -> float:
+        if self.ctc_criterion is None:
+            return 0.0
+        if self._ctc_warmup_steps <= 0:
+            return self._target_ctc_weight
+        ctc_scale = min(1.0, float(self.trainer.global_step + 1) / self._ctc_warmup_steps)
+        return self._target_ctc_weight * ctc_scale
+
+    def _compute_losses(self, batch, apply_ntf: bool) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        tokens = batch['tokens']
+        targets = _build_decoder_targets(tokens, self.criterion.ignore_index)
+
+        decoder_tokens = tokens.clone()
+        if apply_ntf:
+            decoder_tokens = self.noisy_teacher_forcing(decoder_tokens)
+        decoder_tokens.masked_fill_(decoder_tokens == self.criterion.ignore_index, 0)
+
+        encoder_hidden_states = self.net.forward_encoder_embeddings(batch['image'])
+        line_features, ctc_logits = self.net.forward_line_features(
+            encoder_hidden_states,
+            curves=batch['curves'],
+            boxes=batch['boxes'],
+            return_ctc_logits=self.ctc_criterion is not None,
+        )
+
+        logits = self.net(tokens=decoder_tokens,
+                          encoder_hidden_states=line_features)
+        ce_loss = self.criterion(logits.reshape(-1, logits.shape[-1]), targets)
+
+        ctc_loss = None
+        if ctc_logits is not None:
+            ctc_targets, target_lengths = _extract_ctc_targets(tokens)
+            input_lengths = torch.full((tokens.shape[0],),
+                                       ctc_logits.shape[1],
+                                       dtype=torch.long,
+                                       device=tokens.device)
+            log_probs = ctc_logits.log_softmax(dim=-1).transpose(0, 1)
+            ctc_loss = self.ctc_criterion(log_probs, ctc_targets, input_lengths, target_lengths)
+
+        return ce_loss, ctc_loss
+
     def training_step(self, batch, batch_idx):
         self._update_noisy_teacher_forcing_p()
-        loss = self.model_step(self.net, self.noisy_teacher_forcing, self.criterion, batch)
-        # Handle NaN/Inf losses in DDP by replacing with zero loss
-        # This ensures all processes participate in gradient sync while
-        # preventing NaN gradients from corrupting the model
+        ce_loss, ctc_loss = self._compute_losses(batch, apply_ntf=True)
+        ctc_weight = self._current_ctc_weight()
+        loss = ce_loss if ctc_loss is None else ce_loss + ctc_weight * ctc_loss
+
         if torch.isnan(loss) or torch.isinf(loss):
             logger.warning(f'NaN/Inf loss detected at batch {batch_idx}, replacing with zero loss')
-            # Create zero loss connected to graph via output projection weights
             loss = 0.0 * sum(p.sum() for p in self.net.parameters() if p.requires_grad)
+
+        batch_size = batch['tokens'].shape[0]
         self.log('train_loss',
                  loss,
-                 batch_size=batch['tokens'].shape[0],
+                 batch_size=batch_size,
                  on_step=True,
                  on_epoch=True,
                  prog_bar=True,
                  logger=True)
+        self.log('train_ce_loss',
+                 ce_loss,
+                 batch_size=batch_size,
+                 on_step=True,
+                 on_epoch=True,
+                 prog_bar=False,
+                 logger=True)
+        if ctc_loss is not None:
+            self.log('train_ctc_loss',
+                     ctc_loss,
+                     batch_size=batch_size,
+                     on_step=True,
+                     on_epoch=True,
+                     prog_bar=False,
+                     logger=True)
+            self.log('train_ctc_weight',
+                     ctc_weight,
+                     batch_size=batch_size,
+                     on_step=True,
+                     on_epoch=False,
+                     prog_bar=False,
+                     logger=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        tokens = batch['tokens']
-        # shift the tokens to create targets
-        ignore_idxs = torch.full((tokens.shape[0], 1),
-                                 self.criterion.ignore_index,
-                                 dtype=tokens.dtype, device=tokens.device)
-        targets = torch.hstack((tokens[..., 1:], ignore_idxs)).reshape(-1)
-
-        # our tokens already contain BOS/EOS tokens so we just run it
-        # through the model after replacing ignored indices.
-        tokens.masked_fill_(tokens == self.criterion.ignore_index, 0)
+        del batch_idx
+        loss = None
 
         if batch['curves'] is not None:
-            logits = self.net(tokens=tokens,
-                              encoder_input=batch['image'],
-                              encoder_curves=batch['curves'],
-                              encoder_boxes=None)
-
-            logits = logits.reshape(-1, logits.shape[-1])
-            loss = nn.CrossEntropyLoss(reduction='none')(logits, targets)
-            self.val_mean.update(loss)
+            ce_loss, ctc_loss = self._compute_losses({'image': batch['image'],
+                                                      'tokens': batch['tokens'],
+                                                      'curves': batch['curves'],
+                                                      'boxes': None},
+                                                     apply_ntf=False)
+            self.val_mean.update(ce_loss)
+            if ctc_loss is not None and self.val_ctc_mean is not None:
+                self.val_ctc_mean.update(ctc_loss)
+            loss = ce_loss
 
         if batch['boxes'] is not None:
-            logits = self.net(tokens=tokens,
-                              encoder_input=batch['image'],
-                              encoder_curves=None,
-                              encoder_boxes=batch['boxes'])
+            ce_loss, ctc_loss = self._compute_losses({'image': batch['image'],
+                                                      'tokens': batch['tokens'],
+                                                      'curves': None,
+                                                      'boxes': batch['boxes']},
+                                                     apply_ntf=False)
+            self.val_mean.update(ce_loss)
+            if ctc_loss is not None and self.val_ctc_mean is not None:
+                self.val_ctc_mean.update(ctc_loss)
+            loss = ce_loss
 
-            logits = logits.reshape(-1, logits.shape[-1])
-            loss = nn.CrossEntropyLoss(reduction='none')(logits, targets)
-            self.val_mean.update(loss)
         return loss
 
     def on_validation_epoch_end(self):
         if not self.trainer.sanity_checking:
             self.log('val_metric', self.val_mean.compute(), on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
             self.log('global_step', self.global_step, on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
+            if self.val_ctc_mean is not None:
+                self.log('val_ctc_loss', self.val_ctc_mean.compute(), on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
         self.val_mean.reset()
+        if self.val_ctc_mean is not None:
+            self.val_ctc_mean.reset()
 
     def setup(self, stage: Optional[str] = None):
         if stage in [None, 'fit']:
             if self.net is None:
-                self.net = _build_party_model_from_components(config=self.hparams.config,
-                                                              image_size=self.trainer.datamodule.hparams.data_config.image_size)
+                self.net = _build_party_model(config=self.hparams.config,
+                                              image_size=self.trainer.datamodule.hparams.data_config.image_size)
 
             if self.hparams.config.freeze_encoder:
                 for param in self.net.nn['encoder'].parameters():
                     param.requires_grad = False
-                for param in self.net.nn['visual_conditioner'].parameters():
+                for param in self.net.nn['adapter'].parameters():
                     param.requires_grad = False
 
     def on_save_checkpoint(self, checkpoint):
-        """
-        Save hyperparameters a second time so we can set parameters that
-        shouldn't be overwritten in on_load_checkpoint.
-        """
         checkpoint['_module_config'] = self.hparams.config
 
     def on_load_checkpoint(self, checkpoint):
-        """
-        Reconstruct the model from the spec here and not in setup() as
-        otherwise the weight loading will fail.
-        """
         if not isinstance(checkpoint['_module_config'], PartyRecognitionTrainingConfig):
             raise ValueError('Checkpoint is not a party model.')
 
         module_config = checkpoint['_module_config']
         data_config = checkpoint['datamodule_hyper_parameters']['data_config']
-        self.net = _build_party_model_from_components(config=module_config,
-                                                      image_size=data_config.image_size)
+        self.net = _build_party_model(config=module_config,
+                                      image_size=data_config.image_size)
 
     @classmethod
     def load_from_repo(cls,
                        id: str,
                        config: PartyRecognitionTrainingConfig):
-        """
-        Loads weights from HTRMoPo.
-        """
         from htrmopo import get_model
 
         model_path = get_model(id) / 'model.safetensors'
@@ -429,9 +505,6 @@ class PartyRecognitionModel(L.LightningModule):
     def load_from_weights(cls,
                           path: Union[str, 'PathLike'],
                           config: PartyRecognitionTrainingConfig) -> 'PartyRecognitionModel':
-        """
-        Initializes the module from a model weights file.
-        """
         from kraken.models import load_models
         models = load_models(path, tasks=['recognition'])
         if len(models) != 1:
@@ -448,21 +521,13 @@ class PartyRecognitionModel(L.LightningModule):
 
         return callbacks
 
-    # configuration of optimizers and learning rate schedulers
-    # --------------------------------------------------------
-    #
-    # All schedulers are created internally with a frequency of step to enable
-    # batch-wise learning rate warmup. In lr_scheduler_step() calls to the
-    # scheduler are performed at every step.
     def configure_optimizers(self):
         param_groups = get_parameter_groups(self.net, self.hparams.config)
 
-        # Log parameter groups
         for pg in param_groups:
             n_params = sum(p.numel() for p in pg['params'])
             logger.info(f"Param group '{pg['name']}': {n_params:,} params, lr={pg['lr']:.2e}")
 
-        # Store initial LRs for warmup
         self._initial_lrs = [pg['lr'] for pg in param_groups]
 
         config = self.hparams.config
@@ -470,8 +535,6 @@ class PartyRecognitionModel(L.LightningModule):
         world_size = get_world_size() if is_initialized() else 1
         per_rank_batches = self.trainer.datamodule.train_set.num_batches // world_size
         accumulate = max(1, self.hparams.config.accumulate_grad_batches)
-        # The train dataloader emits one sampled page-batch per step.
-        # Scheduler steps should follow optimizer steps (after grad accumulation).
         steps_per_epoch = max(1, math.ceil(per_rank_batches / accumulate))
 
         scheduler = lr_scheduler.CosineAnnealingLR(
@@ -485,11 +548,9 @@ class PartyRecognitionModel(L.LightningModule):
         }
 
     def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_closure):
-        # update params
+        del epoch, batch_idx
         optimizer.step(closure=optimizer_closure)
 
-        # linear warmup between 0 and the initial learning rate in `warmup` steps.
-        # Uses per-group initial LRs for discriminative learning rates.
         if self.hparams.config.warmup and self.trainer.global_step < self.hparams.config.warmup:
             lr_scale = min(1.0, float(self.trainer.global_step + 1) / self.hparams.config.warmup)
             for pg, initial_lr in zip(optimizer.param_groups, self._initial_lrs):
@@ -499,7 +560,6 @@ class PartyRecognitionModel(L.LightningModule):
         if not self.hparams.config.warmup or self.trainer.global_step >= self.hparams.config.warmup:
             if isinstance(scheduler, (lr_scheduler.OneCycleLR, lr_scheduler.CosineAnnealingLR)):
                 scheduler.step()
-            # step every other scheduler epoch-wise
             elif self.trainer.is_last_batch:
                 if metric is None:
                     scheduler.step()
