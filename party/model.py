@@ -31,7 +31,7 @@ from torch.distributed import get_world_size, is_initialized
 from torch.utils.data import RandomSampler, DataLoader
 
 from party.tokenizer import OFFSET, LANG_OFFSET
-from party.fusion import bytellama_vision_decoder, LinePromptedMultiScaleResampler
+from party.fusion import bytellama_vision_decoder, LocatorReaderConditioner
 from party.modules import NoisyTeacherForcing
 from party.dataset import (collate_null, get_default_transforms,
                            BinnedBaselineDataset, ValidationBaselineDataset,
@@ -152,12 +152,13 @@ def _build_party_model_from_components(config: PartyRecognitionTrainingConfig,
     adapter_num_layers = int(config.adapter_num_layers)
     adapter_num_heads = int(config.adapter_num_heads)
     adapter_ds_factors = list(config.adapter_ds_factors)
-    line_num_tokens = int(config.line_num_tokens)
+    locator_num_tokens = int(config.locator_num_tokens)
+    reader_num_tokens = int(config.reader_num_tokens)
     global_num_tokens = int(config.global_num_tokens)
+    conditioner_num_rounds = int(config.conditioner_num_rounds)
     prompt_num_layers = int(config.prompt_num_layers)
     prompt_num_heads = int(config.prompt_num_heads)
-    prompt_sigma_u_factor = float(config.prompt_sigma_u_factor)
-    prompt_sigma_v_factor = float(config.prompt_sigma_v_factor)
+    conditioner_attn_dropout = float(config.conditioner_attn_dropout)
 
     decoder_name = config.decoder_name
     fusion_interval = int(config.fusion_interval)
@@ -173,25 +174,26 @@ def _build_party_model_from_components(config: PartyRecognitionTrainingConfig,
     if len(adapter_ds_factors) != len(encoder_out_indices):
         raise ValueError('adapter_ds_factors must have the same length as encoder_out_indices.')
 
-    encoder_max_seq_len = line_num_tokens + global_num_tokens
+    encoder_max_seq_len = reader_num_tokens + global_num_tokens
     decoder = bytellama_vision_decoder(pretrained=decoder_name,
                                        encoder_max_seq_len=encoder_max_seq_len,
                                        fusion_interval=fusion_interval)
     decoder_embed_dim = decoder.tok_embeddings.embedding_dim
 
-    visual_conditioner = LinePromptedMultiScaleResampler(
+    visual_conditioner = LocatorReaderConditioner(
         num_layers=adapter_num_layers,
         num_heads=adapter_num_heads,
         encoder_embed_dims=encoder_channels,
         encoder_sizes=encoder_sizes,
         decoder_embed_dim=decoder_embed_dim,
         ds_factors=adapter_ds_factors,
-        line_num_tokens=line_num_tokens,
+        locator_num_tokens=locator_num_tokens,
+        reader_num_tokens=reader_num_tokens,
         global_num_tokens=global_num_tokens,
+        num_rounds=conditioner_num_rounds,
         refine_layers=prompt_num_layers,
         refine_num_heads=prompt_num_heads,
-        sigma_u_factor=prompt_sigma_u_factor,
-        sigma_v_factor=prompt_sigma_v_factor,
+        attn_dropout=conditioner_attn_dropout,
     )
 
     return ConfigurablePartyModel(encoder=encoder,

@@ -221,24 +221,27 @@ def compile(ctx, **params):
               multiple=True,
               type=click.IntRange(1),
               help='Per-scale downsampling factor for the conditioned multi-scale adapter. Repeat once per encoder output index.')
-@click.option('--line-num-tokens',
+@click.option('--locator-num-tokens',
               type=click.IntRange(1),
-              help='Number of ordered line memory tokens produced by the visual conditioner.')
+              help='Number of prompt-seeded locator latents that find line support over the full page bank.')
+@click.option('--reader-num-tokens',
+              type=click.IntRange(1),
+              help='Number of ordered reader latents exposed to the decoder.')
 @click.option('--global-num-tokens',
               type=click.IntRange(0),
-              help='Number of optional prompt-conditioned global page summary tokens.')
+              help='Number of optional global summary latents appended to the reader memory.')
+@click.option('--conditioner-num-rounds',
+              type=click.IntRange(1),
+              help='Number of locator-reader rereading rounds over the full page bank.')
 @click.option('--prompt-num-layers',
               type=click.IntRange(1),
-              help='Number of refinement layers over the ordered line memory.')
+              help='Number of refinement layers over the final latent memory.')
 @click.option('--prompt-num-heads',
               type=click.IntRange(1),
               help='Number of attention heads in prompt-conditioned refinement layers.')
-@click.option('--prompt-sigma-u-factor',
-              type=click.FloatRange(min=0.0, min_open=True),
-              help='Multiplier for the along-line pooling width of ordered prompt tokens.')
-@click.option('--prompt-sigma-v-factor',
-              type=click.FloatRange(min=0.0, min_open=True),
-              help='Multiplier for the across-line pooling width of ordered prompt tokens.')
+@click.option('--conditioner-attn-dropout',
+              type=click.FloatRange(min=0.0, max=1.0),
+              help='Attention dropout rate for the conditioner cross- and self-attention layers.')
 @click.option('--logger',
               'pl_logger',
               type=click.Choice(['tensorboard', 'wandb']),
