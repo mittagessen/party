@@ -31,7 +31,7 @@ from torch.distributed import get_world_size, is_initialized
 from torch.utils.data import RandomSampler, DataLoader
 
 from party.tokenizer import OFFSET, LANG_OFFSET
-from party.fusion import bytellama_vision_decoder, LinePromptedMultiScaleResampler
+from party.fusion import bytellama_vision_decoder, PromptConditionedMultiScaleAdapter
 from party.modules import NoisyTeacherForcing
 from party.dataset import (collate_null, get_default_transforms,
                            BinnedBaselineDataset, ValidationBaselineDataset,
@@ -73,7 +73,7 @@ def get_parameter_groups(model, config) -> list[dict[str, Any]]:
     """Create parameter groups with discriminative learning rates.
 
     Pretrained group: encoder layers (lower LR)
-    Full-LR group: decoder + visual conditioner (base LR)
+    Full-LR group: decoder + fused visual conditioner (base LR)
     """
     base_lr = config.lrate
     encoder_params = []
@@ -152,12 +152,11 @@ def _build_party_model_from_components(config: PartyRecognitionTrainingConfig,
     adapter_num_layers = int(config.adapter_num_layers)
     adapter_num_heads = int(config.adapter_num_heads)
     adapter_ds_factors = list(config.adapter_ds_factors)
-    line_num_tokens = int(config.line_num_tokens)
-    global_num_tokens = int(config.global_num_tokens)
+    prompt_num_samples = int(config.prompt_num_samples)
     prompt_num_layers = int(config.prompt_num_layers)
     prompt_num_heads = int(config.prompt_num_heads)
-    prompt_sigma_u_factor = float(config.prompt_sigma_u_factor)
-    prompt_sigma_v_factor = float(config.prompt_sigma_v_factor)
+    prompt_gate_init = float(config.prompt_gate_init)
+    prompt_min_tokens_per_scale = int(config.prompt_min_tokens_per_scale)
 
     decoder_name = config.decoder_name
     fusion_interval = int(config.fusion_interval)
@@ -173,25 +172,24 @@ def _build_party_model_from_components(config: PartyRecognitionTrainingConfig,
     if len(adapter_ds_factors) != len(encoder_out_indices):
         raise ValueError('adapter_ds_factors must have the same length as encoder_out_indices.')
 
-    encoder_max_seq_len = line_num_tokens + global_num_tokens
+    encoder_max_seq_len = prompt_num_samples
     decoder = bytellama_vision_decoder(pretrained=decoder_name,
                                        encoder_max_seq_len=encoder_max_seq_len,
                                        fusion_interval=fusion_interval)
     decoder_embed_dim = decoder.tok_embeddings.embedding_dim
 
-    visual_conditioner = LinePromptedMultiScaleResampler(
+    visual_conditioner = PromptConditionedMultiScaleAdapter(
         num_layers=adapter_num_layers,
         num_heads=adapter_num_heads,
         encoder_embed_dims=encoder_channels,
         encoder_sizes=encoder_sizes,
         decoder_embed_dim=decoder_embed_dim,
         ds_factors=adapter_ds_factors,
-        line_num_tokens=line_num_tokens,
-        global_num_tokens=global_num_tokens,
+        num_samples=prompt_num_samples,
         refine_layers=prompt_num_layers,
         refine_num_heads=prompt_num_heads,
-        sigma_u_factor=prompt_sigma_u_factor,
-        sigma_v_factor=prompt_sigma_v_factor,
+        gate_init=prompt_gate_init,
+        min_tokens_per_scale=prompt_min_tokens_per_scale,
     )
 
     return ConfigurablePartyModel(encoder=encoder,

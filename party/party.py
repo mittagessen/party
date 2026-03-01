@@ -29,7 +29,7 @@ from collections.abc import Generator
 from typing import Optional, Union, TYPE_CHECKING, Any
 
 from party.tokenizer import OctetTokenizer
-from party.fusion import LinePromptedMultiScaleResampler, bytellama_vision_decoder
+from party.fusion import PromptConditionedMultiScaleAdapter, bytellama_vision_decoder
 from party.dataset import get_default_transforms, _to_curve, _to_bbox
 
 if TYPE_CHECKING:
@@ -100,11 +100,10 @@ class PartyModel(nn.Module, RecognitionBaseModel):
                                               'metrics': []}
         self.user_metadata.update(kwargs)
 
-        out_indices = tuple(kwargs.get('encoder_out_indices', (1, 2, 3)))
+        out_indices = (1, 2, 3)
         fusion_interval = kwargs.get('fusion_interval', 3)
 
-        encoder_name = kwargs.get('encoder_name', 'convnextv2_base.fcmae_ft_in22k_in1k')
-        encoder = timm.create_model(encoder_name,
+        encoder = timm.create_model('convnextv2_base.fcmae_ft_in22k_in1k',
                                     pretrained=pretrained,
                                     features_only=True,
                                     out_indices=out_indices)
@@ -117,34 +116,32 @@ class PartyModel(nn.Module, RecognitionBaseModel):
         adapter_num_layers = kwargs.get('adapter_num_layers', 1)
         adapter_num_heads = kwargs.get('adapter_num_heads', 8)
         ds_factors = kwargs.get('adapter_ds_factors', [4, 2, 1])
-        line_num_tokens = kwargs.get('line_num_tokens', 128)
-        global_num_tokens = kwargs.get('global_num_tokens', 8)
+        prompt_num_samples = kwargs.get('prompt_num_samples', 384)
         prompt_num_layers = kwargs.get('prompt_num_layers', 2)
         prompt_num_heads = kwargs.get('prompt_num_heads', 8)
-        prompt_sigma_u_factor = kwargs.get('prompt_sigma_u_factor', 1.5)
-        prompt_sigma_v_factor = kwargs.get('prompt_sigma_v_factor', 0.5)
+        prompt_gate_init = kwargs.get('prompt_gate_init', 0.0)
+        prompt_min_tokens_per_scale = kwargs.get('prompt_min_tokens_per_scale', 16)
 
-        # decoder cross-attention cache length equals the ordered line memory
-        self.encoder_max_seq_len = line_num_tokens + global_num_tokens
+        # decoder cross-attention cache length equals the filtered prompt tokens
+        self.encoder_max_seq_len = prompt_num_samples
 
-        decoder = bytellama_vision_decoder(pretrained=kwargs.get('decoder_name', 'mittagessen/bytellama-40m-oscar'),
+        decoder = bytellama_vision_decoder(pretrained='mittagessen/bytellama-40m-oscar',
                                            encoder_max_seq_len=self.encoder_max_seq_len,
                                            fusion_interval=fusion_interval)
         decoder_embed_dim = decoder.tok_embeddings.embedding_dim
 
-        visual_conditioner = LinePromptedMultiScaleResampler(
+        visual_conditioner = PromptConditionedMultiScaleAdapter(
             num_layers=adapter_num_layers,
             num_heads=adapter_num_heads,
             encoder_embed_dims=encoder_embed_dims,
             encoder_sizes=encoder_sizes,
             decoder_embed_dim=decoder_embed_dim,
             ds_factors=ds_factors,
-            line_num_tokens=line_num_tokens,
-            global_num_tokens=global_num_tokens,
+            num_samples=prompt_num_samples,
             refine_layers=prompt_num_layers,
             refine_num_heads=prompt_num_heads,
-            sigma_u_factor=prompt_sigma_u_factor,
-            sigma_v_factor=prompt_sigma_v_factor,
+            gate_init=prompt_gate_init,
+            min_tokens_per_scale=prompt_min_tokens_per_scale,
         )
 
         self.nn = nn.ModuleDict({'encoder': encoder,
@@ -265,7 +262,8 @@ class PartyModel(nn.Module, RecognitionBaseModel):
 
     def forward_encoder_embeddings(self, encoder_input):
         """
-        Computes encoder feature maps before line-ordered prompt resampling.
+        Computes encoder feature maps before prompt-conditioned token
+        resampling.
         """
         return self.nn['encoder'](encoder_input)
 
@@ -464,7 +462,7 @@ class PartyModel(nn.Module, RecognitionBaseModel):
                                   decoder_max_seq_len=self._max_generated_tokens,
                                   dtype=next(self.nn['encoder'].parameters()).dtype)
 
-            logger.debug('Computing line-focused features via line-ordered visual conditioner.')
+            logger.debug('Computing line-focused features via fused visual conditioner.')
             line_features = self.nn['visual_conditioner'](encoder_hidden_states=encoder_features,
                                                           curves=batch if curves is not None else None,
                                                           boxes=batch if boxes is not None else None)

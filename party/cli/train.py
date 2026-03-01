@@ -221,24 +221,21 @@ def compile(ctx, **params):
               multiple=True,
               type=click.IntRange(1),
               help='Per-scale downsampling factor for the conditioned multi-scale adapter. Repeat once per encoder output index.')
-@click.option('--line-num-tokens',
+@click.option('--prompt-num-samples',
               type=click.IntRange(1),
-              help='Number of ordered line memory tokens produced by the visual conditioner.')
-@click.option('--global-num-tokens',
-              type=click.IntRange(0),
-              help='Number of optional prompt-conditioned global page summary tokens.')
+              help='Number of prompt-conditioned memory tokens produced by the fused visual conditioner.')
 @click.option('--prompt-num-layers',
               type=click.IntRange(1),
-              help='Number of refinement layers over the ordered line memory.')
+              help='Number of self-attention refinement layers after top-k token selection.')
 @click.option('--prompt-num-heads',
               type=click.IntRange(1),
               help='Number of attention heads in prompt-conditioned refinement layers.')
-@click.option('--prompt-sigma-u-factor',
-              type=click.FloatRange(min=0.0, min_open=True),
-              help='Multiplier for the along-line pooling width of ordered prompt tokens.')
-@click.option('--prompt-sigma-v-factor',
-              type=click.FloatRange(min=0.0, min_open=True),
-              help='Multiplier for the across-line pooling width of ordered prompt tokens.')
+@click.option('--prompt-gate-init',
+              type=float,
+              help='Initial value for tanh gates in fused prompt-conditioned token refiner blocks.')
+@click.option('--prompt-min-tokens-per-scale',
+              type=click.IntRange(1),
+              help='Minimum per-scale token budget before balancing to prompt_num_samples in fused visual conditioner.')
 @click.option('--logger',
               'pl_logger',
               type=click.Choice(['tensorboard', 'wandb']),
