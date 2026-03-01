@@ -29,7 +29,7 @@ from collections.abc import Generator
 from typing import Optional, Union, TYPE_CHECKING, Any
 
 from party.tokenizer import OctetTokenizer
-from party.fusion import LocatorReaderConditioner, bytellama_vision_decoder
+from party.fusion import LinePromptedMultiScaleResampler, bytellama_vision_decoder
 from party.dataset import get_default_transforms, _to_curve, _to_bbox
 
 if TYPE_CHECKING:
@@ -117,35 +117,34 @@ class PartyModel(nn.Module, RecognitionBaseModel):
         adapter_num_layers = kwargs.get('adapter_num_layers', 1)
         adapter_num_heads = kwargs.get('adapter_num_heads', 8)
         ds_factors = kwargs.get('adapter_ds_factors', [4, 2, 1])
-        locator_num_tokens = kwargs.get('locator_num_tokens', 8)
-        reader_num_tokens = kwargs.get('reader_num_tokens', 128)
+        line_num_tokens = kwargs.get('line_num_tokens', 128)
         global_num_tokens = kwargs.get('global_num_tokens', 8)
-        conditioner_num_rounds = kwargs.get('conditioner_num_rounds', 2)
         prompt_num_layers = kwargs.get('prompt_num_layers', 2)
         prompt_num_heads = kwargs.get('prompt_num_heads', 8)
+        prompt_sigma_u_factor = kwargs.get('prompt_sigma_u_factor', 1.5)
+        prompt_sigma_v_factor = kwargs.get('prompt_sigma_v_factor', 0.5)
 
-        # decoder cross-attention cache length equals the final latent memory
-        self.encoder_max_seq_len = reader_num_tokens + global_num_tokens
+        # decoder cross-attention cache length equals the ordered line memory
+        self.encoder_max_seq_len = line_num_tokens + global_num_tokens
 
         decoder = bytellama_vision_decoder(pretrained=kwargs.get('decoder_name', 'mittagessen/bytellama-40m-oscar'),
                                            encoder_max_seq_len=self.encoder_max_seq_len,
                                            fusion_interval=fusion_interval)
         decoder_embed_dim = decoder.tok_embeddings.embedding_dim
 
-        visual_conditioner = LocatorReaderConditioner(
+        visual_conditioner = LinePromptedMultiScaleResampler(
             num_layers=adapter_num_layers,
             num_heads=adapter_num_heads,
             encoder_embed_dims=encoder_embed_dims,
             encoder_sizes=encoder_sizes,
             decoder_embed_dim=decoder_embed_dim,
             ds_factors=ds_factors,
-            locator_num_tokens=locator_num_tokens,
-            reader_num_tokens=reader_num_tokens,
+            line_num_tokens=line_num_tokens,
             global_num_tokens=global_num_tokens,
-            num_rounds=conditioner_num_rounds,
             refine_layers=prompt_num_layers,
             refine_num_heads=prompt_num_heads,
-            attn_dropout=kwargs.get('conditioner_attn_dropout', 0.0),
+            sigma_u_factor=prompt_sigma_u_factor,
+            sigma_v_factor=prompt_sigma_v_factor,
         )
 
         self.nn = nn.ModuleDict({'encoder': encoder,
