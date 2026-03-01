@@ -210,32 +210,37 @@ def compile(ctx, **params):
 @click.option('--fusion-interval',
               type=click.IntRange(1),
               help='Insert decoder fusion cross-attention every N layers.')
+@click.option('--adapter-component',
+              type=click.Choice(['multiscale',
+                                 'single_scale']),
+              help='Adapter implementation.')
 @click.option('--adapter-num-layers',
               type=click.IntRange(1),
-              help='Number of per-scale transformer layers in the conditioned multi-scale adapter.')
+              help='Number of adapter transformer layers.')
 @click.option('--adapter-num-heads',
               type=click.IntRange(1),
-              help='Number of attention heads in per-scale adapter blocks.')
+              help='Number of adapter attention heads.')
 @click.option('--adapter-ds-factor',
               'adapter_ds_factors',
               multiple=True,
               type=click.IntRange(1),
-              help='Per-scale downsampling factor for the conditioned multi-scale adapter. Repeat once per encoder output index.')
+              help='Per-scale downsampling factor for multiscale adapter. Repeat once per encoder output index.')
+@click.option('--line-embedding-component',
+              type=click.Choice(['cross_attention',
+                                 'additive']),
+              help='Line embedding module.')
 @click.option('--prompt-num-samples',
               type=click.IntRange(1),
-              help='Number of prompt-conditioned memory tokens produced by the fused visual conditioner.')
+              help='Number of filtered prompt tokens produced by PromptCrossAttention.')
 @click.option('--prompt-num-layers',
               type=click.IntRange(1),
-              help='Number of self-attention refinement layers after top-k token selection.')
+              help='Number of line-embedding transformer layers for cross-attention line embedding.')
 @click.option('--prompt-num-heads',
               type=click.IntRange(1),
-              help='Number of attention heads in prompt-conditioned refinement layers.')
+              help='Number of line-embedding attention heads for cross-attention line embedding.')
 @click.option('--prompt-gate-init',
               type=float,
-              help='Initial value for tanh gates in fused prompt-conditioned token refiner blocks.')
-@click.option('--prompt-min-tokens-per-scale',
-              type=click.IntRange(1),
-              help='Minimum per-scale token budget before balancing to prompt_num_samples in fused visual conditioner.')
+              help='Initial value for PromptCrossAttention tanh gates.')
 @click.option('--logger',
               'pl_logger',
               type=click.Choice(['tensorboard', 'wandb']),

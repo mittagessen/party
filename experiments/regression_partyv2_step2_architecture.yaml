@@ -1,0 +1,48 @@
+precision: bf16-mixed
+device: auto
+num_workers: 4
+num_threads: 1
+train:
+  train_from_scratch: true
+  training_data:
+    - /home/mittagessen/party_dataset/synth_arxiv_train_9k.lst
+  evaluation_data:
+    - /home/mittagessen/party_dataset/synth_arxiv_val_1k.lst
+  checkpoint_path: /home/mittagessen/party_models/regression_partyv2_step2_architecture
+  pl_logger: wandb
+
+  # text transforms
+  normalization: NFD
+  normalize_whitespace: true
+  prompt_mode: both
+
+  # recipe 2/3: switch adapter implementation to multiscale (single encoder stage)
+  encoder_name: convnextv2_base.fcmae_ft_in22k_in1k
+  encoder_out_indices: [2]
+  decoder_name: mittagessen/bytellama-40m-oscar
+  fusion_interval: 3
+  adapter_component: multiscale
+  adapter_num_layers: 1
+  adapter_num_heads: 8
+  adapter_ds_factors: [1]
+  line_embedding_component: cross_attention
+  prompt_num_samples: 384
+  prompt_num_layers: 2
+  prompt_num_heads: 8
+
+  optimizer: AdamW
+  epochs: 8
+  lrate: 5e-4
+  lr_pretrained_mult: 0.1
+  weight_decay: 1e-5
+  schedule: cosine
+  cos_t_max: 8
+  cos_min_lr: 5e-6
+  warmup: 500
+  augment: false
+  batch_size: 16
+  val_batch_size: 32
+  accumulate_grad_batches: 4
+  noisy_teacher_forcing: 0.0
+  noisy_teacher_forcing_warmup: 0
+  label_smoothing: 0.0

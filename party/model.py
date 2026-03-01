@@ -31,8 +31,10 @@ from torch.distributed import get_world_size, is_initialized
 from torch.utils.data import RandomSampler, DataLoader
 
 from party.tokenizer import OFFSET, LANG_OFFSET
-from party.fusion import bytellama_vision_decoder, PromptConditionedMultiScaleAdapter
-from party.modules import NoisyTeacherForcing
+from party.fusion import bytellama_vision_decoder, PartyMultiScaleAdapter
+from party.modules import (NoisyTeacherForcing, PromptEncoder, PromptCrossAttention,
+                           MultiHeadAttention, FeedForward, TransformerSelfAttentionLayer,
+                           RMSNorm, TanhGate)
 from party.dataset import (collate_null, get_default_transforms,
                            BinnedBaselineDataset, ValidationBaselineDataset,
                            _validation_worker_init_fn)
@@ -73,7 +75,7 @@ def get_parameter_groups(model, config) -> list[dict[str, Any]]:
     """Create parameter groups with discriminative learning rates.
 
     Pretrained group: encoder layers (lower LR)
-    Full-LR group: decoder + fused visual conditioner (base LR)
+    Full-LR group: decoder + adapter + fusion + line_embedding (base LR)
     """
     base_lr = config.lrate
     encoder_params = []
@@ -84,8 +86,13 @@ def get_parameter_groups(model, config) -> list[dict[str, Any]]:
         if p.requires_grad:
             encoder_params.append(p)
 
-    # Visual conditioner params -> base LR
-    for p in model.nn['visual_conditioner'].parameters():
+    # Adapter params -> base LR
+    for p in model.nn['adapter'].parameters():
+        if p.requires_grad:
+            full_lr_params.append(p)
+
+    # Line embedding params -> base LR
+    for p in model.nn['line_embedding'].parameters():
         if p.requires_grad:
             full_lr_params.append(p)
 
@@ -105,6 +112,56 @@ def get_parameter_groups(model, config) -> list[dict[str, Any]]:
     return param_groups
 
 
+class SingleScaleAdapter(nn.Module):
+    """
+    Single-scale adapter used by the original main-branch model.
+    """
+    def __init__(self,
+                 num_layers: int,
+                 num_heads: int,
+                 encoder_embed_dim: int,
+                 decoder_embed_dim: int):
+        super().__init__()
+        mlp_ratio = 4
+        hidden_dim = int(mlp_ratio * encoder_embed_dim)
+        head_dim = encoder_embed_dim // num_heads
+        num_kv_heads = num_heads
+        layers = []
+        for _ in range(num_layers):
+            self_attn = MultiHeadAttention(embed_dim=encoder_embed_dim,
+                                           num_heads=num_heads,
+                                           num_kv_heads=num_heads,
+                                           head_dim=head_dim,
+                                           q_proj=nn.Linear(encoder_embed_dim, num_heads * head_dim, bias=False),
+                                           k_proj=nn.Linear(encoder_embed_dim, num_kv_heads * head_dim, bias=False),
+                                           v_proj=nn.Linear(encoder_embed_dim, num_kv_heads * head_dim, bias=False),
+                                           output_proj=nn.Linear(encoder_embed_dim, encoder_embed_dim, bias=False),
+                                           pos_embeddings=None,
+                                           attn_dropout=0.0,
+                                           is_causal=False)
+
+            mlp = FeedForward(gate_proj=nn.Linear(encoder_embed_dim, hidden_dim),
+                              down_proj=nn.Linear(hidden_dim, encoder_embed_dim),
+                              up_proj=None)
+
+            layer = TransformerSelfAttentionLayer(attn=self_attn,
+                                                  mlp=mlp,
+                                                  sa_norm=RMSNorm(encoder_embed_dim, eps=1e-5),
+                                                  mlp_norm=RMSNorm(encoder_embed_dim, eps=1e-5),
+                                                  sa_scale=TanhGate(),
+                                                  mlp_scale=TanhGate())
+            layers.append(layer)
+        layers.append(nn.Linear(encoder_embed_dim, decoder_embed_dim))
+        self.adapter = nn.Sequential(*layers)
+
+    def forward(self, encoder_hidden_states: Union[torch.Tensor, list[torch.Tensor], tuple[torch.Tensor, ...]]) -> torch.Tensor:
+        if isinstance(encoder_hidden_states, (list, tuple)):
+            if len(encoder_hidden_states) != 1:
+                raise ValueError(f'SingleScaleAdapter expects exactly one encoder feature map, got {len(encoder_hidden_states)}.')
+            encoder_hidden_states = encoder_hidden_states[0]
+        return self.adapter(encoder_hidden_states.flatten(-2).transpose(-1, -2))
+
+
 class ConfigurablePartyModel(nn.Module):
     """
     Training-only party model assembled from explicit component selections.
@@ -112,11 +169,15 @@ class ConfigurablePartyModel(nn.Module):
     def __init__(self,
                  encoder: nn.Module,
                  decoder: nn.Module,
-                 visual_conditioner: nn.Module):
+                 adapter: nn.Module,
+                 line_embedding: nn.Module,
+                 line_embedding_component: str):
         super().__init__()
         self.nn = nn.ModuleDict({'encoder': encoder,
                                  'decoder': decoder,
-                                 'visual_conditioner': visual_conditioner})
+                                 'adapter': adapter,
+                                 'line_embedding': line_embedding})
+        self.line_embedding_component = line_embedding_component
 
     def forward(self,
                 tokens: torch.Tensor,
@@ -129,11 +190,20 @@ class ConfigurablePartyModel(nn.Module):
                 mask: Optional[torch.Tensor] = None,
                 input_pos: Optional[torch.Tensor] = None) -> torch.Tensor:
         if encoder_hidden_states is None and encoder_input is not None:
-            encoder_hidden_states = self.nn['visual_conditioner'](
-                self.nn['encoder'](encoder_input),
-                curves=encoder_curves,
-                boxes=encoder_boxes,
-            )
+            encoder_hidden_states = self.nn['adapter'](self.nn['encoder'](encoder_input))
+
+            if self.line_embedding_component == 'cross_attention':
+                encoder_hidden_states = self.nn['line_embedding'](encoder_features=encoder_hidden_states,
+                                                                  curves=encoder_curves,
+                                                                  boxes=encoder_boxes)
+            elif self.line_embedding_component == 'additive':
+                if encoder_curves is None and encoder_boxes is None:
+                    raise ValueError('One of encoder_curves or encoder_boxes needs to be set.')
+                line_embeddings = self.nn['line_embedding'](curves=encoder_curves,
+                                                            boxes=encoder_boxes)
+                encoder_hidden_states = encoder_hidden_states + line_embeddings.unsqueeze(1)
+            else:
+                raise ValueError(f'Unsupported line embedding component {self.line_embedding_component}.')
 
         return self.nn['decoder'](tokens=tokens,
                                   mask=mask,
@@ -144,22 +214,28 @@ class ConfigurablePartyModel(nn.Module):
 
 def _build_party_model_from_components(config: PartyRecognitionTrainingConfig,
                                        image_size: tuple[int, int]) -> ConfigurablePartyModel:
-    encoder_name = config.encoder_name
-    encoder_out_indices = tuple(int(idx) for idx in config.encoder_out_indices)
+    encoder_name = getattr(config, 'encoder_name', 'convnextv2_base.fcmae_ft_in22k_in1k')
+    encoder_out_indices = tuple(int(idx) for idx in getattr(config, 'encoder_out_indices', (1, 2, 3)))
     if not encoder_out_indices:
         raise ValueError('encoder_out_indices must not be empty.')
 
-    adapter_num_layers = int(config.adapter_num_layers)
-    adapter_num_heads = int(config.adapter_num_heads)
-    adapter_ds_factors = list(config.adapter_ds_factors)
-    prompt_num_samples = int(config.prompt_num_samples)
-    prompt_num_layers = int(config.prompt_num_layers)
-    prompt_num_heads = int(config.prompt_num_heads)
-    prompt_gate_init = float(config.prompt_gate_init)
-    prompt_min_tokens_per_scale = int(config.prompt_min_tokens_per_scale)
+    adapter_component = getattr(config, 'adapter_component', 'multiscale')
+    if adapter_component not in ('multiscale', 'single_scale'):
+        raise ValueError(f'Unsupported adapter component {adapter_component}.')
+    adapter_num_layers = int(getattr(config, 'adapter_num_layers', 1 if adapter_component == 'multiscale' else 4))
+    adapter_num_heads = int(getattr(config, 'adapter_num_heads', 8))
+    adapter_ds_factors = list(getattr(config, 'adapter_ds_factors', [4, 2, 1]))
 
-    decoder_name = config.decoder_name
-    fusion_interval = int(config.fusion_interval)
+    line_embedding_component = getattr(config, 'line_embedding_component', 'cross_attention')
+    if line_embedding_component not in ('cross_attention', 'additive'):
+        raise ValueError(f'Unsupported line embedding component {line_embedding_component}.')
+    prompt_num_samples = int(getattr(config, 'prompt_num_samples', 384))
+    prompt_num_layers = int(getattr(config, 'prompt_num_layers', 2))
+    prompt_num_heads = int(getattr(config, 'prompt_num_heads', 8))
+    prompt_gate_init = float(getattr(config, 'prompt_gate_init', 0.0))
+
+    decoder_name = getattr(config, 'decoder_name', 'mittagessen/bytellama-40m-oscar')
+    fusion_interval = int(getattr(config, 'fusion_interval', 3))
 
     encoder = timm.create_model(encoder_name,
                                 pretrained=True,
@@ -169,32 +245,49 @@ def _build_party_model_from_components(config: PartyRecognitionTrainingConfig,
     encoder_sizes = [(image_size[0] // red, image_size[1] // red)
                      for red in encoder.feature_info.reduction()]
 
-    if len(adapter_ds_factors) != len(encoder_out_indices):
-        raise ValueError('adapter_ds_factors must have the same length as encoder_out_indices.')
+    if adapter_component == 'single_scale':
+        if len(encoder_out_indices) != 1:
+            raise ValueError('single_scale adapter requires exactly one encoder output index.')
+        adapter_seq_len = encoder_sizes[0][0] * encoder_sizes[0][1]
+    else:
+        if len(adapter_ds_factors) != len(encoder_out_indices):
+            raise ValueError('adapter_ds_factors must have the same length as encoder_out_indices for multiscale adapter.')
+        adapter_seq_len = sum((size[0] // ds_factor) * (size[1] // ds_factor)
+                              for size, ds_factor in zip(encoder_sizes, adapter_ds_factors))
 
-    encoder_max_seq_len = prompt_num_samples
+    encoder_max_seq_len = prompt_num_samples if line_embedding_component == 'cross_attention' else adapter_seq_len
     decoder = bytellama_vision_decoder(pretrained=decoder_name,
                                        encoder_max_seq_len=encoder_max_seq_len,
                                        fusion_interval=fusion_interval)
     decoder_embed_dim = decoder.tok_embeddings.embedding_dim
 
-    visual_conditioner = PromptConditionedMultiScaleAdapter(
-        num_layers=adapter_num_layers,
-        num_heads=adapter_num_heads,
-        encoder_embed_dims=encoder_channels,
-        encoder_sizes=encoder_sizes,
-        decoder_embed_dim=decoder_embed_dim,
-        ds_factors=adapter_ds_factors,
-        num_samples=prompt_num_samples,
-        refine_layers=prompt_num_layers,
-        refine_num_heads=prompt_num_heads,
-        gate_init=prompt_gate_init,
-        min_tokens_per_scale=prompt_min_tokens_per_scale,
-    )
+    if adapter_component == 'single_scale':
+        adapter = SingleScaleAdapter(num_layers=adapter_num_layers,
+                                     num_heads=adapter_num_heads,
+                                     encoder_embed_dim=encoder_channels[0],
+                                     decoder_embed_dim=decoder_embed_dim)
+    else:
+        adapter = PartyMultiScaleAdapter(num_layers=adapter_num_layers,
+                                         num_heads=adapter_num_heads,
+                                         encoder_embed_dims=encoder_channels,
+                                         encoder_sizes=encoder_sizes,
+                                         decoder_embed_dim=decoder_embed_dim,
+                                         ds_factors=adapter_ds_factors)
+
+    if line_embedding_component == 'cross_attention':
+        line_embedding = PromptCrossAttention(embed_dim=decoder_embed_dim,
+                                              num_heads=prompt_num_heads,
+                                              num_layers=prompt_num_layers,
+                                              num_samples=prompt_num_samples,
+                                              gate_init=prompt_gate_init)
+    else:
+        line_embedding = PromptEncoder(decoder_embed_dim)
 
     return ConfigurablePartyModel(encoder=encoder,
                                   decoder=decoder,
-                                  visual_conditioner=visual_conditioner)
+                                  adapter=adapter,
+                                  line_embedding=line_embedding,
+                                  line_embedding_component=line_embedding_component)
 
 
 class PartyTextLineDataModule(L.LightningDataModule):
@@ -298,7 +391,7 @@ class PartyRecognitionModel(L.LightningModule):
 
         p_nft = config.noisy_teacher_forcing
         self._target_ntf_p = p_nft
-        self._ntf_warmup_steps = max(0, int(config.noisy_teacher_forcing_warmup or 0))
+        self._ntf_warmup_steps = max(0, int(getattr(config, 'noisy_teacher_forcing_warmup', 0) or 0))
         initial_ntf_p = 0.0 if self._ntf_warmup_steps > 0 else p_nft
         self.noisy_teacher_forcing = nn.Identity() if p_nft == 0. else NoisyTeacherForcing(min_label=OFFSET,
                                                                                            max_label=LANG_OFFSET,
@@ -384,9 +477,11 @@ class PartyRecognitionModel(L.LightningModule):
                                                               image_size=self.trainer.datamodule.hparams.data_config.image_size)
 
             if self.hparams.config.freeze_encoder:
-                for param in self.net.nn['encoder'].parameters():
+                encoder = self.net.nn['encoder'] if hasattr(self.net, 'nn') and 'encoder' in self.net.nn else self.net.encoder
+                adapter = self.net.nn['adapter'] if hasattr(self.net, 'nn') and 'adapter' in self.net.nn else self.net.adapter
+                for param in encoder.parameters():
                     param.requires_grad = False
-                for param in self.net.nn['visual_conditioner'].parameters():
+                for param in adapter.parameters():
                     param.requires_grad = False
 
     def on_save_checkpoint(self, checkpoint):

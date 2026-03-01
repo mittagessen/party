@@ -8,7 +8,7 @@ train:
     - synth_arxiv_train_9k.lst
   evaluation_data:
     - synth_arxiv_val_1k.lst
-  checkpoint_path: /home/mittagessen/party_models/regression_fused_main_components
+  checkpoint_path: /home/mittagessen/foo
   pl_logger: wandb
 
   # text transforms
@@ -16,19 +16,15 @@ train:
   normalize_whitespace: true
   prompt_mode: both
 
-  # fused visual conditioner setup (single encoder stage for comparability)
+  # component-wise model setup (main-like)
   encoder_name: convnextv2_base.fcmae_ft_in22k_in1k
   encoder_out_indices: [2]
   decoder_name: mittagessen/bytellama-40m-oscar
   fusion_interval: 3
+  adapter_component: single_scale
   adapter_num_layers: 4
   adapter_num_heads: 8
-  adapter_ds_factors: [1]
-  prompt_num_samples: 384
-  prompt_num_layers: 2
-  prompt_num_heads: 8
-  prompt_gate_init: 0.0
-  prompt_min_tokens_per_scale: 16
+  line_embedding_component: additive
 
   # training hyperparameters for synthetic convergence checks
   optimizer: AdamW
