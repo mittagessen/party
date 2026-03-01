@@ -116,6 +116,7 @@ class PartyRecognitionTrainingDataConfig(RecognitionTrainingDataConfig):
         self.prompt_mode = kwargs.pop('prompt_mode', 'both')
         self.normalization = kwargs.pop('normalization', None)
         self.normalize_whitespace = kwargs.pop('normalize_whitespace', True)
+        self.prompt_corruption = kwargs.pop('prompt_corruption', False)
 
         kwargs.setdefault('batch_size', 16)
 

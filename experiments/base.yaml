@@ -27,6 +27,7 @@ train:
   label_smoothing: 0.1
   noisy_teacher_forcing: 0.1
   augmentation: true
+  prompt_corruption: true
   validate_before_train: false
   # effective batch size params
   batch_size: 16

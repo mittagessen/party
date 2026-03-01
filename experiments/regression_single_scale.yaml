@@ -30,6 +30,7 @@ train:
   cos_min_lr: 5e-6
   warmup: 500
   augment: false
+  prompt_corruption: false
   batch_size: 16
   val_batch_size: 32
   accumulate_grad_batches: 4

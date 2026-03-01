@@ -28,6 +28,7 @@ train:
   cos_min_lr: 5e-6
   warmup: 5000
   augment: true
+  prompt_corruption: true
   validate_before_train: false
   # effective batch size params
   batch_size: 32

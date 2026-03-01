@@ -120,7 +120,8 @@ class PartyTextLineDataModule(L.LightningDataModule):
         augmentation = None
         if data_config.augment:
             from party.augmentation import Augmenter
-            augmentation = Augmenter(image_size=data_config.image_size)
+            augmentation = Augmenter(image_size=data_config.image_size,
+                                     prompt_corruption=data_config.prompt_corruption)
 
         if data_config.training_data and data_config.evaluation_data:
             self.train_set = BinnedBaselineDataset(data_config.training_data,
