@@ -279,7 +279,6 @@ def train(ctx, **kwargs):
 
     from lightning.pytorch import Trainer
     from lightning.pytorch.callbacks import RichModelSummary, ModelCheckpoint, RichProgressBar
-    from kraken.models import convert_models
     from kraken.train.utils import KrakenOnExceptionCheckpoint
 
     torch.set_float32_matmul_precision('high')
