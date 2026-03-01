@@ -176,11 +176,14 @@ def compile(ctx, **params):
 @click.option('--cos-min-lr',
               type=float,
               help='Minimal final learning rate for cosine LR scheduler.')
+@click.option('--gradient-clip-val', help='Gradient clip value', type=float)
 @click.option('--freeze-encoder/--no-freeze-encoder', help='Switch to freeze the encoder')
+@click.option('--warmup', type=int, help='Number of steps to ramp up to `lrate` initial learning rate.')
 @click.option('--augment/--no-augment', help='Enable image augmentation')
 @click.option('--noisy-teacher-forcing', type=click.FloatRange(0.0, 1.0), help='Probability that each individual target token is altered for NTF.')
 @click.option('--noisy-teacher-forcing-warmup', type=click.IntRange(0), help='Number of optimization steps to ramp up NTF probability.')
 @click.option('--label-smoothing', type=click.FloatRange(0.0, 1.0), help='Amount of label smoothing')
+@click.option('--accumulate-grad-batches', type=int, help='Number of batches to accumulate gradient across.')
 @click.option('-t', '--training-files', 'training_data', multiple=True, type=click.File(mode='r', lazy=True),
               help='File(s) with additional paths to training data')
 @click.option('-e', '--evaluation-files', 'evaluation_data', default=None, multiple=True,
@@ -193,14 +196,23 @@ def compile(ctx, **params):
               help='Sets line prompt sampling mode: `boxes` for boxes only, '
               '`curves` for curves only, and `both` for randomly switching '
               'between boxes and curves.')
+@click.option('--encoder-name',
+              type=str,
+              help='Timm encoder model name.')
 @click.option('--encoder-out-index',
               'encoder_out_indices',
               multiple=True,
               type=click.IntRange(0),
               help='Encoder feature indices to expose. Repeat the option for multiple indices.')
+@click.option('--decoder-name',
+              type=str,
+              help='Decoder checkpoint identifier.')
+@click.option('--fusion-interval',
+              type=click.IntRange(1),
+              help='Insert decoder fusion cross-attention every N layers.')
 @click.option('--adapter-num-layers',
               type=click.IntRange(1),
-              help='Number of adapter transformer layers. Defaults to 4 for single-scale and 1 for multi-scale.')
+              help='Number of per-scale transformer layers in the adapter.')
 @click.option('--adapter-num-heads',
               type=click.IntRange(1),
               help='Number of attention heads in per-scale adapter blocks.')
@@ -209,6 +221,24 @@ def compile(ctx, **params):
               multiple=True,
               type=click.IntRange(1),
               help='Per-scale downsampling factor for the adapter. Repeat once per encoder output index.')
+@click.option('--prompt-num-samples',
+              type=click.IntRange(1),
+              help='Number of learned prompt query slots exposed to the decoder.')
+@click.option('--prompt-num-layers',
+              type=click.IntRange(1),
+              help='Number of prompt cross-attention/self-attention layers.')
+@click.option('--prompt-num-heads',
+              type=click.IntRange(1),
+              help='Number of attention heads in prompt-conditioned layers.')
+@click.option('--prompt-gate-init',
+              type=float,
+              help='Initial value for prompt conditioner residual gates.')
+@click.option('--ctc-aux-weight',
+              type=click.FloatRange(min=0.0),
+              help='Weight of the prompt-side CTC auxiliary loss.')
+@click.option('--ctc-aux-warmup',
+              type=click.IntRange(0),
+              help='Number of steps to ramp the CTC auxiliary loss to full weight.')
 @click.option('--logger',
               'pl_logger',
               type=click.Choice(['tensorboard', 'wandb']),

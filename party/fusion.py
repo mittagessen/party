@@ -19,7 +19,7 @@ import torch
 import logging
 
 from torch import nn
-from typing import Optional, Union
+from typing import Optional
 
 from party.tokenizer import TOKEN_NUM
 from party.modules import (MultiHeadAttention, RMSNorm, TanhGate,
@@ -32,16 +32,7 @@ from party.modules import (MultiHeadAttention, RMSNorm, TanhGate,
 
 logger = logging.getLogger(__name__)
 
-__all__ = ['bytellama_vision_decoder',
-           'default_adapter_ds_factors',
-           'SingleScaleAdapter',
-           'PartyMultiScaleAdapter']
-
-
-def default_adapter_ds_factors(num_scales: int) -> list[int]:
-    if num_scales < 1:
-        raise ValueError('num_scales must be positive.')
-    return [2 ** idx for idx in range(num_scales - 1, -1, -1)]
+__all__ = ['bytellama_vision_decoder', 'PartyMultiScaleAdapter']
 
 
 def bytellama_vision_decoder(vocab_size: int = TOKEN_NUM,
@@ -273,68 +264,3 @@ class PartyMultiScaleAdapter(nn.Module):
             hidden_state = self.adapter[idx](hidden_state)
             outputs.append(self.pos_embeddings[idx](hidden_state))
         return torch.cat(outputs, dim=1)
-
-
-class SingleScaleAdapter(nn.Module):
-    """
-    Single-scale adapter used by the additive prompt baseline.
-    """
-
-    def __init__(
-        self,
-        num_layers: int,
-        num_heads: int,
-        encoder_embed_dim: int,
-        decoder_embed_dim: int,
-    ):
-        super().__init__()
-        mlp_ratio = 4
-        hidden_dim = int(mlp_ratio * encoder_embed_dim)
-        head_dim = encoder_embed_dim // num_heads
-        layers = []
-        for _ in range(num_layers):
-            self_attn = MultiHeadAttention(
-                embed_dim=encoder_embed_dim,
-                num_heads=num_heads,
-                num_kv_heads=num_heads,
-                head_dim=head_dim,
-                q_proj=nn.Linear(encoder_embed_dim, num_heads * head_dim, bias=False),
-                k_proj=nn.Linear(encoder_embed_dim, num_heads * head_dim, bias=False),
-                v_proj=nn.Linear(encoder_embed_dim, num_heads * head_dim, bias=False),
-                output_proj=nn.Linear(encoder_embed_dim, encoder_embed_dim, bias=False),
-                pos_embeddings=None,
-                attn_dropout=0.0,
-                is_causal=False,
-            )
-
-            mlp = FeedForward(
-                gate_proj=nn.Linear(encoder_embed_dim, hidden_dim),
-                down_proj=nn.Linear(hidden_dim, encoder_embed_dim),
-                up_proj=None,
-            )
-
-            layers.append(
-                TransformerSelfAttentionLayer(
-                    attn=self_attn,
-                    mlp=mlp,
-                    sa_norm=RMSNorm(encoder_embed_dim, eps=1e-5),
-                    mlp_norm=RMSNorm(encoder_embed_dim, eps=1e-5),
-                    sa_scale=TanhGate(),
-                    mlp_scale=TanhGate(),
-                )
-            )
-        layers.append(nn.Linear(encoder_embed_dim, decoder_embed_dim))
-        self.adapter = nn.Sequential(*layers)
-
-    def forward(
-        self,
-        encoder_hidden_states: Union[torch.Tensor, list[torch.Tensor], tuple[torch.Tensor, ...]],
-    ) -> torch.Tensor:
-        if isinstance(encoder_hidden_states, (list, tuple)):
-            if len(encoder_hidden_states) != 1:
-                raise ValueError(
-                    'SingleScaleAdapter expects exactly one encoder feature map, '
-                    f'got {len(encoder_hidden_states)}.'
-                )
-            encoder_hidden_states = encoder_hidden_states[0]
-        return self.adapter(encoder_hidden_states.flatten(-2).transpose(-1, -2))
