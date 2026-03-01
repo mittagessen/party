@@ -1,5 +1,54 @@
 from kraken.configs import TrainingConfig, RecognitionTrainingDataConfig, RecognitionInferenceConfig
 
+MODEL_VARIANTS = {
+    'base_single_scale': {
+        'encoder': {
+            'name': 'convnextv2_base.fcmae_ft_in22k_in1k',
+            'out_indices': (2,),
+        },
+        'decoder': {
+            'name': 'mittagessen/bytellama-40m-oscar',
+            'embed_dim': 576,
+            'num_heads': 9,
+            'num_kv_heads': 3,
+            'num_layers': 30,
+            'intermediate_dim': 1536,
+        },
+        'adapter': {
+            'ds_factors': (1,),
+            'num_layers': 4,
+            'num_heads': 8,
+        },
+        'fusion_interval': 3,
+    },
+    'base_multi_scale': {
+        'encoder': {
+            'name': 'convnextv2_base.fcmae_ft_in22k_in1k',
+            'out_indices': (1, 2, 3),
+        },
+        'decoder': {
+            'name': 'mittagessen/bytellama-40m-oscar',
+            'embed_dim': 576,
+            'num_heads': 9,
+            'num_kv_heads': 3,
+            'num_layers': 30,
+            'intermediate_dim': 1536,
+        },
+        'adapter': {
+            'ds_factors': (4, 2, 1),
+            'num_layers': 1,
+            'num_heads': 8,
+        },
+        'fusion_interval': 3,
+    },
+}
+
+
+def get_model_variant(name: str) -> dict:
+    if name not in MODEL_VARIANTS:
+        raise ValueError(f'Unknown model variant {name!r}. Available: {list(MODEL_VARIANTS)}')
+    return MODEL_VARIANTS[name]
+
 
 class PartyRecognitionInferenceConfig(RecognitionInferenceConfig):
     """
@@ -32,32 +81,7 @@ class PartyRecognitionTrainingConfig(TrainingConfig):
     Args:
     """
     def __init__(self, **kwargs):
-        self.encoder_name = kwargs.pop('encoder_name', 'convnextv2_base.fcmae_ft_in22k_in1k')
-        self.encoder_out_indices = tuple(kwargs.pop('encoder_out_indices', (1, 2, 3)))
-        if not self.encoder_out_indices:
-            raise ValueError('encoder_out_indices must not be empty.')
-
-        self.decoder_name = kwargs.pop('decoder_name', 'mittagessen/bytellama-40m-oscar')
-        self.fusion_interval = kwargs.pop('fusion_interval', 3)
-
-        self.adapter_component = kwargs.pop('adapter_component', 'multiscale')
-        if self.adapter_component not in ('multiscale', 'single_scale'):
-            raise ValueError(f'Invalid adapter component {self.adapter_component}. Use one of: multiscale, single_scale.')
-        self.adapter_num_layers = kwargs.pop('adapter_num_layers', 1 if self.adapter_component == 'multiscale' else 4)
-        self.adapter_num_heads = kwargs.pop('adapter_num_heads', 8)
-        self.adapter_ds_factors = list(kwargs.pop('adapter_ds_factors', [4, 2, 1]))
-        if self.adapter_component == 'multiscale' and len(self.adapter_ds_factors) != len(self.encoder_out_indices):
-            raise ValueError('adapter_ds_factors must have the same length as encoder_out_indices for multiscale adapter.')
-        if self.adapter_component == 'single_scale' and len(self.encoder_out_indices) != 1:
-            raise ValueError('single_scale adapter requires exactly one entry in encoder_out_indices.')
-
-        self.line_embedding_component = kwargs.pop('line_embedding_component', 'cross_attention')
-        if self.line_embedding_component not in ('cross_attention', 'additive'):
-            raise ValueError(f'Invalid line embedding component {self.line_embedding_component}. Use one of: cross_attention, additive.')
-        self.prompt_num_samples = kwargs.pop('prompt_num_samples', 384)
-        self.prompt_num_layers = kwargs.pop('prompt_num_layers', 2)
-        self.prompt_num_heads = kwargs.pop('prompt_num_heads', 8)
-        self.prompt_gate_init = kwargs.pop('prompt_gate_init', 0.0)
+        self.model_variant = kwargs.pop('model_variant', 'base_single_scale')
 
         self.freeze_encoder = kwargs.pop('freeze_encoder', False)
         self.train_from_scratch = kwargs.pop('train_from_scratch', False)

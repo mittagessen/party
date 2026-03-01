@@ -16,15 +16,8 @@ train:
   normalize_whitespace: true
   prompt_mode: both
 
-  # component-wise model setup (main-like)
-  encoder_name: convnextv2_base.fcmae_ft_in22k_in1k
-  encoder_out_indices: [2]
-  decoder_name: mittagessen/bytellama-40m-oscar
-  fusion_interval: 3
-  adapter_component: single_scale
-  adapter_num_layers: 4
-  adapter_num_heads: 8
-  line_embedding_component: additive
+  # model variant
+  model_variant: base_single_scale
 
   # training hyperparameters for synthetic convergence checks
   optimizer: AdamW
