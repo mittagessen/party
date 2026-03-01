@@ -1,14 +1,14 @@
 precision: bf16-mixed
 device: auto
-num_workers: 4
+num_workers: 8
 num_threads: 1
 train:
   train_from_scratch: true
   training_data:
-    - /home/mittagessen/party_dataset/synth_arxiv_train_9k.lst
+    - synth_arxiv_train_9k.lst
   evaluation_data:
-    - /home/mittagessen/party_dataset/synth_arxiv_val_1k.lst
-  checkpoint_path: /home/mittagessen/party_models/regression_partyv2_step1_cross_attention_open_gates_ctc
+    - synth_arxiv_val_1k.lst
+  checkpoint_path: /home/mittagessen/party_models/regression_locator_reader_main_components
   pl_logger: wandb
 
   # text transforms
@@ -16,7 +16,7 @@ train:
   normalize_whitespace: true
   prompt_mode: both
 
-  # open-gated cross-attention prompt conditioner + CTC auxiliary loss
+  # locator-reader visual conditioner setup (single encoder stage for comparability)
   encoder_name: convnextv2_base.fcmae_ft_in22k_in1k
   encoder_out_indices: [2]
   decoder_name: mittagessen/bytellama-40m-oscar
@@ -24,13 +24,14 @@ train:
   adapter_num_layers: 4
   adapter_num_heads: 8
   adapter_ds_factors: [1]
-  prompt_num_samples: 384
+  locator_num_tokens: 8
+  reader_num_tokens: 128
+  global_num_tokens: 8
+  conditioner_num_rounds: 2
   prompt_num_layers: 2
   prompt_num_heads: 8
-  prompt_gate_init: 1.0
-  ctc_aux_weight: 0.1
-  ctc_aux_warmup: 1000
 
+  # training hyperparameters for synthetic convergence checks
   optimizer: AdamW
   epochs: 8
   lrate: 5e-4
@@ -40,7 +41,7 @@ train:
   cos_t_max: 8
   cos_min_lr: 5e-6
   warmup: 500
-  augment: false
+  augment: true
   batch_size: 16
   val_batch_size: 32
   accumulate_grad_batches: 4

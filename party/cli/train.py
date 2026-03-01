@@ -212,7 +212,7 @@ def compile(ctx, **params):
               help='Insert decoder fusion cross-attention every N layers.')
 @click.option('--adapter-num-layers',
               type=click.IntRange(1),
-              help='Number of per-scale transformer layers in the adapter.')
+              help='Number of per-scale transformer layers in the conditioned multi-scale adapter.')
 @click.option('--adapter-num-heads',
               type=click.IntRange(1),
               help='Number of attention heads in per-scale adapter blocks.')
@@ -220,25 +220,28 @@ def compile(ctx, **params):
               'adapter_ds_factors',
               multiple=True,
               type=click.IntRange(1),
-              help='Per-scale downsampling factor for the adapter. Repeat once per encoder output index.')
-@click.option('--prompt-num-samples',
+              help='Per-scale downsampling factor for the conditioned multi-scale adapter. Repeat once per encoder output index.')
+@click.option('--locator-num-tokens',
               type=click.IntRange(1),
-              help='Number of learned prompt query slots exposed to the decoder.')
+              help='Number of prompt-seeded locator latents that find line support over the full page bank.')
+@click.option('--reader-num-tokens',
+              type=click.IntRange(1),
+              help='Number of ordered reader latents exposed to the decoder.')
+@click.option('--global-num-tokens',
+              type=click.IntRange(0),
+              help='Number of optional global summary latents appended to the reader memory.')
+@click.option('--conditioner-num-rounds',
+              type=click.IntRange(1),
+              help='Number of locator-reader rereading rounds over the full page bank.')
 @click.option('--prompt-num-layers',
               type=click.IntRange(1),
-              help='Number of prompt cross-attention/self-attention layers.')
+              help='Number of refinement layers over the final latent memory.')
 @click.option('--prompt-num-heads',
               type=click.IntRange(1),
-              help='Number of attention heads in prompt-conditioned layers.')
-@click.option('--prompt-gate-init',
-              type=float,
-              help='Initial value for prompt conditioner residual gates.')
-@click.option('--ctc-aux-weight',
-              type=click.FloatRange(min=0.0),
-              help='Weight of the prompt-side CTC auxiliary loss.')
-@click.option('--ctc-aux-warmup',
-              type=click.IntRange(0),
-              help='Number of steps to ramp the CTC auxiliary loss to full weight.')
+              help='Number of attention heads in prompt-conditioned refinement layers.')
+@click.option('--conditioner-attn-dropout',
+              type=click.FloatRange(min=0.0, max=1.0),
+              help='Attention dropout rate for the conditioner cross- and self-attention layers.')
 @click.option('--logger',
               'pl_logger',
               type=click.Choice(['tensorboard', 'wandb']),
