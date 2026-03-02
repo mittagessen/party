@@ -290,6 +290,9 @@ class MultiHeadAttention(nn.Module):
             k = k.view(b, s_y, -1, self.head_dim)
             v = v.view(b, s_y, -1, self.head_dim)
 
+            if self.pos_embeddings is not None:
+                k = self.pos_embeddings(k, input_pos=input_pos)
+
             # k,v shape: [b, n_kv, s_y, h_d]
             k = k.transpose(1, 2)
             v = v.transpose(1, 2)
