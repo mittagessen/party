@@ -371,6 +371,8 @@ def train(ctx, **kwargs):
         else:
             trainer.fit(model, data_module)
 
+    from kraken.models import convert_models
+
     score = checkpoint_callback.best_model_score.item()
     weight_path = Path(checkpoint_callback.best_model_path).with_name(f'best_{score:.4f}.{params.get("weights_format")}')
     opath = convert_models([checkpoint_callback.best_model_path], weight_path, weights_format=params['weights_format'])
