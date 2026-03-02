@@ -1,27 +1,50 @@
 from kraken.configs import TrainingConfig, RecognitionTrainingDataConfig, RecognitionInferenceConfig
 
 MODEL_VARIANTS = {
-    'base_single_scale': {
+    # Tiny: ~10M LM params, ConvNeXt v2 Nano encoder (~15.6M)
+    'tiny': {
         'encoder': {
-            'name': 'convnextv2_base.fcmae_ft_in22k_in1k',
-            'out_indices': (2,),
+            'name': 'convnextv2_nano.fcmae_ft_in22k_in1k',
+            'out_indices': (1, 2, 3),
         },
         'decoder': {
-            'name': 'mittagessen/bytellama-40m-oscar',
-            'embed_dim': 576,
-            'num_heads': 9,
-            'num_kv_heads': 3,
-            'num_layers': 30,
-            'intermediate_dim': 1536,
+            'name': None,
+            'embed_dim': 192,
+            'num_heads': 6,
+            'num_kv_heads': 2,
+            'num_layers': 18,
+            'intermediate_dim': 512,
         },
         'adapter': {
-            'ds_factors': (1,),
-            'num_layers': 4,
+            'ds_factors': (4, 2, 1),
+            'num_layers': 1,
             'num_heads': 8,
         },
         'fusion_interval': 3,
     },
-    'base_multi_scale': {
+    # Small: ~21M LM params, ConvNeXt v2 Tiny encoder (~28.6M)
+    'small': {
+        'encoder': {
+            'name': 'convnextv2_tiny.fcmae_ft_in22k_in1k',
+            'out_indices': (1, 2, 3),
+        },
+        'decoder': {
+            'name': None,
+            'embed_dim': 288,
+            'num_heads': 9,
+            'num_kv_heads': 3,
+            'num_layers': 18,
+            'intermediate_dim': 768,
+        },
+        'adapter': {
+            'ds_factors': (4, 2, 1),
+            'num_layers': 1,
+            'num_heads': 8,
+        },
+        'fusion_interval': 3,
+    },
+    # Base: ~40M LM params (pretrained), ConvNeXt v2 Base encoder (~89M)
+    'base': {
         'encoder': {
             'name': 'convnextv2_base.fcmae_ft_in22k_in1k',
             'out_indices': (1, 2, 3),
@@ -37,6 +60,27 @@ MODEL_VARIANTS = {
         'adapter': {
             'ds_factors': (4, 2, 1),
             'num_layers': 1,
+            'num_heads': 8,
+        },
+        'fusion_interval': 3,
+    },
+    # Large: ~164M LM params, ConvNeXt v2 Large encoder (~198M)
+    'large': {
+        'encoder': {
+            'name': 'convnextv2_large.fcmae_ft_in22k_in1k',
+            'out_indices': (1, 2, 3),
+        },
+        'decoder': {
+            'name': None,
+            'embed_dim': 768,
+            'num_heads': 12,
+            'num_kv_heads': 4,
+            'num_layers': 24,
+            'intermediate_dim': 2048,
+        },
+        'adapter': {
+            'ds_factors': (4, 2, 1),
+            'num_layers': 2,
             'num_heads': 8,
         },
         'fusion_interval': 3,
@@ -81,7 +125,7 @@ class PartyRecognitionTrainingConfig(TrainingConfig):
     Args:
     """
     def __init__(self, **kwargs):
-        self.model_variant = kwargs.pop('model_variant', 'base_single_scale')
+        self.model_variant = kwargs.pop('model_variant', 'base')
 
         self.freeze_encoder = kwargs.pop('freeze_encoder', False)
         self.train_from_scratch = kwargs.pop('train_from_scratch', False)

@@ -32,7 +32,7 @@ from party.modules import (MultiHeadAttention, RMSNorm, TanhGate,
 
 logger = logging.getLogger(__name__)
 
-__all__ = ['bytellama_vision_decoder', 'PartyMultiScaleAdapter']
+__all__ = ['bytellama_vision_decoder', 'PartyAdapter']
 
 
 def bytellama_vision_decoder(vocab_size: int = TOKEN_NUM,
@@ -184,10 +184,10 @@ def bytellama_vision_decoder(vocab_size: int = TOKEN_NUM,
     return decoder
 
 
-class PartyMultiScaleAdapter(nn.Module):
+class PartyAdapter(nn.Module):
     """
-    Multi-scale adapter head that processes features from multiple encoder
-    stages independently, then concatenates them into a single sequence.
+    Adapter head that processes features from multiple encoder stages
+    independently, then concatenates them into a single sequence.
 
     Args:
         num_layers: Number of self-attention layers per scale.

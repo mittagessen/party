@@ -200,7 +200,7 @@ def compile(ctx, **params):
 @click.option('--model-variant',
               type=str,
               default=None,
-              help='Named model variant (e.g. base_single_scale, base_multi_scale).')
+              help='Named model variant (e.g. tiny, small, base, large).')
 @click.option('--logger',
               'pl_logger',
               type=click.Choice(['tensorboard', 'wandb']),

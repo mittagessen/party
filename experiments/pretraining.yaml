@@ -12,12 +12,13 @@ train:
     - /home/bkiessling/party_val.lst
   # directory to save checkpoints in
   checkpoint_path: /home/bkiessling/experiments/base_partyv2
+  # model variant
+  model_variant: base
   # text transforms
   normalization: NFD
   normalize_whitespace: true
   # whether to train on bbox, baseline, or both line prompts
   prompt_mode: both
-  prompt_num_samples: 384
   # base configuration of training epochs and LR schedule
   optimizer: AdamW
   epochs: 12
@@ -26,15 +27,15 @@ train:
   schedule: cosine
   cos_t_max: 12
   cos_min_lr: 5e-6
-  warmup: 5000
+  warmup: 1000
   augment: true
-  prompt_corruption: true
+  prompt_corruption: false 
   validate_before_train: false
   # effective batch size params
   batch_size: 32
   val_batch_size: 64
   accumulate_grad_batches: 8
-  noisy_teacher_forcing: 0.02
+  noisy_teacher_forcing: 0.01
   noisy_teacher_forcing_warmup: 10000
   label_smoothing: 0.0
   pl_logger: wandb
