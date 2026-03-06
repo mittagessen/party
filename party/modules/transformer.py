@@ -234,16 +234,8 @@ class DeformableCrossAttention(nn.Module):
     ) -> torch.Tensor:
         bsz, seq_len, _ = x.shape
         shapes = self._as_spatial_shapes(encoder_spatial_shapes, device=x.device)
-        if shapes.shape[0] != self.num_levels:
-            raise ValueError(f'Expected {self.num_levels} levels, got {shapes.shape[0]}.')
-        total_tokens = int((shapes[:, 0] * shapes[:, 1]).sum().item())
-        if encoder_input.shape[1] != total_tokens:
-            raise ValueError(
-                f'encoder_input has {encoder_input.shape[1]} tokens but '
-                f'encoder_spatial_shapes sum to {total_tokens}.'
-            )
 
-        values = self.v_proj(encoder_input).view(bsz, total_tokens, self.num_heads, self.head_dim)
+        values = self.v_proj(encoder_input).view(bsz, -1, self.num_heads, self.head_dim)
 
         refs = self._prepare_reference_points(x, encoder_reference_points)
         ref_mix = self.reference_weights(x).view(bsz, seq_len, self.num_heads, self.num_reference_points)
