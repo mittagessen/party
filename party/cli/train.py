@@ -367,7 +367,7 @@ def train(ctx, **kwargs):
 
     with threadpool_limits(limits=ctx.meta['num_threads']):
         if resume:
-            trainer.fit(model, data_module, ckpt_path=resume)
+            trainer.fit(model, data_module, ckpt_path=resume, weights_only=False)
         else:
             trainer.fit(model, data_module)
 
