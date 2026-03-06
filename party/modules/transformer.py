@@ -176,7 +176,13 @@ class DeformableCrossAttention(nn.Module):
         self.sampling_offsets = nn.Linear(embed_dim, num_heads * num_levels * num_points * 2)
         self.attention_weights = nn.Linear(embed_dim, num_heads * num_levels * num_points)
         self.reference_weights = nn.Linear(embed_dim, num_heads * num_reference_points)
-        self.default_reference_points = nn.Parameter(torch.zeros(num_reference_points, 2))
+        # Fallback anchors when no prompt geometry is provided.
+        # Keep these non-trainable to avoid DDP unused-parameter errors in the
+        # common path where explicit reference points are always supplied.
+        self.default_reference_points = nn.Parameter(
+            torch.zeros(num_reference_points, 2),
+            requires_grad=False,
+        )
         nn.init.uniform_(self.default_reference_points, 0.1, 0.9)
 
     @staticmethod
