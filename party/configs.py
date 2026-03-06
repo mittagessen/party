@@ -8,7 +8,7 @@ MODEL_VARIANTS = {
             'out_indices': (1, 2, 3),
         },
         'decoder': {
-            'name': None,
+            'name': 'bytellama-7m-cc',
             'embed_dim': 192,
             'num_heads': 6,
             'num_kv_heads': 2,
@@ -32,7 +32,7 @@ MODEL_VARIANTS = {
             'out_indices': (1, 2, 3),
         },
         'decoder': {
-            'name': None,
+            'name': 'bytellama-16m-cc',
             'embed_dim': 288,
             'num_heads': 9,
             'num_kv_heads': 3,
