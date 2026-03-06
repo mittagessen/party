@@ -357,7 +357,7 @@ def train(ctx, **kwargs):
                 model = PartyRecognitionModel.load_from_repo(load, config=m_config)
         elif resume:
             message(f'Resuming from checkpoint {resume}.')
-            model = PartyRecognitionModel.load_from_checkpoint(resume)
+            model = PartyRecognitionModel.load_from_checkpoint(resume, weights_only=False)
 
     try:
         (entry_point,) = importlib.metadata.entry_points(group='kraken.writers', name=params['weights_format'])
