@@ -31,7 +31,7 @@ from typing import Optional, Union, TYPE_CHECKING, Any
 from party.modules import PromptEncoder
 from party.tokenizer import OctetTokenizer
 from party.configs import get_model_variant
-from party.fusion import PartyAdapter, bytellama_vision_decoder
+from party.fusion import PartyHybridNeck, bytellama_vision_decoder
 from party.dataset import get_default_transforms, _to_curve, _to_bbox
 
 if TYPE_CHECKING:
@@ -79,14 +79,21 @@ def _baseline_to_bbox(line: 'BaselineLine') -> 'BBoxLine':
 def _build_adapter(variant, encoder_channels, encoder_sizes, decoder_embed_dim):
     """Returns (adapter_module, adapter_seq_len)."""
     adapter_cfg = variant['adapter']
-    adapter = PartyAdapter(num_layers=adapter_cfg['num_layers'],
-                           num_heads=adapter_cfg['num_heads'],
-                           encoder_embed_dims=encoder_channels,
-                           encoder_sizes=encoder_sizes,
-                           decoder_embed_dim=decoder_embed_dim,
-                           ds_factors=list(adapter_cfg['ds_factors']))
-    seq_len = sum((size[0] // ds) * (size[1] // ds)
-                  for size, ds in zip(encoder_sizes, adapter_cfg['ds_factors']))
+    ds_factors = list(adapter_cfg['output_ds_factors'])
+    adapter = PartyHybridNeck(
+        encoder_embed_dims=encoder_channels,
+        encoder_sizes=encoder_sizes,
+        decoder_embed_dim=decoder_embed_dim,
+        hidden_dim=adapter_cfg.get('hidden_dim', 256),
+        num_heads=adapter_cfg.get('num_heads', 8),
+        num_encoder_layers=adapter_cfg.get('num_encoder_layers', 1),
+        use_encoder_idx=adapter_cfg.get('use_encoder_idx', None),
+        output_ds_factors=ds_factors,
+        dim_feedforward=adapter_cfg.get('dim_feedforward', 1024),
+        fusion_depth=adapter_cfg.get('fusion_depth', 2),
+    )
+    seq_len = sum((h // ds) * (w // ds)
+                  for (h, w), ds in zip(encoder_sizes, ds_factors))
     return adapter, seq_len
 
 
@@ -128,7 +135,7 @@ class PartyModel(nn.Module, RecognitionBaseModel):
         # 2. Compute adapter seq len for decoder cross-attention
         adapter_cfg = variant['adapter']
         adapter_seq_len = sum((size[0] // ds) * (size[1] // ds)
-                             for size, ds in zip(encoder_sizes, adapter_cfg['ds_factors']))
+                             for size, ds in zip(encoder_sizes, adapter_cfg['output_ds_factors']))
         self.encoder_max_seq_len = adapter_seq_len
 
         # 3. Build decoder
