@@ -32,7 +32,7 @@ class FusionLayer(nn.Module):
         >>> model = TransformerDecoder(layers=layer, num_layers=32, ...)
         >>>
         >>> # Fuse a cross attention layer to each self attention layer to adapt for the encoder
-        >>> fusion_layer = nn.TransformerCrossAttentionLayer(...)
+        >>> fusion_layer = nn.TransformerDeformableCrossAttentionLayer(...)
         >>> fused_layer = FusionLayer(layer, fusion_layer)
         >>> model = TransformerDecoder(layers=fused_layer, num_layers=32, ...)
         >>>

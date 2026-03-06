@@ -134,8 +134,10 @@ class PartyModel(nn.Module, RecognitionBaseModel):
 
         # 2. Compute adapter seq len for decoder cross-attention
         adapter_cfg = variant['adapter']
-        adapter_seq_len = sum((size[0] // ds) * (size[1] // ds)
-                             for size, ds in zip(encoder_sizes, adapter_cfg['output_ds_factors']))
+        output_ds_factors = list(adapter_cfg['output_ds_factors'])
+        self.encoder_spatial_shapes = [(size[0] // ds, size[1] // ds)
+                                       for size, ds in zip(encoder_sizes, output_ds_factors)]
+        adapter_seq_len = sum(h * w for h, w in self.encoder_spatial_shapes)
         self.encoder_max_seq_len = adapter_seq_len
 
         # 3. Build decoder
@@ -147,7 +149,10 @@ class PartyModel(nn.Module, RecognitionBaseModel):
             embed_dim=variant['decoder']['embed_dim'],
             intermediate_dim=variant['decoder']['intermediate_dim'],
             encoder_max_seq_len=adapter_seq_len,
-            fusion_interval=variant['fusion_interval'])
+            encoder_spatial_shapes=self.encoder_spatial_shapes,
+            fusion_interval=variant['fusion_interval'],
+            deformable_num_points=variant['decoder'].get('deformable_num_points', 20),
+            deformable_offset_scale=variant['decoder'].get('deformable_offset_scale', 4.0))
         decoder_embed_dim = decoder.tok_embeddings.embedding_dim
 
         # 4. Build adapter
@@ -173,7 +178,7 @@ class PartyModel(nn.Module, RecognitionBaseModel):
         Sets up key-value attention caches for inference for ``self.decoder``.
         For each layer in ``self.decoder.layers``:
         - :class:`party.modules.TransformerSelfAttentionLayer` will use ``decoder_max_seq_len``.
-        - :class:`party.modules.TransformerCrossAttentionLayer` will use ``encoder_max_seq_len``.
+        - :class:`party.modules.TransformerDeformableCrossAttentionLayer` will use cached encoder features.
         - :class:`party.modules.fusion.FusionLayer` will use both ``decoder_max_seq_len`` and ``encoder_max_seq_len``.
 
         Args:
@@ -260,6 +265,7 @@ class PartyModel(nn.Module, RecognitionBaseModel):
         # During decoding, encoder_input will only be provided
         # for new inputs. Previous encoder outputs are cached
         # in the decoder cache.
+        encoder_reference_points = encoder_curves if encoder_curves is not None else encoder_boxes
         if encoder_input is not None:
             adapter_output = self.forward_encoder_embeddings(encoder_input)
             line_embeddings = self.nn['line_embedding'](curves=encoder_curves,
@@ -270,6 +276,8 @@ class PartyModel(nn.Module, RecognitionBaseModel):
                                     mask=mask,
                                     encoder_input=encoder_hidden_states,
                                     encoder_mask=encoder_mask,
+                                    encoder_spatial_shapes=self.encoder_spatial_shapes,
+                                    encoder_reference_points=encoder_reference_points,
                                     input_pos=input_pos)
         return output
 
@@ -485,6 +493,8 @@ class PartyModel(nn.Module, RecognitionBaseModel):
             curr_masks = masks[:, :_prompt_length]
             logits = self.forward(tokens=_prompt[:bsz, ...],
                                   encoder_hidden_states=encoder_hidden_states,
+                                  encoder_curves=batch if curves is not None else None,
+                                  encoder_boxes=batch if boxes is not None else None,
                                   encoder_mask=encoder_mask[:bsz, ...],
                                   mask=curr_masks,
                                   input_pos=input_pos[:, :_prompt_length].squeeze())

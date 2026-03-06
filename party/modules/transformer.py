@@ -4,10 +4,11 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 import copy
-from typing import Callable, Dict, List, Optional, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 from .attention import MultiHeadAttention
 
 
@@ -131,22 +132,175 @@ class TransformerSelfAttentionLayer(nn.Module):
         return out
 
 
-class TransformerCrossAttentionLayer(nn.Module):
+class DeformableCrossAttention(nn.Module):
     """
-    Cross attention Transformer layer following the same conventions as the TransformerSelfAttentionLayer.
-    Normalization is applied before the attention **and** FF layer.
+    Multi-scale deformable cross-attention operating on flattened encoder
+    tokens with known per-level spatial shapes.
 
     Args:
-        attn (MultiHeadAttention): Attention module.
-        mlp (nn.Module): Feed-forward module.
-        ca_norm (Optional[nn.Module]): Normalization to be applied before cross-attention.
-        mlp_norm (Optional[nn.Module]): Normalization to be applied before the feed-forward layer.
-        ca_scale (Optional[nn.Module]): Module to scale cross-attention output.
-        mlp_scale (Optional[nn.Module]): Module to scale the feed-forward output.
+        embed_dim (int): model embedding dimension.
+        num_heads (int): number of query heads.
+        num_levels (int): number of encoder feature levels.
+        num_points (int): sampled points per level and head.
+        num_reference_points (int): geometry reference points per sample.
+        offset_scale (float): maximum offset magnitude in pixels.
     """
     def __init__(
         self,
-        attn: MultiHeadAttention,
+        *,
+        embed_dim: int,
+        num_heads: int,
+        num_levels: int,
+        num_points: int = 20,
+        num_reference_points: int = 4,
+        offset_scale: float = 4.0,
+    ) -> None:
+        super().__init__()
+        if embed_dim % num_heads != 0:
+            raise ValueError('embed_dim must be divisible by num_heads')
+        if num_points < 1:
+            raise ValueError('num_points must be >= 1')
+        if num_reference_points < 1:
+            raise ValueError('num_reference_points must be >= 1')
+
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.num_levels = num_levels
+        self.num_points = num_points
+        self.num_reference_points = num_reference_points
+        self.offset_scale = float(offset_scale)
+        self.head_dim = embed_dim // num_heads
+
+        self.v_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.sampling_offsets = nn.Linear(embed_dim, num_heads * num_levels * num_points * 2)
+        self.attention_weights = nn.Linear(embed_dim, num_heads * num_levels * num_points)
+        self.reference_weights = nn.Linear(embed_dim, num_heads * num_reference_points)
+        self.default_reference_points = nn.Parameter(torch.zeros(num_reference_points, 2))
+        nn.init.uniform_(self.default_reference_points, 0.1, 0.9)
+
+    @staticmethod
+    def _as_spatial_shapes(
+        spatial_shapes: Union[torch.Tensor, List[Tuple[int, int]], Tuple[Tuple[int, int], ...]],
+        *,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if isinstance(spatial_shapes, torch.Tensor):
+            shapes = spatial_shapes.to(device=device, dtype=torch.long)
+        else:
+            shapes = torch.tensor(spatial_shapes, device=device, dtype=torch.long)
+        if shapes.ndim != 2 or shapes.shape[1] != 2:
+            raise ValueError('encoder_spatial_shapes must have shape [num_levels, 2].')
+        return shapes
+
+    def _prepare_reference_points(
+        self,
+        x: torch.Tensor,
+        reference_points: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        bsz, seq_len, _ = x.shape
+        if reference_points is None:
+            refs = self.default_reference_points.sigmoid().view(1, 1, self.num_reference_points, 2)
+            refs = refs.expand(bsz, seq_len, -1, -1)
+        else:
+            if reference_points.ndim == 3:
+                refs = reference_points[:, None, :, :]
+            elif reference_points.ndim == 4:
+                refs = reference_points
+            else:
+                raise ValueError('encoder_reference_points must have shape [b, r, 2] or [b, s, r, 2].')
+            if refs.shape[0] != bsz:
+                raise ValueError('encoder_reference_points batch size must match query batch size.')
+            if refs.shape[1] == 1 and seq_len > 1:
+                refs = refs.expand(-1, seq_len, -1, -1)
+            elif refs.shape[1] != seq_len:
+                raise ValueError('encoder_reference_points sequence dimension must be 1 or match query length.')
+            if refs.shape[2] != self.num_reference_points:
+                if refs.shape[2] > self.num_reference_points:
+                    refs = refs[:, :, :self.num_reference_points, :]
+                else:
+                    pad = refs[:, :, -1:, :].expand(-1, -1, self.num_reference_points - refs.shape[2], -1)
+                    refs = torch.cat([refs, pad], dim=2)
+            refs = refs.clamp(0.0, 1.0)
+        return refs.to(dtype=x.dtype)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        encoder_input: torch.Tensor,
+        *,
+        encoder_spatial_shapes: Union[torch.Tensor, List[Tuple[int, int]], Tuple[Tuple[int, int], ...]],
+        encoder_reference_points: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        bsz, seq_len, _ = x.shape
+        shapes = self._as_spatial_shapes(encoder_spatial_shapes, device=x.device)
+        if shapes.shape[0] != self.num_levels:
+            raise ValueError(f'Expected {self.num_levels} levels, got {shapes.shape[0]}.')
+        total_tokens = int((shapes[:, 0] * shapes[:, 1]).sum().item())
+        if encoder_input.shape[1] != total_tokens:
+            raise ValueError(
+                f'encoder_input has {encoder_input.shape[1]} tokens but '
+                f'encoder_spatial_shapes sum to {total_tokens}.'
+            )
+
+        values = self.v_proj(encoder_input).view(bsz, total_tokens, self.num_heads, self.head_dim)
+
+        refs = self._prepare_reference_points(x, encoder_reference_points)
+        ref_mix = self.reference_weights(x).view(bsz, seq_len, self.num_heads, self.num_reference_points)
+        ref_mix = torch.softmax(ref_mix, dim=-1)
+        anchors = (ref_mix[..., None] * refs[:, :, None, :, :]).sum(dim=-2)
+
+        offsets = self.sampling_offsets(x).view(
+            bsz, seq_len, self.num_heads, self.num_levels, self.num_points, 2
+        )
+        attn_weights = self.attention_weights(x).view(
+            bsz, seq_len, self.num_heads, self.num_levels * self.num_points
+        )
+        attn_weights = torch.softmax(attn_weights, dim=-1).view(
+            bsz, seq_len, self.num_heads, self.num_levels, self.num_points
+        )
+
+        out = torch.zeros((bsz, seq_len, self.num_heads, self.head_dim), device=x.device, dtype=x.dtype)
+        start = 0
+        for lvl_idx, (height, width) in enumerate(shapes.tolist()):
+            level_tokens = height * width
+            level_vals = values[:, start:start + level_tokens]
+            start += level_tokens
+
+            level_vals = level_vals.view(bsz, height, width, self.num_heads, self.head_dim)
+            level_vals = level_vals.permute(0, 3, 4, 1, 2).reshape(bsz * self.num_heads, self.head_dim, height, width)
+
+            lvl_offsets = offsets[:, :, :, lvl_idx]
+            normalizer = torch.tensor([max(width, 1), max(height, 1)],
+                                      device=x.device,
+                                      dtype=x.dtype).view(1, 1, 1, 1, 2)
+            lvl_locs = anchors[:, :, :, None, :] + torch.tanh(lvl_offsets) * (self.offset_scale / normalizer)
+            lvl_grid = lvl_locs.clamp(0.0, 1.0).mul(2.0).sub(1.0)
+            lvl_grid = lvl_grid.permute(0, 2, 1, 3, 4).reshape(bsz * self.num_heads, seq_len, self.num_points, 2)
+
+            sampled = F.grid_sample(
+                level_vals,
+                lvl_grid,
+                mode='bilinear',
+                padding_mode='zeros',
+                align_corners=False,
+            )
+            sampled = sampled.view(bsz, self.num_heads, self.head_dim, seq_len, self.num_points)
+            sampled = sampled.permute(0, 3, 1, 4, 2)
+            weights = attn_weights[:, :, :, lvl_idx, :].unsqueeze(-1)
+            out = out + (sampled * weights).sum(dim=3)
+
+        out = out.view(bsz, seq_len, self.embed_dim)
+        return self.out_proj(out)
+
+
+class TransformerDeformableCrossAttentionLayer(nn.Module):
+    """
+    Cross-attention transformer layer using multi-scale deformable attention.
+    """
+    def __init__(
+        self,
+        attn: DeformableCrossAttention,
         mlp: nn.Module,
         *,
         ca_norm: Optional[nn.Module] = None,
@@ -161,6 +315,11 @@ class TransformerCrossAttentionLayer(nn.Module):
         self.mlp_norm = mlp_norm or nn.Identity()
         self.ca_scale = ca_scale or nn.Identity()
         self.mlp_scale = mlp_scale or nn.Identity()
+        self._cache_setup = False
+        self._cache_enabled = False
+        self._cached_encoder_input: Optional[torch.Tensor] = None
+        self._cached_spatial_shapes: Optional[Union[torch.Tensor, List[Tuple[int, int]], Tuple[Tuple[int, int], ...]]] = None
+        self._cached_reference_points: Optional[torch.Tensor] = None
 
     def setup_caches(
         self,
@@ -170,68 +329,32 @@ class TransformerCrossAttentionLayer(nn.Module):
         encoder_max_seq_len: int,
         decoder_max_seq_len: int,
     ) -> None:
-        """Setup key value caches for attention calculation.
-
-        Args:
-            batch_size (int): batch size for the caches.
-            dtype (torch.dtype): dtype for the caches.
-            encoder_max_seq_len (int): maximum cache sequence length.
-            decoder_max_seq_len (int): this parameter is ignored in this layer.
-        """
-        self.attn.setup_cache(batch_size, dtype, encoder_max_seq_len)
+        del batch_size, dtype, encoder_max_seq_len, decoder_max_seq_len
+        self._cache_setup = True
+        self._cache_enabled = True
+        self._cached_encoder_input = None
+        self._cached_spatial_shapes = None
+        self._cached_reference_points = None
 
     def caches_are_setup(self) -> bool:
-        """
-        Check if the key value caches are setup on ``self.attn``.
-        See :func:~party.modules.TransformerDecoder.caches_are_setup`.
-        """
-        return self.attn.kv_cache is not None
+        return self._cache_setup
 
     def caches_are_enabled(self) -> bool:
-        """
-        Checks if the key value caches on ``self.attn`` are enabled.
-        See :func:~party.modules.TransformerDecoder.caches_are_enabled`.
-        """
-        return self.attn.cache_enabled
+        return self._cache_enabled
 
     def reset_cache(self):
-        """Reset the key value caches."""
-        self.attn.reset_cache()
+        self._cached_encoder_input = None
+        self._cached_spatial_shapes = None
+        self._cached_reference_points = None
 
     def _skip_mask(self, mask: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-        """Some tokens in x may not attend to any encoder inputs
-        due to the cross attention mask (encoder_mask). This results in
-        a full row of the attention matrix being masked out.
-
-        In the example below, the word "the" is masked from every embedding.
-        The False value means a token can't attend to an embedding.
-
-        .. code-block:: text
-
-            |emb||emb||emb|
-        |The| F    F    F
-        |red| T    F    T
-        |car| F    T    T
-
-        This results in no inputs into the softmax layer which causes a NaN.
-        The skip mask is used to mask the outputs of attention and
-        mlp resulting in the token being skipped.
-
-        The above example would result in a skip mask of: [[True], [False], [False]]
-        which specifies which tokens to fully mask out.
-
-        """
-        # no skip_mask if no masking
         if mask is None:
             return None
-        # negate mask and convert to boolean mask
         if mask.dtype == torch.bool:
             mask = ~mask
         else:
             mask = torch.isneginf(mask)
-        # True where all elements in a row are True
-        mask = torch.all(mask, dim=-1, keepdim=True)
-        return mask
+        return torch.all(mask, dim=-1, keepdim=True)
 
     def forward(
         self,
@@ -239,59 +362,42 @@ class TransformerCrossAttentionLayer(nn.Module):
         *,
         encoder_input: Optional[torch.Tensor] = None,
         encoder_mask: Optional[torch.Tensor] = None,
+        encoder_spatial_shapes: Optional[Union[torch.Tensor, List[Tuple[int, int]], Tuple[Tuple[int, int], ...]]] = None,
+        encoder_reference_points: Optional[torch.Tensor] = None,
         **kwargs: Dict,
     ) -> torch.Tensor:
-        """
-        Args:
-            x (torch.Tensor): input tensor with shape
-                [batch_size x seq_length x embed_dim]
-            encoder_input (Optional[torch.Tensor]): Optional input embeds from the encoder. Shape
-                [batch_size x token_sequence x embed_dim]
-            encoder_mask (Optional[torch.Tensor]):  Boolean tensor defining a relational matrix between
-                tokens and encoder embeddings. A True value at position i,j means token i can attend
-                to embedding j in the decoder. Mask has shape [batch_size x token_sequence x embed_sequence].
-                Default is None.
-            **kwargs (Dict): transformer layer inputs not relevant to self attention.
+        del kwargs
+        if encoder_input is None:
+            if not self._cache_enabled or self._cached_encoder_input is None:
+                return x
+            encoder_input = self._cached_encoder_input
+            encoder_spatial_shapes = self._cached_spatial_shapes
+            if encoder_reference_points is None:
+                encoder_reference_points = self._cached_reference_points
+        elif self._cache_enabled:
+            self._cached_encoder_input = encoder_input
+            self._cached_spatial_shapes = encoder_spatial_shapes
+            self._cached_reference_points = encoder_reference_points
 
-        Returns:
-            torch.Tensor: output tensor with same shape as input
-                [batch_size x seq_length x embed_dim]
-        """
-        # During decoding, it's possible encoder_input is None because the embeds
-        # are already stored in the kv cache.
-        empty_cache = not self.caches_are_enabled() or self.attn.kv_cache.size == 0
-        # Skip cross attention when no secondary input as it's primary purpose
-        # is to attend between x and encoder_input.
-        if encoder_input is None and empty_cache:
-            return x
+        if encoder_spatial_shapes is None:
+            raise ValueError('encoder_spatial_shapes is required for deformable cross-attention.')
 
-        # A mask of tokens (x) with no encoder_input
         skip_mask = self._skip_mask(encoder_mask)
-        if encoder_mask is not None:
-            # TODO: remove after PyTorch 2.5 is released
-            # This unmasks the skipped rows to avoid NaNs in SDPA Softmax backward
-            # This doesn't affect the output since outputs are masked out later
-            encoder_mask = encoder_mask.masked_fill(skip_mask, True)
-
-        # Input tensor and attention output have the same shape
-        # [b, s, d]
-        # Norm applied before self-attention
-        # TODO: Add support for sample packing and bring back input_pos
-        attn_out = self.attn(self.ca_norm(x), encoder_input, mask=encoder_mask)
+        attn_out = self.attn(
+            self.ca_norm(x),
+            encoder_input,
+            encoder_spatial_shapes=encoder_spatial_shapes,
+            encoder_reference_points=encoder_reference_points,
+        )
         if skip_mask is not None:
             attn_out = attn_out.masked_fill(skip_mask, 0)
 
-        # Residual connection; shape: [batch_size, seq_length, embed_dim]
         h = self.ca_scale(attn_out) + x
-
-        # Norm applied before the feedforward layer
         mlp_out = self.mlp(self.mlp_norm(h))
         if skip_mask is not None:
             mlp_out = mlp_out.masked_fill(skip_mask, 0)
 
-        # Residual connection; shape: [batch_size, seq_length, embed_dim]
-        out = h + self.mlp_scale(mlp_out)
-        return out
+        return h + self.mlp_scale(mlp_out)
 
 
 def _get_clones(module: nn.Module, n: int) -> nn.ModuleList:
@@ -399,7 +505,7 @@ class TransformerDecoder(nn.Module):
         """
         Sets up key-value attention caches for inference. For each layer in ``self.layers``:
             - :class:`~party.modules.TransformerSelfAttentionLayer` will use ``decoder_max_seq_len``.
-            - :class:`~party.modules.TransformerCrossAttentionLayer` will use ``encoder_max_seq_len``.
+            - :class:`~party.modules.TransformerDeformableCrossAttentionLayer` will cache encoder features.
             - :class:`~party.modules.FusionLayer` will use ``decoder_max_seq_len`` and ``encoder_max_seq_len``.
 
         Args:
@@ -410,7 +516,7 @@ class TransformerDecoder(nn.Module):
         """
 
         has_encoder_layers = any(
-            isinstance(m, TransformerCrossAttentionLayer) for m in self.modules()
+            isinstance(m, TransformerDeformableCrossAttentionLayer) for m in self.modules()
         )
         has_decoder_layers = any(
             isinstance(m, TransformerSelfAttentionLayer) for m in self.modules()
@@ -546,6 +652,8 @@ class TransformerDecoder(nn.Module):
         mask: Optional[torch.Tensor] = None,
         encoder_input: Optional[torch.Tensor] = None,
         encoder_mask: Optional[torch.Tensor] = None,
+        encoder_spatial_shapes: Optional[Union[torch.Tensor, List[Tuple[int, int]], Tuple[Tuple[int, int], ...]]] = None,
+        encoder_reference_points: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
         """
@@ -627,6 +735,8 @@ class TransformerDecoder(nn.Module):
                 mask=mask,
                 encoder_input=encoder_input,
                 encoder_mask=encoder_mask,
+                encoder_spatial_shapes=encoder_spatial_shapes,
+                encoder_reference_points=encoder_reference_points,
                 input_pos=input_pos,
             )
 

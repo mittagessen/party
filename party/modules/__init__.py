@@ -3,7 +3,12 @@ from .norms import RMSNorm  # NOQA
 from .tanh_gate import TanhGate  # NOQA
 from .llama_components import scale_hidden_dim_for_mlp, llama3_mlp, Llama3ScaledRoPE  # NOQA
 from .fusion_layer import FusionLayer  # NOQA
-from .transformer import TransformerCrossAttentionLayer, TransformerSelfAttentionLayer, TransformerDecoder  # NOQA
+from .transformer import (  # NOQA
+    DeformableCrossAttention,
+    TransformerDecoder,
+    TransformerDeformableCrossAttentionLayer,
+    TransformerSelfAttentionLayer,
+)
 from .feed_forward import FeedForward  # NOQA
-from .prompt import PromptEncoder, PromptCrossAttention  # NOQA
+from .prompt import PromptEncoder  # NOQA
 from .noisy_teacher_forcing import NoisyTeacherForcing  # NOQA

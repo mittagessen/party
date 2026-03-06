@@ -25,9 +25,10 @@ import torch.nn.functional as F
 
 from party.tokenizer import TOKEN_NUM
 from party.modules import (MultiHeadAttention, RMSNorm, TanhGate,
-                           TransformerCrossAttentionLayer, TransformerDecoder,
-                           FeedForward, TransformerSelfAttentionLayer,
+                           TransformerDecoder,
+                           TransformerSelfAttentionLayer,
                            FusionLayer, scale_hidden_dim_for_mlp,
+                           DeformableCrossAttention, TransformerDeformableCrossAttentionLayer,
                            Llama3ScaledRoPE, llama3_mlp)
 
 
@@ -47,7 +48,10 @@ def bytellama_vision_decoder(vocab_size: int = TOKEN_NUM,
                              norm_eps: int = 1e-5,
                              rope_base: int = 10000,
                              encoder_max_seq_len: int = 56700,
+                             encoder_spatial_shapes: Optional[list[tuple[int, int]]] = None,
                              fusion_interval: int = 3,
+                             deformable_num_points: int = 20,
+                             deformable_offset_scale: float = 4.0,
                              pretrained: Optional[str] = None,
                              **kwargs) -> TransformerDecoder:
     """
@@ -91,7 +95,10 @@ def bytellama_vision_decoder(vocab_size: int = TOKEN_NUM,
               'norm_eps': norm_eps,
               'rope_base': rope_base,
               'encoder_max_seq_len': encoder_max_seq_len,
-              'fusion_interval': fusion_interval}
+              'encoder_spatial_shapes': encoder_spatial_shapes,
+              'fusion_interval': fusion_interval,
+              'deformable_num_points': deformable_num_points,
+              'deformable_offset_scale': deformable_offset_scale}
 
     if pretrained:
         from huggingface_hub import hf_hub_download
@@ -133,25 +140,18 @@ def bytellama_vision_decoder(vocab_size: int = TOKEN_NUM,
         # cross attention layers, mixing text and vision,
         # placed every `fusion_interval` layers
         if idx % config['fusion_interval'] == 0:
-            xattn = MultiHeadAttention(
+            xattn_mlp = llama3_mlp(dim=config['embed_dim'], hidden_dim=hidden_dim)
+            if not config['encoder_spatial_shapes']:
+                raise ValueError('encoder_spatial_shapes are required for deformable cross-attention.')
+            xattn = DeformableCrossAttention(
                 embed_dim=config['embed_dim'],
                 num_heads=config['num_heads'],
-                num_kv_heads=num_kv_heads,
-                head_dim=head_dim,
-                q_proj=nn.Linear(config['embed_dim'], config['num_heads'] * head_dim, bias=False),
-                k_proj=nn.Linear(config['embed_dim'], num_kv_heads * head_dim, bias=False),
-                v_proj=nn.Linear(config['embed_dim'], num_kv_heads * head_dim, bias=False),
-                output_proj=nn.Linear(config['embed_dim'], config['embed_dim'], bias=False),
-                q_norm=RMSNorm(dim=head_dim, eps=1e-05),
-                k_norm=RMSNorm(dim=head_dim, eps=1e-05),
-                pos_embeddings=None,
-                max_seq_len=config['encoder_max_seq_len'],
-                is_causal=False,
-                attn_dropout=0.0,
+                num_levels=len(config['encoder_spatial_shapes']),
+                num_points=config['deformable_num_points'],
+                num_reference_points=4,
+                offset_scale=config['deformable_offset_scale'],
             )
-
-            xattn_mlp = llama3_mlp(dim=config['embed_dim'], hidden_dim=hidden_dim)
-            xattn_layer = TransformerCrossAttentionLayer(
+            xattn_layer = TransformerDeformableCrossAttentionLayer(
                 attn=xattn,
                 mlp=xattn_mlp,
                 ca_norm=RMSNorm(dim=config['embed_dim']),
