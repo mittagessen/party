@@ -272,7 +272,7 @@ def train(ctx, **kwargs):
     m_config = PartyRecognitionTrainingConfig(**params)
 
     if resume:
-        data_module = PartyTextLineDataModule.load_from_checkpoint(resume)
+        data_module = PartyTextLineDataModule.load_from_checkpoint(resume, weights_only=False)
     else:
         data_module = PartyTextLineDataModule(dm_config)
 
