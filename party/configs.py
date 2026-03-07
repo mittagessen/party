@@ -60,7 +60,7 @@ MODEL_VARIANTS = {
             'embed_dim': 576,
             'num_heads': 9,
             'num_kv_heads': 3,
-            'num_layers': 30,
+            'num_layers': 12,
             'intermediate_dim': 1536,
         },
         'adapter': {
@@ -81,11 +81,11 @@ MODEL_VARIANTS = {
         },
         'decoder': {
             'name': None,
-            'embed_dim': 768,
-            'num_heads': 12,
-            'num_kv_heads': 4,
-            'num_layers': 24,
-            'intermediate_dim': 2048,
+            'embed_dim': 576,
+            'num_heads': 9,
+            'num_kv_heads': 3,
+            'num_layers': 30,
+            'intermediate_dim': 1536,
         },
         'adapter': {
             'output_ds_factors': (2, 4, 4),
