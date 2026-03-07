@@ -28,10 +28,11 @@ from lightning.fabric import Fabric
 from collections.abc import Generator
 from typing import Optional, Union, TYPE_CHECKING, Any
 
-from party.modules import PromptEncoder
+from party.modules import (PromptEncoder, MultiHeadAttention, FeedForward,
+                           TransformerSelfAttentionLayer, RMSNorm, TanhGate)
 from party.tokenizer import OctetTokenizer
 from party.configs import get_model_variant
-from party.fusion import PartyAdapter, bytellama_vision_decoder
+from party.fusion import PartyMultiScaleAdapter, bytellama_vision_decoder
 from party.dataset import get_default_transforms, _to_curve, _to_bbox
 
 if TYPE_CHECKING:
@@ -76,17 +77,74 @@ def _baseline_to_bbox(line: 'BaselineLine') -> 'BBoxLine':
     return BBoxLine(**d)
 
 
+class SingleScaleAdapter(nn.Module):
+    """
+    Single-scale adapter used by the original main-branch model.
+    """
+    def __init__(self,
+                 num_layers: int,
+                 num_heads: int,
+                 encoder_embed_dim: int,
+                 decoder_embed_dim: int):
+        super().__init__()
+        mlp_ratio = 4
+        hidden_dim = int(mlp_ratio * encoder_embed_dim)
+        head_dim = encoder_embed_dim // num_heads
+        num_kv_heads = num_heads
+        layers = []
+        for _ in range(num_layers):
+            self_attn = MultiHeadAttention(embed_dim=encoder_embed_dim,
+                                           num_heads=num_heads,
+                                           num_kv_heads=num_heads,
+                                           head_dim=head_dim,
+                                           q_proj=nn.Linear(encoder_embed_dim, num_heads * head_dim, bias=False),
+                                           k_proj=nn.Linear(encoder_embed_dim, num_kv_heads * head_dim, bias=False),
+                                           v_proj=nn.Linear(encoder_embed_dim, num_kv_heads * head_dim, bias=False),
+                                           output_proj=nn.Linear(encoder_embed_dim, encoder_embed_dim, bias=False),
+                                           pos_embeddings=None,
+                                           attn_dropout=0.0,
+                                           is_causal=False)
+
+            mlp = FeedForward(gate_proj=nn.Linear(encoder_embed_dim, hidden_dim),
+                              down_proj=nn.Linear(hidden_dim, encoder_embed_dim),
+                              up_proj=None)
+
+            layer = TransformerSelfAttentionLayer(attn=self_attn,
+                                                  mlp=mlp,
+                                                  sa_norm=RMSNorm(encoder_embed_dim, eps=1e-5),
+                                                  mlp_norm=RMSNorm(encoder_embed_dim, eps=1e-5),
+                                                  sa_scale=TanhGate(),
+                                                  mlp_scale=TanhGate())
+            layers.append(layer)
+        layers.append(nn.Linear(encoder_embed_dim, decoder_embed_dim))
+        self.adapter = nn.Sequential(*layers)
+
+    def forward(self, encoder_hidden_states):
+        if isinstance(encoder_hidden_states, (list, tuple)):
+            if len(encoder_hidden_states) != 1:
+                raise ValueError(f'SingleScaleAdapter expects exactly one encoder feature map, got {len(encoder_hidden_states)}.')
+            encoder_hidden_states = encoder_hidden_states[0]
+        return self.adapter(encoder_hidden_states.flatten(-2).transpose(-1, -2))
+
+
 def _build_adapter(variant, encoder_channels, encoder_sizes, decoder_embed_dim):
     """Returns (adapter_module, adapter_seq_len)."""
     adapter_cfg = variant['adapter']
-    adapter = PartyAdapter(num_layers=adapter_cfg['num_layers'],
-                           num_heads=adapter_cfg['num_heads'],
-                           encoder_embed_dims=encoder_channels,
-                           encoder_sizes=encoder_sizes,
-                           decoder_embed_dim=decoder_embed_dim,
-                           ds_factors=list(adapter_cfg['ds_factors']))
-    seq_len = sum((size[0] // ds) * (size[1] // ds)
-                  for size, ds in zip(encoder_sizes, adapter_cfg['ds_factors']))
+    if len(variant['encoder']['out_indices']) == 1:
+        adapter = SingleScaleAdapter(num_layers=adapter_cfg['num_layers'],
+                                     num_heads=adapter_cfg['num_heads'],
+                                     encoder_embed_dim=encoder_channels[0],
+                                     decoder_embed_dim=decoder_embed_dim)
+        seq_len = encoder_sizes[0][0] * encoder_sizes[0][1]
+    else:
+        adapter = PartyMultiScaleAdapter(num_layers=adapter_cfg['num_layers'],
+                                         num_heads=adapter_cfg['num_heads'],
+                                         encoder_embed_dims=encoder_channels,
+                                         encoder_sizes=encoder_sizes,
+                                         decoder_embed_dim=decoder_embed_dim,
+                                         ds_factors=list(adapter_cfg['ds_factors']))
+        seq_len = sum((size[0] // ds) * (size[1] // ds)
+                      for size, ds in zip(encoder_sizes, adapter_cfg['ds_factors']))
     return adapter, seq_len
 
 
@@ -127,8 +185,11 @@ class PartyModel(nn.Module, RecognitionBaseModel):
 
         # 2. Compute adapter seq len for decoder cross-attention
         adapter_cfg = variant['adapter']
-        adapter_seq_len = sum((size[0] // ds) * (size[1] // ds)
-                             for size, ds in zip(encoder_sizes, adapter_cfg['ds_factors']))
+        if len(variant['encoder']['out_indices']) == 1:
+            adapter_seq_len = encoder_sizes[0][0] * encoder_sizes[0][1]
+        else:
+            adapter_seq_len = sum((size[0] // ds) * (size[1] // ds)
+                                 for size, ds in zip(encoder_sizes, adapter_cfg['ds_factors']))
         self.encoder_max_seq_len = adapter_seq_len
 
         # 3. Build decoder

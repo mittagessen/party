@@ -5,7 +5,7 @@ MODEL_VARIANTS = {
     'tiny': {
         'encoder': {
             'name': 'convnextv2_nano.fcmae_ft_in22k_in1k',
-            'out_indices': (1, 2, 3),
+            'out_indices': (2,),
         },
         'decoder': {
             'name': 'mittagessen/bytellama-7m-cc',
@@ -16,8 +16,8 @@ MODEL_VARIANTS = {
             'intermediate_dim': 512,
         },
         'adapter': {
-            'ds_factors': (4, 2, 1),
-            'num_layers': 1,
+            'ds_factors': (1,),
+            'num_layers': 2,
             'num_heads': 8,
         },
         'fusion_interval': 3,
@@ -26,7 +26,7 @@ MODEL_VARIANTS = {
     'small': {
         'encoder': {
             'name': 'convnextv2_tiny.fcmae_ft_in22k_in1k',
-            'out_indices': (1, 2, 3),
+            'out_indices': (2,),
         },
         'decoder': {
             'name': 'mittagessen/bytellama-16m-cc',
@@ -37,8 +37,8 @@ MODEL_VARIANTS = {
             'intermediate_dim': 768,
         },
         'adapter': {
-            'ds_factors': (4, 2, 1),
-            'num_layers': 1,
+            'ds_factors': (1,),
+            'num_layers': 2,
             'num_heads': 8,
         },
         'fusion_interval': 3,
@@ -47,19 +47,19 @@ MODEL_VARIANTS = {
     'base': {
         'encoder': {
             'name': 'convnextv2_base.fcmae_ft_in22k_in1k',
-            'out_indices': (1, 2, 3),
+            'out_indices': (2,),
         },
         'decoder': {
-            'name': 'mittagessen/bytellama-40m-oscar',
+            'name': 'mittagessen/bytellama-43m-cc',
             'embed_dim': 576,
             'num_heads': 9,
             'num_kv_heads': 3,
-            'num_layers': 30,
+            'num_layers': 12,
             'intermediate_dim': 1536,
         },
         'adapter': {
-            'ds_factors': (4, 2, 1),
-            'num_layers': 1,
+            'ds_factors': (1,),
+            'num_layers': 4,
             'num_heads': 8,
         },
         'fusion_interval': 3,
@@ -68,7 +68,7 @@ MODEL_VARIANTS = {
     'large': {
         'encoder': {
             'name': 'convnextv2_large.fcmae_ft_in22k_in1k',
-            'out_indices': (1, 2, 3),
+            'out_indices': (2,),
         },
         'decoder': {
             'name': None,
@@ -79,8 +79,8 @@ MODEL_VARIANTS = {
             'intermediate_dim': 2048,
         },
         'adapter': {
-            'ds_factors': (4, 2, 1),
-            'num_layers': 2,
+            'ds_factors': (1,),
+            'num_layers': 4,
             'num_heads': 8,
         },
         'fusion_interval': 3,
