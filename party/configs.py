@@ -132,6 +132,8 @@ class PartyRecognitionTrainingConfig(TrainingConfig):
         self.noisy_teacher_forcing = kwargs.pop('noisy_teacher_forcing', 0.02)
         self.noisy_teacher_forcing_warmup = kwargs.pop('noisy_teacher_forcing_warmup', None)
         self.label_smoothing = kwargs.pop('label_smoothing', 0.0)
+        self.proto_margin = kwargs.pop('proto_margin', 0.0)
+        self.proto_temperature_init = kwargs.pop('proto_temperature_init', 10.0)
         # LR multiplier for pretrained encoder components.
         self.lr_pretrained_mult = kwargs.pop('lr_pretrained_mult', 0.2)
 

@@ -42,7 +42,7 @@ logging.getLogger("lightning.fabric.utilities.seed").setLevel(logging.ERROR)
 @click.option('-F', '--files', default=None, multiple=True,
               callback=_validate_manifests, type=click.File(mode='r', lazy=True),
               help='File(s) with additional paths to training data.')
-@click.option('-u', '--normalization', type=click.Choice(['NFD', 'NFKD', 'NFC', 'NFKC']),
+@click.option('-u', '--normalization', type=click.Choice(['NFD', 'NFKD', 'NFC', 'NFKC']), default='NFC', show_default=True,
               help='Ground truth normalization')
 @click.option('-n', '--normalize-whitespace/--no-normalize-whitespace',
               help='Normalizes unicode whitespace')
@@ -184,6 +184,8 @@ def compile(ctx, **params):
 @click.option('--noisy-teacher-forcing', type=click.FloatRange(0.0, 1.0), help='Probability that each individual target token is altered for NTF.')
 @click.option('--noisy-teacher-forcing-warmup', type=click.IntRange(0), help='Number of optimization steps to ramp up NTF probability.')
 @click.option('--label-smoothing', type=click.FloatRange(0.0, 1.0), help='Amount of label smoothing')
+@click.option('--proto-margin', type=float, help='ArcFace angular margin for prototype logits.')
+@click.option('--proto-temperature-init', type=float, help='Initial prototype-logit temperature.')
 @click.option('--accumulate-grad-batches', type=int, help='Number of batches to accumulate gradient across.')
 @click.option('-t', '--training-files', 'training_data', multiple=True, type=click.File(mode='r', lazy=True),
               help='File(s) with additional paths to training data')

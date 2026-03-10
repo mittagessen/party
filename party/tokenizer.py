@@ -12,17 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
 # or implied. See the License for the specific language governing
 # permissions and limitations under the License.
-import codecs
 import logging
 
-from statistics import fmean
-
-from typing import List, TYPE_CHECKING, Optional, Set, Tuple
+from typing import Any, Iterable, List, TYPE_CHECKING, Optional, Set, Tuple
 
 if TYPE_CHECKING:
     from torch import IntTensor, FloatTensor
 
-__all__ = ['OctetTokenizer']
+__all__ = ['CodePointTokenizer', 'OctetTokenizer']
 
 logger = logging.getLogger(__name__)
 
@@ -707,118 +704,204 @@ def resolve_lang(lang: str) -> Optional[str]:
     return None
 
 
-OFFSET = 3
-LANG_OFFSET = OFFSET + 256
-TOKEN_NUM = max(LANG_OFFSET + len(ISO_TO_IDX), 512)
+PAD_ID = 0
+BOS_ID = 1
+EOS_ID = 2
+LANG_OFFSET = 3
+CODEPOINT_OFFSET = LANG_OFFSET + len(ISO_TO_IDX)
+
+# Backwards-compatible aliases used in older code paths.
+OFFSET = CODEPOINT_OFFSET
+TOKEN_NUM = CODEPOINT_OFFSET
 
 
-class OctetTokenizer(object):
+class CodePointTokenizer(object):
     """
-    A non-trainable tokenizer that simple encodes strings as UTF-8 and uses
-    their octets.
+    Dynamic Unicode code point tokenizer.
 
-    Examples:
-        >>> tokenizer = OctetTokenizer()
-        >>> tokenized_text = tokenizer.encode("Hello world!", add_bos=True, add_eos=True)
-        >>> print(tokenized_text)
-        [1, 31587, 29644, 102, 2]
+    Token layout:
+    - 0: PAD
+    - 1: BOS
+    - 2: EOS
+    - 3..CODEPOINT_OFFSET-1: language tokens
+    - CODEPOINT_OFFSET+: registered Unicode code points
     """
-    pad_id = 0
-    bos_id = 1
-    eos_id = 2
-    # vocab size is max(byte tokens + lang tokens, 512)
-    _offset = 3
-    _lang_offset = _offset + 256
+    pad_id = PAD_ID
+    bos_id = BOS_ID
+    eos_id = EOS_ID
 
-    def __init__(self):
-        pass
+    def __init__(self,
+                 codepoints: Optional[Iterable[int]] = None,
+                 frozen: bool = False):
+        self._codepoint_to_idx: dict[int, int] = {}
+        self._idx_to_codepoint: list[int] = []
+        self._frozen = False
+        if codepoints:
+            self.register_codepoint_values(codepoints)
+        if frozen:
+            self.freeze()
 
     def __len__(self) -> int:
-        """
-        Total number of input labels the codec can decode.
-        """
-        return TOKEN_NUM
+        return self.vocab_size
+
+    @property
+    def vocab_size(self) -> int:
+        return CODEPOINT_OFFSET + len(self._idx_to_codepoint)
 
     @property
     def max_label(self) -> int:
+        return self.vocab_size - 1
+
+    @property
+    def is_frozen(self) -> bool:
+        return self._frozen
+
+    @property
+    def codepoints(self) -> list[int]:
+        return list(self._idx_to_codepoint)
+
+    def freeze(self):
+        self._frozen = True
+
+    def thaw(self):
+        self._frozen = False
+
+    def _register_single_codepoint(self, codepoint: int) -> bool:
+        if codepoint < 0 or codepoint > 0x10FFFF:
+            raise ValueError(f'Invalid code point: {codepoint}')
+        if codepoint in self._codepoint_to_idx:
+            return False
+        if self._frozen:
+            raise ValueError(f'Code point U+{codepoint:04X} is not registered and tokenizer is frozen.')
+        idx = len(self._idx_to_codepoint)
+        self._codepoint_to_idx[codepoint] = idx
+        self._idx_to_codepoint.append(codepoint)
+        return True
+
+    def register_codepoint_values(self, codepoints: Iterable[int]) -> list[int]:
         """
-        Returns the maximum label value.
+        Registers raw Unicode code point values and returns newly-added values.
         """
-        return TOKEN_NUM - 1
+        new_codepoints = []
+        for codepoint in codepoints:
+            cp = int(codepoint)
+            if self._register_single_codepoint(cp):
+                new_codepoints.append(cp)
+        return new_codepoints
+
+    def register_codepoints(self, text: str) -> list[int]:
+        """
+        Registers all code points occurring in ``text`` and returns newly-added
+        code point values.
+        """
+        return self.register_codepoint_values(ord(char) for char in text)
+
+    def _get_lang_token(self, lang: str) -> int:
+        # Accept both language names and ISO-639-3 tags.
+        normalized = DATASET_TAG_TO_ISO.get(lang, lang)
+        if normalized in LANG_TO_ISO:
+            normalized = LANG_TO_ISO[normalized]
+        return LANG_OFFSET + ISO_TO_IDX.get(normalized, ISO_TO_IDX['und'])
+
+    def _token_for_codepoint(self, codepoint: int) -> int:
+        idx = self._codepoint_to_idx.get(codepoint)
+        if idx is None:
+            if self._frozen:
+                raise ValueError(f'Code point U+{codepoint:04X} is not registered and tokenizer is frozen.')
+            idx = len(self._idx_to_codepoint)
+            self._codepoint_to_idx[codepoint] = idx
+            self._idx_to_codepoint.append(codepoint)
+        return CODEPOINT_OFFSET + idx
+
+    def codepoint_for_token(self, token_id: int) -> Optional[int]:
+        idx = token_id - CODEPOINT_OFFSET
+        if idx < 0 or idx >= len(self._idx_to_codepoint):
+            return None
+        return self._idx_to_codepoint[idx]
+
+    def token_for_codepoint(self, codepoint: int) -> Optional[int]:
+        idx = self._codepoint_to_idx.get(codepoint)
+        if idx is None:
+            return None
+        return CODEPOINT_OFFSET + idx
 
     def encode(self,
                text: str,
                langs: Optional[List[str]] = None,
                add_bos: bool = True,
                add_eos: bool = True) -> List[int]:
-        """
-        Encode text into token IDs.
-
-        Args:
-            text: The input text to be encoded, unbatched.
-            langs: List of lang tokens to insert between BOS and first text token.
-            add_bos: Whether to prepend BOS to the input, defaults to True.
-            add_eos: Whether to append EOS to the input, defaults to True.
-
-        Returns:
-            List[int]: The encoded token IDs.
-        """
         tokens = []
         if add_bos:
             tokens.append(self.bos_id)
         if langs:
-            tokens.extend([LANG_OFFSET + ISO_TO_IDX.get(lang, ISO_TO_IDX['und']) for lang in langs])
-        tokens.extend([i + OFFSET for i in text.encode("utf-8")])
+            tokens.extend(self._get_lang_token(lang) for lang in langs)
+        tokens.extend(self._token_for_codepoint(ord(char)) for char in text)
         if add_eos:
             tokens.append(self.eos_id)
-
         return tokens
 
+    def _decode_language_tokens(self, ids: Iterable[int]) -> Set[str]:
+        return {
+            LANG_IDX_TO_ISO.get(int(token - LANG_OFFSET), 'und')
+            for token in ids
+            if LANG_OFFSET <= int(token) < CODEPOINT_OFFSET
+        }
+
     def decode(self, ids: 'IntTensor') -> Tuple[str, Set[str]]:
-        """Decode a sequence of token IDs into a string and language tags.
-
-        Args:
-            ids: The input token IDs to be decoded.
-
-        Returns:
-            A tuple containing the decoded text and any language tags in
-            the input tensor.
-        """
-        lang_ids = set(LANG_IDX_TO_ISO.get(int(id - LANG_OFFSET), 'und') for id in ids if id >= LANG_OFFSET)
-        ids = [id - OFFSET for id in ids if OFFSET <= id < LANG_OFFSET]
-        text = bytes(ids).decode("utf-8", errors="ignore")
-        return text, lang_ids
+        token_ids = [int(token) for token in ids]
+        lang_ids = self._decode_language_tokens(token_ids)
+        chars = []
+        for token in token_ids:
+            codepoint = self.codepoint_for_token(token)
+            if codepoint is not None:
+                chars.append(chr(codepoint))
+        return ''.join(chars), lang_ids
 
     def decode_with_confs(self,
                           ids: 'IntTensor',
                           confidences: 'FloatTensor') -> Tuple[str, List[float], Set[str]]:
-        """Decode a sequence of token IDs into a string, computing average
-        confidence scores for each Unicode code point, and extracting any
-        contained language tags.
-
-        Args:
-            ids: The input token IDs to be decoded.
-            confidences: The normalized confidence scores for each output token.
-
-        Returns:
-            A tuple containing the decoded text, confidences for each code
-            point, and any language tags in the input tensor.
-        """
-        lang_ids = set(LANG_IDX_TO_ISO.get(int(id - LANG_OFFSET), 'und') for id in ids if id >= LANG_OFFSET)
-        ids = [id - OFFSET for id in ids if OFFSET <= id < LANG_OFFSET]
-        decoder = codecs.getincrementaldecoder('utf-8')(errors='strict')
-        cs = []
+        token_ids = [int(token) for token in ids]
+        lang_ids = self._decode_language_tokens(token_ids)
+        if hasattr(confidences, 'tolist'):
+            confidences = confidences.tolist()
+        text = []
         confs = []
-        ics = []
-        confidences = confidences.tolist()
-        for id, conf in zip((id.to_bytes() for id in bytes(ids)), confidences):
-            try:
-                c = decoder.decode(id)
-                ics.append(conf)
-                if c:
-                    cs.append(c)
-                    confs.append(fmean(ics))
-                    ics = []
-            except UnicodeDecodeError as e:
-                logger.info(f'Unexpected byte value in token tensor: {e}')
-        return ''.join(cs), confs, lang_ids
+        for token, conf in zip(token_ids, confidences):
+            codepoint = self.codepoint_for_token(token)
+            if codepoint is None:
+                continue
+            text.append(chr(codepoint))
+            confs.append(float(conf))
+        return ''.join(text), confs, lang_ids
+
+    def save(self) -> dict[str, Any]:
+        """
+        Serializes tokenizer state for dataset metadata and checkpoints.
+        """
+        return {'version': 1,
+                'frozen': self._frozen,
+                'codepoints': self._idx_to_codepoint}
+
+    @classmethod
+    def load(cls, state: Optional[dict[str, Any]]) -> 'CodePointTokenizer':
+        if not state:
+            return cls()
+        codepoints = state.get('codepoints', [])
+        frozen = bool(state.get('frozen', True))
+        return cls(codepoints=codepoints, frozen=frozen)
+
+    @classmethod
+    def merge(cls, tokenizers: Iterable['CodePointTokenizer']) -> 'CodePointTokenizer':
+        codepoints = []
+        seen: set[int] = set()
+        for tokenizer in tokenizers:
+            for codepoint in tokenizer.codepoints:
+                if codepoint in seen:
+                    continue
+                seen.add(codepoint)
+                codepoints.append(codepoint)
+        return cls(codepoints=codepoints, frozen=True)
+
+
+# Backwards-compatible alias.
+OctetTokenizer = CodePointTokenizer

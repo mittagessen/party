@@ -22,6 +22,15 @@ Party needs to be trained on datasets precompiled from PageXML or ALTO files con
 
         $ party compile -o dataset.arrow *.xml
 
+Unicode normalization (NFC by default) is strongly recommended during dataset
+compilation. The code point tokenizer maps each unique Unicode code point to its
+own prototype, so unnormalized text will cause semantically equivalent but
+differently encoded characters (e.g. precomposed vs. decomposed accented
+letters) to be assigned distinct prototypes, fragmenting the training signal. To
+explicitly select a normalization form use:
+
+        $ party compile -u NFC -o dataset.arrow *.xml
+
 The current compilation code determines the language on a page level by traversing its path upward until a path component matches a known language identifier, e.g. `/english/path/to/german/dir/with/file.xml` would be assigned `German` as a language because of `german` being the first path component matching a language string in the absolute path. The help screen of `party compile` will print a list of known language identifiers. Files which cannot be assigned a known language will have the `undetermined` value assigned. New ones can be added in `party/tokenizer.py` on request. A better solution parsing out ALTO and PageXML language attributes on the line level is in the works. 
 
 To fine-tune the pretrained base model dataset files in listed in manifest files on all available GPUs:

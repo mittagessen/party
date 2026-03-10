@@ -29,8 +29,8 @@ from lightning.pytorch.callbacks import EarlyStopping
 from torch.distributed import get_world_size, is_initialized
 from torch.utils.data import RandomSampler, DataLoader
 
-from party.tokenizer import OFFSET, LANG_OFFSET
-from party.modules import NoisyTeacherForcing
+from party.tokenizer import CODEPOINT_OFFSET, CodePointTokenizer
+from party.modules import NoisyTeacherForcing, PrototypeHead
 from party.party import PartyModel
 from party.dataset import (collate_null, get_default_transforms,
                            BinnedBaselineDataset, ValidationBaselineDataset,
@@ -44,8 +44,52 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _get_prototype_head(model) -> Optional[PrototypeHead]:
+    module_dict = getattr(model, 'nn', None)
+    if module_dict is None:
+        return None
+    try:
+        decoder = module_dict['decoder']
+    except Exception:
+        return None
+    output = getattr(decoder, 'output', None)
+    if isinstance(output, PrototypeHead):
+        return output
+    return None
+
+
+def apply_arcface_margin(logits: torch.Tensor,
+                         targets: torch.Tensor,
+                         margin: float,
+                         temperature: torch.Tensor,
+                         ignore_index: int = -100) -> torch.Tensor:
+    """
+    Applies ArcFace angular margin to target logits.
+    """
+    if margin <= 0:
+        return logits
+
+    valid = targets != ignore_index
+    if not torch.any(valid):
+        return logits
+
+    rows = torch.nonzero(valid, as_tuple=False).squeeze(1)
+    cols = targets[rows]
+
+    tau = torch.clamp(temperature, min=1.0, max=100.0).to(dtype=logits.dtype, device=logits.device)
+    cos_theta = (logits[rows, cols] / tau).clamp(-1.0 + 1e-7, 1.0 - 1e-7)
+    sin_theta = torch.sqrt(torch.clamp(1.0 - cos_theta * cos_theta, min=0.0))
+    cos_m = math.cos(margin)
+    sin_m = math.sin(margin)
+    adjusted = tau * (cos_theta * cos_m - sin_theta * sin_m)
+
+    out = logits.clone()
+    out[rows, cols] = adjusted
+    return out
+
+
 @torch.compile(dynamic=False)
-def model_step(model, ntf, criterion, batch):
+def model_step(model, ntf, criterion, batch, proto_margin: float = 0.0):
     tokens = batch['tokens']
     # shift the tokens to create targets
     ignore_idxs = torch.full((tokens.shape[0], 1),
@@ -65,6 +109,13 @@ def model_step(model, ntf, criterion, batch):
                    encoder_boxes=batch['boxes'])
 
     logits = logits.reshape(-1, logits.shape[-1])
+    proto_head = _get_prototype_head(model)
+    if proto_head is not None and proto_margin > 0.0 and model.training:
+        logits = apply_arcface_margin(logits,
+                                      targets,
+                                      margin=proto_margin,
+                                      temperature=proto_head.temperature,
+                                      ignore_index=criterion.ignore_index)
     return criterion(logits, targets)
 
 
@@ -77,6 +128,7 @@ def get_parameter_groups(model, config) -> list[dict[str, Any]]:
     base_lr = config.lrate
     encoder_params = []
     full_lr_params = []
+    temperature_params = []
 
     # Encoder params -> reduced LR
     for p in model.nn['encoder'].parameters():
@@ -94,10 +146,13 @@ def get_parameter_groups(model, config) -> list[dict[str, Any]]:
             full_lr_params.append(p)
 
     # Decoder params -> base LR (including decoder base layers)
-    for _, p in model.nn['decoder'].named_parameters():
+    for name, p in model.nn['decoder'].named_parameters():
         if not p.requires_grad:
             continue
-        full_lr_params.append(p)
+        if name == 'output.temperature':
+            temperature_params.append(p)
+        else:
+            full_lr_params.append(p)
 
     param_groups = [{'params': encoder_params,
                      'lr': base_lr * config.lr_pretrained_mult,
@@ -105,6 +160,10 @@ def get_parameter_groups(model, config) -> list[dict[str, Any]]:
                     {'params': full_lr_params,
                      'lr': base_lr,
                      'name': 'full_lr'}]
+    if temperature_params:
+        param_groups.append({'params': temperature_params,
+                             'lr': base_lr * 0.1,
+                             'name': 'temperature'})
 
     return param_groups
 
@@ -137,6 +196,9 @@ class PartyTextLineDataModule(L.LightningDataModule):
                 raise ValueError('No valid validation data provided. Please add some.')
             self.train_set.max_seq_len = max(self.train_set.max_seq_len, self.val_set.max_seq_len)
             self.val_set.max_seq_len = self.train_set.max_seq_len
+            self.tokenizer = CodePointTokenizer.merge([self.train_set.tokenizer, self.val_set.tokenizer])
+            self.train_set.tokenizer = self.tokenizer
+            self.val_set.tokenizer = self.tokenizer
             logger.info('Training set language statistics:')
             for lang, count in sorted(self.train_set.lang_counts.items(), key=lambda x: -x[1]):
                 logger.info(f'  {lang}: {count}')
@@ -149,6 +211,7 @@ class PartyTextLineDataModule(L.LightningDataModule):
                                                       batch_size=data_config.val_batch_size)
             if len(self.test_set) == 0:
                 raise ValueError('No valid test data provided. Please add some.')
+            self.tokenizer = self.test_set.tokenizer
         else:
             raise ValueError('Invalid specification of training/evaluation/test data.')
 
@@ -212,16 +275,31 @@ class PartyRecognitionModel(L.LightningModule):
         p_nft = config.noisy_teacher_forcing
         self._target_ntf_p = p_nft
         self._ntf_warmup_steps = max(0, int(getattr(config, 'noisy_teacher_forcing_warmup', 0) or 0))
-        initial_ntf_p = 0.0 if self._ntf_warmup_steps > 0 else p_nft
-        self.noisy_teacher_forcing = nn.Identity() if p_nft == 0. else NoisyTeacherForcing(min_label=OFFSET,
-                                                                                           max_label=LANG_OFFSET,
-                                                                                           p=initial_ntf_p,
-                                                                                           ignore_index=self.criterion.ignore_index)
+        self.noisy_teacher_forcing = nn.Identity()
+        self._init_noisy_teacher_forcing()
 
         self.model_step = model_step
 
     def forward(self, x, curves):
         return self.net(encoder_input=x, encoder_curves=curves)
+
+    def _init_noisy_teacher_forcing(self):
+        p_nft = self._target_ntf_p
+        if p_nft == 0.0:
+            self.noisy_teacher_forcing = nn.Identity()
+            return
+        initial_ntf_p = 0.0 if self._ntf_warmup_steps > 0 else p_nft
+        vocab_size = CODEPOINT_OFFSET
+        tokenizer = getattr(self.net, 'tokenizer', None) if self.net is not None else None
+        if tokenizer is not None:
+            vocab_size = tokenizer.vocab_size
+        if vocab_size <= CODEPOINT_OFFSET:
+            self.noisy_teacher_forcing = nn.Identity()
+            return
+        self.noisy_teacher_forcing = NoisyTeacherForcing(min_label=CODEPOINT_OFFSET,
+                                                         max_label=vocab_size,
+                                                         p=initial_ntf_p,
+                                                         ignore_index=self.criterion.ignore_index)
 
     def _update_noisy_teacher_forcing_p(self):
         if not isinstance(self.noisy_teacher_forcing, NoisyTeacherForcing):
@@ -232,9 +310,21 @@ class PartyRecognitionModel(L.LightningModule):
         ntf_scale = min(1.0, float(self.trainer.global_step + 1) / self._ntf_warmup_steps)
         self.noisy_teacher_forcing.p = self._target_ntf_p * ntf_scale
 
+    def _current_proto_margin(self) -> float:
+        margin = float(getattr(self.hparams.config, 'proto_margin', 0.0))
+        warmup_steps = int(getattr(self.hparams.config, 'warmup', 0) or 0)
+        if margin <= 0.0 or warmup_steps <= 0:
+            return margin
+        scale = min(1.0, float(self.trainer.global_step + 1) / warmup_steps)
+        return margin * scale
+
     def training_step(self, batch, batch_idx):
         self._update_noisy_teacher_forcing_p()
-        loss = self.model_step(self.net, self.noisy_teacher_forcing, self.criterion, batch)
+        loss = self.model_step(self.net,
+                               self.noisy_teacher_forcing,
+                               self.criterion,
+                               batch,
+                               proto_margin=self._current_proto_margin())
         # Handle NaN/Inf losses in DDP by replacing with zero loss
         # This ensures all processes participate in gradient sync while
         # preventing NaN gradients from corrupting the model
@@ -293,8 +383,13 @@ class PartyRecognitionModel(L.LightningModule):
     def setup(self, stage: Optional[str] = None):
         if stage in [None, 'fit']:
             if self.net is None:
+                data_tokenizer = getattr(self.trainer.datamodule, 'tokenizer', None)
                 self.net = PartyModel(model_variant=self.hparams.config.model_variant,
-                                      image_size=self.trainer.datamodule.hparams.data_config.image_size)
+                                      image_size=self.trainer.datamodule.hparams.data_config.image_size,
+                                      tokenizer_state=data_tokenizer.save() if data_tokenizer is not None else None,
+                                      proto_temperature_init=getattr(self.hparams.config, 'proto_temperature_init', 10.0),
+                                      proto_margin=getattr(self.hparams.config, 'proto_margin', 0.0))
+            self._init_noisy_teacher_forcing()
 
             if self.hparams.config.freeze_encoder:
                 for param in self.net.nn['encoder'].parameters():
@@ -308,6 +403,9 @@ class PartyRecognitionModel(L.LightningModule):
         shouldn't be overwritten in on_load_checkpoint.
         """
         checkpoint['_module_config'] = self.hparams.config
+        tokenizer = getattr(self.net, 'tokenizer', None)
+        if tokenizer is not None:
+            checkpoint['_tokenizer_state'] = tokenizer.save()
 
     def on_load_checkpoint(self, checkpoint):
         """
@@ -319,8 +417,15 @@ class PartyRecognitionModel(L.LightningModule):
 
         module_config = checkpoint['_module_config']
         data_config = checkpoint['datamodule_hyper_parameters']['data_config']
+        tokenizer_state = checkpoint.get('_tokenizer_state')
+        proto_temperature_init = getattr(module_config, 'proto_temperature_init', 10.0)
+        proto_margin = getattr(module_config, 'proto_margin', 0.0)
         self.net = PartyModel(model_variant=module_config.model_variant,
-                               image_size=data_config.image_size)
+                               image_size=data_config.image_size,
+                               tokenizer_state=tokenizer_state,
+                               proto_temperature_init=proto_temperature_init,
+                               proto_margin=proto_margin)
+        self._init_noisy_teacher_forcing()
 
     @classmethod
     def load_from_repo(cls,

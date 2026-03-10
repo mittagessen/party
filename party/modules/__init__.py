@@ -8,3 +8,4 @@ from .feed_forward import FeedForward  # NOQA
 from .prompt import PromptEncoder, PromptCrossAttention  # NOQA
 from .position_embeddings import PositionEmbeddingRandom  # NOQA
 from .noisy_teacher_forcing import NoisyTeacherForcing  # NOQA
+from .prototype import PrototypeHead  # NOQA

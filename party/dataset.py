@@ -44,7 +44,7 @@ from torch.distributed import get_rank, get_world_size, is_initialized
 
 from scipy.special import comb
 
-from party.tokenizer import OctetTokenizer
+from party.tokenizer import CodePointTokenizer
 
 
 if TYPE_CHECKING:
@@ -145,10 +145,53 @@ def _to_bbox(boundary, im_size, clamp_tolerance: float = 0.02):
     return pa.scalar(bbox, type=pa.list_(pa.float32()))
 
 
+def _codepoints_from_metadata(raw_metadata: Optional[dict[bytes, bytes]]) -> Optional[list[int]]:
+    if not raw_metadata:
+        return None
+    if b'codepoints' not in raw_metadata:
+        return None
+    try:
+        return json.loads(raw_metadata[b'codepoints'].decode('utf-8'))
+    except Exception:
+        logger.warning('Failed to parse codepoints metadata. Falling back to table scan.')
+        return None
+
+
+def _max_tokens_from_metadata(raw_metadata: Optional[dict[bytes, bytes]]) -> int:
+    if not raw_metadata:
+        return 0
+    if b'max_tokens_in_line' in raw_metadata:
+        return int.from_bytes(raw_metadata[b'max_tokens_in_line'], 'little')
+    if b'max_octets_in_line' in raw_metadata:
+        return int.from_bytes(raw_metadata[b'max_octets_in_line'], 'little')
+    return 0
+
+
+def _merge_codepoint_lists(codepoint_lists: list[list[int]]) -> CodePointTokenizer:
+    merged: list[int] = []
+    seen: set[int] = set()
+    for codepoints in codepoint_lists:
+        for cp in codepoints:
+            if cp not in seen:
+                seen.add(cp)
+                merged.append(cp)
+    return CodePointTokenizer(codepoints=merged, frozen=True)
+
+
+def _tokenizer_from_table(table: pa.Table) -> CodePointTokenizer:
+    tokenizer = CodePointTokenizer()
+    for item in table.column('pages'):
+        page = item.as_py()
+        for line in page['lines']:
+            tokenizer.register_codepoints(line['text'])
+    tokenizer.freeze()
+    return tokenizer
+
+
 def compile(files: Optional[list[Union[str, 'PathLike']]] = None,
             output_file: Union[str, 'PathLike'] = None,
             normalize_whitespace: bool = True,
-            normalization: Optional[Literal['NFD', 'NFC', 'NFKD', 'NFKC']] = None,
+            normalization: Optional[Literal['NFD', 'NFC', 'NFKD', 'NFKC']] = 'NFC',
             max_line_tokens: int = 384,
             resize: Optional[Tuple[int, int]] = None,
             allow_textless: bool = False,
@@ -179,7 +222,7 @@ def compile(files: Optional[list[Union[str, 'PathLike']]] = None,
     page_struct = pa.struct([('im', pa.binary()),
                              ('lines', pa.list_(line_struct))])
 
-    tokenizer = OctetTokenizer()
+    tokenizer = CodePointTokenizer()
 
     if normalization:
         text_transforms.append(partial(F_t.text_normalize, normalization=normalization))
@@ -191,6 +234,7 @@ def compile(files: Optional[list[Union[str, 'PathLike']]] = None,
     # helper variables to enable padding to longest sequence without iterating
     # over set during training.
     max_lines_in_page = 0
+    max_tokens_in_line = 0
     max_octets_in_line = 0
     schema = pa.schema([('pages', page_struct)])
 
@@ -218,6 +262,7 @@ def compile(files: Optional[list[Union[str, 'PathLike']]] = None,
                         continue
                     page_data = []
                     page_lang_counts = Counter()
+                    prev_max_tokens_in_line = max_tokens_in_line
                     prev_max_octets_in_line = max_octets_in_line
                     for line in seg.lines:
                         try:
@@ -241,7 +286,13 @@ def compile(files: Optional[list[Union[str, 'PathLike']]] = None,
                             bbox = _to_bbox(line.boundary, page.image_size)
                             if bbox is None:
                                 continue
-                            max_octets_in_line = max(len(tokenizer.encode(text, add_bos=False, add_eos=False)), max_octets_in_line)
+                            max_octets_in_line = max(len(text.encode('utf-8')), max_octets_in_line)
+                            tokenizer.register_codepoints(text)
+                            n_tokens = len(tokenizer.encode(text,
+                                                            langs=line_langs,
+                                                            add_bos=True,
+                                                            add_eos=True))
+                            max_tokens_in_line = max(n_tokens, max_tokens_in_line)
                             page_data.append(pa.scalar({'text': pa.scalar(text),
                                                         'lang': line_langs,
                                                         'curve': curve,
@@ -251,7 +302,8 @@ def compile(files: Optional[list[Union[str, 'PathLike']]] = None,
                         except Exception:
                             continue
                     # skip pages with lines longer than max_line_tokens
-                    if max_octets_in_line > max_line_tokens:
+                    if max_tokens_in_line > max_line_tokens:
+                        max_tokens_in_line = prev_max_tokens_in_line
                         max_octets_in_line = prev_max_octets_in_line
                         continue
                     if len(page_data) > 1:
@@ -262,9 +314,13 @@ def compile(files: Optional[list[Union[str, 'PathLike']]] = None,
                         max_lines_in_page = max(len(page_data), max_lines_in_page)
                     callback(1, len(files))
         with pa.memory_map(tmpfile.name, 'rb') as source:
+            tokenizer.freeze()
             metadata = {'num_lines': num_lines.to_bytes(4, 'little'),
                         'max_lines_in_page': max_lines_in_page.to_bytes(4, 'little'),
+                        'max_tokens_in_line': max_tokens_in_line.to_bytes(4, 'little'),
+                        # Kept for legacy compatibility with existing datasets/loaders.
                         'max_octets_in_line': max_octets_in_line.to_bytes(4, 'little'),
+                        'codepoints': json.dumps(tokenizer.codepoints).encode('utf-8'),
                         'lang_counts': json.dumps(dict(lang_counts)).encode('utf-8')}
             schema = schema.with_metadata(metadata)
             ds_table = pa.ipc.open_file(source).read_all()
@@ -296,7 +352,8 @@ def collate_sequences(im, page_data, max_seq_len: int, index: int):
     if isinstance(page_data[0][0], str):
         labels = [x for x, _, _ in page_data]
     else:
-        labels = torch.stack([F.pad(x, pad=(0, max_seq_len-len(x)), value=-100) for x, _, _ in page_data]).long()
+        batch_max_seq_len = max(max_seq_len, max(len(x) for x, _, _ in page_data))
+        labels = torch.stack([F.pad(x, pad=(0, batch_max_seq_len-len(x)), value=-100) for x, _, _ in page_data]).long()
     curves = None
     boxes = None
     if page_data[0][1] is not None:
@@ -351,8 +408,7 @@ class BinnedBaselineDataset(Dataset):
         self.max_seq_len = 0
         self._len = 0
 
-        self.tokenizer = OctetTokenizer()
-
+        all_codepoints: list[list[int]] = []
         self.arrow_table = None
         self.pages_per_file = []
         self.lang_counts = Counter()
@@ -363,6 +419,9 @@ class BinnedBaselineDataset(Dataset):
                 raw_metadata = ds_table.schema.metadata
                 if not raw_metadata or b'num_lines' not in raw_metadata:
                     raise ValueError(f'{file} does not contain a valid metadata record.')
+                file_codepoints = _codepoints_from_metadata(raw_metadata)
+                if file_codepoints is not None:
+                    all_codepoints.append(file_codepoints)
                 if b'lang_counts' in raw_metadata:
                     self.lang_counts.update(json.loads(raw_metadata[b'lang_counts']))
                 if not self.arrow_table:
@@ -371,7 +430,13 @@ class BinnedBaselineDataset(Dataset):
                     self.arrow_table = pa.concat_tables([self.arrow_table, ds_table])
                 self.pages_per_file.append(len(ds_table))
                 self._len += int.from_bytes(raw_metadata[b'num_lines'], 'little')
-                self.max_seq_len = max(int.from_bytes(raw_metadata[b'max_octets_in_line'], 'little'), self.max_seq_len)
+                self.max_seq_len = max(_max_tokens_from_metadata(raw_metadata), self.max_seq_len)
+
+        if all_codepoints:
+            self.tokenizer = _merge_codepoint_lists(all_codepoints)
+        else:
+            logger.info('Building code point registry from dataset contents.')
+            self.tokenizer = _tokenizer_from_table(self.arrow_table)
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         item = self.arrow_table.column('pages')[index].as_py()
@@ -384,7 +449,7 @@ class BinnedBaselineDataset(Dataset):
 
         if self.prompt_mode == 'both':
             rng = np.random.default_rng()
-            return_boxes = rng.choice([False, True], 1)
+            return_boxes = bool(rng.choice([False, True]))
         elif self.prompt_mode == 'boxes':
             return_boxes = True
         else:
@@ -441,8 +506,7 @@ class ValidationBaselineDataset(IterableDataset):
         self.batch_size = batch_size
         self.max_seq_len = 0
 
-        self.tokenizer = OctetTokenizer()
-
+        all_codepoints: list[list[int]] = []
         self.arrow_table = None
         self.lang_counts = Counter()
 
@@ -452,13 +516,22 @@ class ValidationBaselineDataset(IterableDataset):
                 raw_metadata = ds_table.schema.metadata
                 if not raw_metadata or b'num_lines' not in raw_metadata:
                     raise ValueError(f'{file} does not contain a valid metadata record.')
+                file_codepoints = _codepoints_from_metadata(raw_metadata)
+                if file_codepoints is not None:
+                    all_codepoints.append(file_codepoints)
                 if b'lang_counts' in raw_metadata:
                     self.lang_counts.update(json.loads(raw_metadata[b'lang_counts']))
                 if not self.arrow_table:
                     self.arrow_table = ds_table
                 else:
                     self.arrow_table = pa.concat_tables([self.arrow_table, ds_table])
-                self.max_seq_len = max(int.from_bytes(raw_metadata[b'max_octets_in_line'], 'little'), self.max_seq_len)
+                self.max_seq_len = max(_max_tokens_from_metadata(raw_metadata), self.max_seq_len)
+
+        if all_codepoints:
+            self.tokenizer = _merge_codepoint_lists(all_codepoints)
+        else:
+            logger.info('Building code point registry from validation dataset contents.')
+            self.tokenizer = _tokenizer_from_table(self.arrow_table)
 
     def __iter__(self):
         device_rank, world_size = (get_rank(), get_world_size()) if is_initialized() else (0, 1)
@@ -501,7 +574,8 @@ class ValidationBaselineDataset(IterableDataset):
                     if return_boxes:
                         boxes.append(torch.tensor(line['bbox']).view(4, 2))
                     tokens.append(torch.tensor(self.tokenizer.encode(line['text'], langs=line['lang'], add_bos=True, add_eos=True), dtype=torch.int32))
-                tokens = torch.stack([F.pad(x, pad=(0, self.max_seq_len-len(x)), value=-100) for x in tokens]).long()
+                batch_max_seq_len = max(self.max_seq_len, max(len(x) for x in tokens))
+                tokens = torch.stack([F.pad(x, pad=(0, batch_max_seq_len-len(x)), value=-100) for x in tokens]).long()
                 boxes = torch.stack(boxes) if len(boxes) else None
                 curves = torch.stack(curves) if len(curves) else None
                 yield {'image': im,
@@ -541,7 +615,7 @@ class TestBaselineDataset(Dataset):
                     self.arrow_table = ds_table
                 else:
                     self.arrow_table = pa.concat_tables([self.arrow_table, ds_table])
-                self.max_seq_len = max(int.from_bytes(raw_metadata[b'max_octets_in_line'], 'little'), self.max_seq_len)
+                self.max_seq_len = max(_max_tokens_from_metadata(raw_metadata), self.max_seq_len)
 
     def __len__(self):
         return len(self.arrow_table)

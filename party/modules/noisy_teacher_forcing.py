@@ -32,7 +32,7 @@ class NoisyTeacherForcing(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         noise = torch.randint_like(x, low=self.min_label, high=self.max_label)
         prob = torch.rand_like(x, dtype=torch.float)
-        # Only perturb text byte tokens and never touch ignore/padding entries.
+        # Only perturb text/code-point tokens and never touch ignore/padding entries.
         valid_tokens = (x >= self.min_label) & (x < self.max_label)
         if self.ignore_index is not None:
             valid_tokens &= x != self.ignore_index

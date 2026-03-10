@@ -29,8 +29,9 @@ from collections.abc import Generator
 from typing import Optional, Union, TYPE_CHECKING, Any
 
 from party.modules import (PromptEncoder, MultiHeadAttention, FeedForward,
-                           TransformerSelfAttentionLayer, RMSNorm, TanhGate)
-from party.tokenizer import OctetTokenizer
+                           TransformerSelfAttentionLayer, RMSNorm, TanhGate,
+                           PrototypeHead)
+from party.tokenizer import CodePointTokenizer
 from party.configs import get_model_variant
 from party.fusion import PartyMultiScaleAdapter, bytellama_vision_decoder
 from party.dataset import get_default_transforms, _to_curve, _to_bbox
@@ -160,14 +161,29 @@ class PartyModel(nn.Module, RecognitionBaseModel):
     """
     model_type = ['recognition']
     _kraken_min_version = '6.0.0'
-    tokenizer = OctetTokenizer()
 
     def __init__(self, **kwargs):
         super().__init__()
 
+        tokenizer_state = kwargs.pop('tokenizer_state', None)
+        tokenizer_arg = kwargs.pop('tokenizer', None)
+        proto_temperature_init = kwargs.pop('proto_temperature_init', 10.0)
+        proto_margin = kwargs.pop('proto_margin', 0.0)
+
         self.user_metadata: dict[str, Any] = {'accuracy': [],
                                               'metrics': []}
         self.user_metadata.update(kwargs)
+        self.user_metadata['proto_temperature_init'] = proto_temperature_init
+        self.user_metadata['proto_margin'] = proto_margin
+
+        if isinstance(tokenizer_arg, CodePointTokenizer):
+            self.tokenizer = tokenizer_arg
+        elif isinstance(tokenizer_arg, dict):
+            self.tokenizer = CodePointTokenizer.load(tokenizer_arg)
+        else:
+            self.tokenizer = CodePointTokenizer.load(tokenizer_state)
+        self.tokenizer.freeze()
+        self.user_metadata['tokenizer'] = self.tokenizer.save()
 
         model_variant = kwargs['model_variant']
         image_size = kwargs['image_size']
@@ -194,6 +210,7 @@ class PartyModel(nn.Module, RecognitionBaseModel):
 
         # 3. Build decoder
         decoder = bytellama_vision_decoder(
+            vocab_size=self.tokenizer.vocab_size,
             pretrained=variant['decoder']['name'] if pretrained else None,
             num_layers=variant['decoder']['num_layers'],
             num_heads=variant['decoder']['num_heads'],
@@ -201,7 +218,9 @@ class PartyModel(nn.Module, RecognitionBaseModel):
             embed_dim=variant['decoder']['embed_dim'],
             intermediate_dim=variant['decoder']['intermediate_dim'],
             encoder_max_seq_len=adapter_seq_len,
-            fusion_interval=variant['fusion_interval'])
+            fusion_interval=variant['fusion_interval'],
+            temperature_init=proto_temperature_init,
+            margin=proto_margin)
         decoder_embed_dim = decoder.tok_embeddings.embedding_dim
 
         # 4. Build adapter
@@ -334,6 +353,90 @@ class PartyModel(nn.Module, RecognitionBaseModel):
         """
         encoder_hidden_states = self.nn['encoder'](encoder_input)
         return self.nn['adapter'](encoder_hidden_states)
+
+    def _prototype_head(self) -> PrototypeHead:
+        output = self.nn['decoder'].output
+        if not isinstance(output, PrototypeHead):
+            raise TypeError('Decoder output projection is not a PrototypeHead.')
+        return output
+
+    @torch.no_grad()
+    def extend_prototypes(self, new_vectors: torch.Tensor) -> nn.Embedding:
+        """
+        Extends the shared token/prototype embedding table with new vectors.
+        """
+        head = self._prototype_head()
+        resized = head.extend_prototypes(new_vectors)
+        head.tie_embeddings(resized)
+        self.nn['decoder'].tok_embeddings = resized
+        return resized
+
+    @torch.no_grad()
+    def add_codepoints_with_prototypes(self,
+                                       codepoints: list[int],
+                                       prototype_vectors: torch.Tensor) -> list[int]:
+        """
+        Registers new code points and appends matching prototype vectors.
+
+        Returns:
+            Token IDs of newly added code points.
+        """
+        if prototype_vectors.ndim != 2:
+            raise ValueError(f'Expected 2D prototype tensor, got {tuple(prototype_vectors.shape)}')
+        if len(codepoints) != prototype_vectors.shape[0]:
+            raise ValueError(
+                f'Number of code points ({len(codepoints)}) does not match '
+                f'number of vectors ({prototype_vectors.shape[0]}).'
+            )
+
+        new_codepoints = []
+        vector_by_codepoint: dict[int, torch.Tensor] = {}
+        for codepoint, vector in zip(codepoints, prototype_vectors):
+            cp = int(codepoint)
+            if self.tokenizer.token_for_codepoint(cp) is not None:
+                continue
+            new_codepoints.append(cp)
+            vector_by_codepoint[cp] = vector
+
+        if not new_codepoints:
+            return []
+
+        self.tokenizer.thaw()
+        try:
+            added_codepoints = self.tokenizer.register_codepoint_values(new_codepoints)
+        finally:
+            self.tokenizer.freeze()
+
+        if not added_codepoints:
+            return []
+
+        ordered_vectors = torch.stack([vector_by_codepoint[cp] for cp in added_codepoints], dim=0)
+        self.extend_prototypes(ordered_vectors)
+        self.user_metadata['tokenizer'] = self.tokenizer.save()
+        return [self.tokenizer.token_for_codepoint(cp) for cp in added_codepoints]
+
+    @torch.no_grad()
+    def add_codepoints_from_support(self,
+                                    support_codepoints: list[int],
+                                    support_vectors: torch.Tensor) -> list[int]:
+        """
+        Initializes prototypes for unseen code points as support-set means.
+        """
+        if support_vectors.ndim != 2:
+            raise ValueError(f'Expected 2D support tensor, got {tuple(support_vectors.shape)}')
+        if len(support_codepoints) != support_vectors.shape[0]:
+            raise ValueError(
+                f'Number of support labels ({len(support_codepoints)}) does not match '
+                f'number of support vectors ({support_vectors.shape[0]}).'
+            )
+
+        grouped: dict[int, list[torch.Tensor]] = {}
+        for codepoint, vector in zip(support_codepoints, support_vectors):
+            grouped.setdefault(int(codepoint), []).append(vector)
+
+        codepoints = list(grouped.keys())
+        mean_vectors = torch.stack([torch.stack(vectors, dim=0).mean(dim=0) for vectors in grouped.values()], dim=0)
+        return self.add_codepoints_with_prototypes(codepoints, mean_vectors)
 
     def prepare_for_inference(self, config: 'Config'):
         """
