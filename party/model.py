@@ -263,6 +263,8 @@ class PartyRecognitionModel(L.LightningModule):
         # through the model after replacing ignored indices.
         tokens.masked_fill_(tokens == self.criterion.ignore_index, 0)
 
+        valid_mask = targets != self.criterion.ignore_index
+
         if batch['curves'] is not None:
             logits = self.net(tokens=tokens,
                               encoder_input=batch['image'],
@@ -271,7 +273,7 @@ class PartyRecognitionModel(L.LightningModule):
 
             logits = logits.reshape(-1, logits.shape[-1])
             loss = nn.CrossEntropyLoss(reduction='none')(logits, targets)
-            self.val_mean.update(loss)
+            self.val_mean.update(loss[valid_mask])
 
         if batch['boxes'] is not None:
             logits = self.net(tokens=tokens,
@@ -281,7 +283,7 @@ class PartyRecognitionModel(L.LightningModule):
 
             logits = logits.reshape(-1, logits.shape[-1])
             loss = nn.CrossEntropyLoss(reduction='none')(logits, targets)
-            self.val_mean.update(loss)
+            self.val_mean.update(loss[valid_mask])
         return loss
 
     def on_validation_epoch_end(self):

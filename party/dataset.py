@@ -241,7 +241,7 @@ def compile(files: Optional[list[Union[str, 'PathLike']]] = None,
                             bbox = _to_bbox(line.boundary, page.image_size)
                             if bbox is None:
                                 continue
-                            max_octets_in_line = max(len(tokenizer.encode(text, add_bos=False, add_eos=False)), max_octets_in_line)
+                            max_octets_in_line = max(len(tokenizer.encode(text, langs=line_langs, add_bos=True, add_eos=True)), max_octets_in_line)
                             page_data.append(pa.scalar({'text': pa.scalar(text),
                                                         'lang': line_langs,
                                                         'curve': curve,
