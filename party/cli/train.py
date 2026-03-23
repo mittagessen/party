@@ -233,7 +233,7 @@ def train(ctx, **kwargs):
         raise click.BadOptionUsage('freq', 'freq needs to be either in the interval [0,1.0] or a positive integer.')
 
     if sum(map(bool, [resume, load, train_from_scratch])) > 1:
-        raise click.BadOptionsUsage('load', 'load/resume/train_from_scratch options are mutually exclusive.')
+        raise click.BadOptionUsage('load', 'load/resume/train_from_scratch options are mutually exclusive.')
     elif resume is None and load is None and train_from_scratch is False:
         load = '10.5281/zenodo.15075344'
 
@@ -367,7 +367,7 @@ def train(ctx, **kwargs):
 
     with threadpool_limits(limits=ctx.meta['num_threads']):
         if resume:
-            trainer.fit(model, data_module, ckpt_path=resume)
+            trainer.fit(model, data_module, ckpt_path=resume, weights_only=False)
         else:
             trainer.fit(model, data_module)
 
