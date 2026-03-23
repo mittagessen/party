@@ -272,7 +272,7 @@ def train(ctx, **kwargs):
     m_config = PartyRecognitionTrainingConfig(**params)
 
     if resume:
-        data_module = PartyTextLineDataModule.load_from_checkpoint(resume)
+        data_module = PartyTextLineDataModule.load_from_checkpoint(resume, weights_only=False)
     else:
         data_module = PartyTextLineDataModule(dm_config)
 
@@ -351,13 +351,13 @@ def train(ctx, **kwargs):
             if load.endswith('safetensors'):
                 model = PartyRecognitionModel.load_from_weights(load, config=m_config)
             elif load.endswith('ckpt'):
-                model = PartyRecognitionModel.load_from_checkpoint(load, config=m_config)
+                model = PartyRecognitionModel.load_from_checkpoint(load, config=m_config, weights_only=False)
             else:
                 message(f'Loading from zenodo repository {load}.')
                 model = PartyRecognitionModel.load_from_repo(load, config=m_config)
         elif resume:
             message(f'Resuming from checkpoint {resume}.')
-            model = PartyRecognitionModel.load_from_checkpoint(resume)
+            model = PartyRecognitionModel.load_from_checkpoint(resume, weights_only=False)
 
     try:
         (entry_point,) = importlib.metadata.entry_points(group='kraken.writers', name=params['weights_format'])
