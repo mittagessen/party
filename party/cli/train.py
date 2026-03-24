@@ -187,6 +187,11 @@ def compile(ctx, output, files, normalization, normalize_whitespace,
 @click.option('--accumulate-grad-batches', type=int, help='Number of batches to accumulate gradient across.')
 @click.option('--validate-before-train/--no-validate-before-train', default=True, help='Enables validation run before first training run.')
 @click.option('--sampling-weights', type=click.UNPROCESSED, default=repeat(1), hidden=True)
+@click.option('--logger',
+              'pl_logger',
+              type=click.Choice(['tensorboard', 'wandb']),
+              default=None,
+              help='Logger to use for training.')
 @click.argument('ground_truth', nargs=-1, callback=_expand_gt, type=click.Path(exists=False, dir_okay=False))
 def train(ctx, **kwargs):
     """
@@ -251,7 +256,8 @@ def train(ctx, **kwargs):
 
     cbs = [RichModelSummary(max_depth=2)]
 
-    checkpoint_callback = ModelCheckpoint(dirpath=params.pop('output'),
+    output_dir = params.pop('output')
+    checkpoint_callback = ModelCheckpoint(dirpath=output_dir,
                                           save_top_k=10,
                                           monitor='global_step',
                                           mode='max',
@@ -259,6 +265,29 @@ def train(ctx, **kwargs):
                                           filename='checkpoint_{epoch:02d}-{val_metric:.4f}')
 
     cbs.append(checkpoint_callback)
+
+    if params.get('pl_logger') == 'tensorboard':
+        try:
+            import tensorboard  # NOQA
+        except ImportError:
+            raise click.BadOptionUsage('logger', 'tensorboard logger needs the `tensorboard` package installed.')
+
+    if params.get('pl_logger') == 'wandb':
+        try:
+            import wandb  # NOQA
+        except ImportError:
+            raise click.BadOptionUsage('logger', 'wandb logger needs the `wandb` package installed.')
+
+    pl_logger = None
+    if params.get('pl_logger') == 'tensorboard':
+        from lightning.pytorch.loggers import TensorBoardLogger
+        pl_logger = TensorBoardLogger(save_dir=output_dir)
+    elif params.get('pl_logger') == 'wandb':
+        from lightning.pytorch.loggers import WandbLogger
+        pl_logger = WandbLogger(project='party',
+                                save_dir=output_dir,
+                                log_model=False)
+
     if not ctx.meta['verbose']:
         cbs.append(RichProgressBar(leave=True))
 
@@ -283,6 +312,7 @@ def train(ctx, **kwargs):
                       callbacks=cbs,
                       gradient_clip_val=params['gradient_clip_val'],
                       num_sanity_val_steps=0,
+                      logger=pl_logger if pl_logger else False,
                       use_distributed_sampler=False,
                       **val_check_interval)
 
