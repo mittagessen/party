@@ -225,6 +225,11 @@ def compile(ctx, output, files, normalization, normalize_whitespace,
               default=RECOGNITION_HYPER_PARAMS['accumulate_grad_batches'],
               help='Number of batches to accumulate gradient across.')
 @click.option('--validate-before-train/--no-validate-before-train', show_default=True, default=True, help='Enables validation run before first training run.')
+@click.option('--logger',
+              'pl_logger',
+              type=click.Choice(['tensorboard', 'wandb']),
+              default=None,
+              help='Logger to use for training.')
 @click.argument('ground_truth', nargs=-1, callback=_expand_gt, type=click.Path(exists=False, dir_okay=False))
 def train(ctx, load_from_checkpoint, load_from_safetensors, load_from_repo,
           train_from_scratch, resume_from_checkpoint, batch_size, output, freq,
@@ -233,7 +238,7 @@ def train(ctx, load_from_checkpoint, load_from_safetensors, load_from_repo,
           gamma, step_size, sched_patience, cos_max, cos_min_lr,
           training_files, evaluation_files, workers, threads, augment,
           prompt_mode, accumulate_grad_batches, validate_before_train,
-          ground_truth):
+          pl_logger, ground_truth):
     """
     Trains a model from image-text pairs.
     """
@@ -315,6 +320,30 @@ def train(ctx, load_from_checkpoint, load_from_safetensors, load_from_repo,
                                          batch_size=batch_size,
                                          num_workers=workers)
 
+    if pl_logger == 'tensorboard':
+        try:
+            import tensorboard  # NOQA
+        except ImportError:
+            raise click.BadOptionUsage('logger', 'tensorboard logger needs the `tensorboard` package installed.')
+
+    if pl_logger == 'wandb':
+        try:
+            import wandb  # NOQA
+        except ImportError:
+            raise click.BadOptionUsage('logger', 'wandb logger needs the `wandb` package installed.')
+
+    checkpoint_path = output
+
+    pl_logger_instance = None
+    if pl_logger == 'tensorboard':
+        from lightning.pytorch.loggers import TensorBoardLogger
+        pl_logger_instance = TensorBoardLogger(save_dir=checkpoint_path)
+    elif pl_logger == 'wandb':
+        from lightning.pytorch.loggers import WandbLogger
+        pl_logger_instance = WandbLogger(project='party',
+                                         save_dir=checkpoint_path,
+                                         log_model=False)
+
     cbs = [RichModelSummary(max_depth=2)]
 
     checkpoint_callback = ModelCheckpoint(dirpath=output,
@@ -340,6 +369,7 @@ def train(ctx, load_from_checkpoint, load_from_safetensors, load_from_repo,
                       callbacks=cbs,
                       gradient_clip_val=hyper_params['gradient_clip_val'],
                       num_sanity_val_steps=0,
+                      logger=pl_logger_instance if pl_logger_instance else False,
                       **val_check_interval)
 
     with trainer.init_module(empty_init=True):

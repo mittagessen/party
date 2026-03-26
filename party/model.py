@@ -150,29 +150,27 @@ class RecognitionModel(L.LightningModule):
         # through the model after replacing ignored indices.
         tokens.masked_fill_(tokens == self.criterion.ignore_index, 0)
 
-        batch_size = self.hparams.batch_size
+        valid_mask = targets != self.criterion.ignore_index
 
         if batch['curves'] is not None:
-            for batch_tokens, batch_targets, batch_curves in zip(tokens.split(batch_size), targets.split(batch_size), batch['curves'].split(batch_size)):
-                logits = self.model(tokens=tokens,
-                                    encoder_input=batch['image'],
-                                    encoder_curves=batch['curves'],
-                                    encoder_boxes=None)
+            logits = self.model(tokens=tokens,
+                                encoder_input=batch['image'],
+                                encoder_curves=batch['curves'],
+                                encoder_boxes=None)
 
-                logits = logits.reshape(-1, logits.shape[-1])
-                loss = nn.CrossEntropyLoss(reduction='none')(logits, targets)
-                self.val_mean.update(loss)
+            logits = logits.reshape(-1, logits.shape[-1])
+            loss = nn.CrossEntropyLoss(reduction='none')(logits, targets)
+            self.val_mean.update(loss[valid_mask])
 
         if batch['boxes'] is not None:
-            for batch_tokens, batch_targets, batch_boxes in zip(tokens.split(batch_size), targets.split(batch_size), batch['boxes'].split(batch_size)):
-                logits = self.model(tokens=tokens,
-                                    encoder_input=batch['image'],
-                                    encoder_curves=None,
-                                    encoder_boxes=batch['boxes'])
+            logits = self.model(tokens=tokens,
+                                encoder_input=batch['image'],
+                                encoder_curves=None,
+                                encoder_boxes=batch['boxes'])
 
-                logits = logits.reshape(-1, logits.shape[-1])
-                loss = nn.CrossEntropyLoss(reduction='none')(logits, targets)
-                self.val_mean.update(loss)
+            logits = logits.reshape(-1, logits.shape[-1])
+            loss = nn.CrossEntropyLoss(reduction='none')(logits, targets)
+            self.val_mean.update(loss[valid_mask])
         return loss
 
     def on_validation_epoch_end(self):
