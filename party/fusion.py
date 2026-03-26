@@ -182,12 +182,16 @@ def bytellama_vision_decoder(vocab_size: int = TOKEN_NUM,
         from safetensors import safe_open
         with safe_open(weight_path, framework='pt') as f:
             state_dict = {k: f.get_tensor(k) for k in f.keys()}
-        rweight = torch.zeros(TOKEN_NUM - 259, config['embed_dim'])
+        existing_weight = state_dict['tok_embeddings.weight']
+        rweight = torch.zeros(TOKEN_NUM - existing_weight.shape[0], config['embed_dim'],
+                              device=existing_weight.device, dtype=existing_weight.dtype)
         torch.nn.init.xavier_uniform_(rweight)
-        state_dict['tok_embeddings.weight'] = torch.cat([state_dict['tok_embeddings.weight'], rweight], dim=0)
-        rweight = rweight.clone()
+        state_dict['tok_embeddings.weight'] = torch.cat([existing_weight, rweight], dim=0)
+        existing_weight = state_dict['output.weight']
+        rweight = torch.zeros(TOKEN_NUM - existing_weight.shape[0], config['embed_dim'],
+                              device=existing_weight.device, dtype=existing_weight.dtype)
         torch.nn.init.xavier_uniform_(rweight)
-        state_dict['output.weight'] = torch.cat([state_dict['output.weight'], rweight], dim=0)
+        state_dict['output.weight'] = torch.cat([existing_weight, rweight], dim=0)
         decoder.load_state_dict(state_dict, strict=False)
 
     return decoder
