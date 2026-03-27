@@ -85,7 +85,7 @@ class RecognitionModel(L.LightningModule):
                  decoder_embed_dim: int = 576,
                  decoder_intermediate_dim: int = 1536,
                  decoder_fusion_interval: int = 3,
-                 pretrained: bool = True,
+                 pretrained: bool = False,
                  freeze_encoder: bool = RECOGNITION_HYPER_PARAMS['freeze_encoder'],
                  batch_size: int = RECOGNITION_HYPER_PARAMS['batch_size'],
                  **kwargs):
@@ -116,6 +116,7 @@ class RecognitionModel(L.LightningModule):
                                                  intermediate_dim=decoder_intermediate_dim,
                                                  fusion_interval=decoder_fusion_interval,
                                                  pretrained=decoder if pretrained else None,
+                                                 config_from_pretrained=False,
                                                  encoder_max_seq_len=encoder_input_size[0] // l_red * encoder_input_size[1] // l_red)
 
         self.model = PartyModel(encoder=encoder_model,

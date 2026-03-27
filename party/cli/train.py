@@ -375,7 +375,7 @@ def train(ctx, load_from_checkpoint, load_from_safetensors, load_from_repo,
     with trainer.init_module(empty_init=True):
         if train_from_scratch:
             message('Initializing new model.')
-            model = RecognitionModel(**hyper_params)
+            model = RecognitionModel(**dict(hyper_params, pretrained=False))
         elif load_from_checkpoint:
             message(f'Loading from checkpoint {load_from_checkpoint}.')
             model = RecognitionModel.load_from_checkpoint(load_from_checkpoint,

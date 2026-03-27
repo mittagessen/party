@@ -50,6 +50,7 @@ def bytellama_vision_decoder(vocab_size: int = TOKEN_NUM,
                              encoder_max_seq_len: int = 4800,  # start of fusion parameters
                              fusion_interval: int = 3,
                              pretrained: Optional[str] = None,
+                             config_from_pretrained: bool = False,
                              **kwargs) -> TransformerDecoder:
     """
     Builds a vision decoder from a ByteLlama model with additional fused cross
@@ -77,8 +78,11 @@ def bytellama_vision_decoder(vocab_size: int = TOKEN_NUM,
             by :func:`~party.modules.KVCache`.
         fusion_interval (int): interval number of layers between fusion layers.
         pretrained (str): huggingface hub identifier of pretrained bytellama
-                          weights. All hyperparameters will except
-                          encoder_max_seq_len will be ignored.
+                          weights.
+        config_from_pretrained (bool): If True, merge model geometry from the
+                          pretrained repository config before instantiation.
+                          If False, keep the explicitly supplied geometry and
+                          only load compatible pretrained weights.
 
     Returns:
         TransformerDecoder: Instantiation of Llama 3.2 vision decoder.
@@ -96,7 +100,7 @@ def bytellama_vision_decoder(vocab_size: int = TOKEN_NUM,
               'encoder_max_seq_len': encoder_max_seq_len,
               'fusion_interval': fusion_interval}
 
-    if pretrained:
+    if pretrained and config_from_pretrained:
         from huggingface_hub import hf_hub_download
         with open(hf_hub_download(repo_id=pretrained, filename='config.json'), 'r') as fp:
             config.update(json.load(fp))
@@ -178,6 +182,7 @@ def bytellama_vision_decoder(vocab_size: int = TOKEN_NUM,
                                  output=output_proj)
 
     if pretrained:
+        from huggingface_hub import hf_hub_download
         weight_path = hf_hub_download(repo_id=pretrained, filename='model.safetensors')
         from safetensors import safe_open
         with safe_open(weight_path, framework='pt') as f:
