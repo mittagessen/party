@@ -111,6 +111,37 @@ def _to_bbox(boundary, im_size):
     return pa.scalar(bbox, type=pa.list_(pa.float32()))
 
 
+def _get_line_langs(line: dict[str, Any], page_lang: Optional[str] = None) -> List[str]:
+    """
+    Extracts language tags from either the current page-level schema or older
+    line-level schemas.
+    """
+    langs = line.get('lang')
+    if langs:
+        if isinstance(langs, str):
+            return [langs]
+        return list(langs)
+    if page_lang:
+        return [page_lang]
+    return ['und']
+
+
+def _get_page_lang(item: dict[str, Any]) -> str:
+    """
+    Returns a single representative page language for compatibility with
+    datasets compiled before the page-level language field existed.
+    """
+    page_lang = item.get('lang')
+    if page_lang:
+        return page_lang
+    page_data = item.get('lines', [])
+    if page_data:
+        langs = _get_line_langs(page_data[0])
+        if langs:
+            return langs[0]
+    return 'und'
+
+
 def compile(files: Optional[List[Union[str, 'PathLike']]] = None,
             output_file: Union[str, 'PathLike'] = None,
             normalize_whitespace: bool = True,
@@ -196,7 +227,11 @@ def compile(files: Optional[List[Union[str, 'PathLike']]] = None,
                             if not line.baseline:
                                 logger.info('No baseline given for line')
                                 continue
-                            max_octets_in_line = max(len(tokenizer.encode(text, add_bos=False, add_eos=False)), max_octets_in_line)
+                            max_octets_in_line = max(len(tokenizer.encode(text,
+                                                                         langs=[lang],
+                                                                         add_bos=True,
+                                                                         add_eos=True)),
+                                                     max_octets_in_line)
                             page_data.append(pa.scalar({'text': pa.scalar(text),
                                                         'curve': _to_curve(line.baseline, im_size),
                                                         'bbox': _to_bbox(line.boundary, im_size)},
@@ -292,11 +327,14 @@ class TextLineDataModule(L.LightningDataModule):
         """
         self.train_set = BinnedBaselineDataset(self.hparams.training_data,
                                                im_transforms=self.im_transforms,
+                                               prompt_mode=self.hparams.prompt_mode,
                                                augmentation=self.hparams.augmentation,
                                                batch_size=self.hparams.batch_size)
         self.val_set = ValidationBaselineDataset(self.hparams.evaluation_data,
                                                  im_transforms=self.im_transforms,
-                                                 augmentation=self.hparams.augmentation)
+                                                 prompt_mode=self.hparams.prompt_mode,
+                                                 augmentation=False,
+                                                 batch_size=self.hparams.batch_size)
         self.train_set.max_seq_len = max(self.train_set.max_seq_len, self.val_set.max_seq_len)
         self.val_set.max_seq_len = self.train_set.max_seq_len
 
@@ -378,7 +416,7 @@ class BinnedBaselineDataset(Dataset):
 
         item = self.arrow_table.column('pages')[idx].as_py()
         logger.debug(f'Attempting to load {item["im"]}')
-        im, lang, page_data = item['im'], item['lang'], item['lines']
+        im, page_lang, page_data = item['im'], _get_page_lang(item), item['lines']
         try:
             im = Image.open(io.BytesIO(im)).convert('RGB')
         except Exception:
@@ -400,7 +438,11 @@ class BinnedBaselineDataset(Dataset):
             return_boxes = False
         for x in rng.choice(len(page_data), self.batch_size, replace=True, shuffle=False):
             line = page_data[x]
-            tokens = torch.tensor(self.tokenizer.encode(line['text'], langs=[lang], add_bos=True, add_eos=True), dtype=torch.int32)
+            tokens = torch.tensor(self.tokenizer.encode(line['text'],
+                                                        langs=_get_line_langs(line, page_lang),
+                                                        add_bos=True,
+                                                        add_eos=True),
+                                  dtype=torch.int32)
             curve = torch.tensor(line['curve']).view(4, 2) if not return_boxes else None
             bbox = torch.tensor(line['bbox']).view(4, 2) if return_boxes else None
             sample.append((tokens, curve, bbox))
@@ -469,7 +511,7 @@ class ValidationBaselineDataset(IterableDataset):
         for item in self.arrow_table.column('pages')[replica_rank::num_replicas]:
             item = item.as_py()
             logger.debug(f'Attempting to load {item["im"]}')
-            im, lang, page_data = item['im'], item['lang'], item['lines']
+            im, page_lang, page_data = item['im'], _get_page_lang(item), item['lines']
             im = Image.open(io.BytesIO(im)).convert('RGB')
             im = self.transforms(im)
             if self.aug:
@@ -498,7 +540,11 @@ class ValidationBaselineDataset(IterableDataset):
                         curves.append(torch.tensor(line['curve']).view(4, 2))
                     if return_boxes:
                         boxes.append(torch.tensor(line['bbox']).view(4, 2))
-                    tokens.append(torch.tensor(self.tokenizer.encode(line['text'], langs=[lang], add_bos=True, add_eos=True), dtype=torch.int32))
+                    tokens.append(torch.tensor(self.tokenizer.encode(line['text'],
+                                                                     langs=_get_line_langs(line, page_lang),
+                                                                     add_bos=True,
+                                                                     add_eos=True),
+                                               dtype=torch.int32))
 
                 tokens = torch.stack([F.pad(x, pad=(0, self.max_seq_len-len(x)), value=-100) for x in tokens]).long()
                 boxes = torch.stack(boxes) if len(boxes) else None
@@ -549,7 +595,7 @@ class TestBaselineDataset(Dataset):
         from kraken.containers import Segmentation, BaselineLine, BBoxLine
 
         item = self.arrow_table.column('pages')[index].as_py()
-        im, lang, page_data = item['im'], item['lang'], item['lines']
+        im, page_lang, page_data = item['im'], _get_page_lang(item), item['lines']
         im = Image.open(io.BytesIO(im)).convert('RGB')
 
         if self.prompt_mode == 'curves':
@@ -564,7 +610,7 @@ class TestBaselineDataset(Dataset):
                                 script_detection=False,
                                 text_direction='horizontal-lr',
                                 lines=lines,
-                                language=[lang])
+                                language=[page_lang])
 
 
 # magic lsq cubic bezier fit function from the internet.

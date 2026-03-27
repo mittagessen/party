@@ -108,7 +108,7 @@ def bytellama_vision_decoder(vocab_size: int = TOKEN_NUM,
     layers = []
 
     rope = Llama3ScaledRoPE(dim=head_dim, max_seq_len=config['max_seq_len'], base=config['rope_base'])
-    for idx in range(1, num_layers + 1):
+    for idx in range(1, config['num_layers'] + 1):
 
         # Self attention layers for text decoder
         self_attn = MultiHeadAttention(

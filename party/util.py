@@ -35,21 +35,22 @@ def checkpoint_to_kraken(checkpoint_path: Union[str, 'PathLike'],
     """
     state_dict = torch.load(checkpoint_path, map_location=torch.device('cpu'), weights_only=True)
     # we do not have configurable encoders/decoders
+    hyper_params = state_dict['hyper_parameters']
     config = {"prompt_mode": state_dict['datamodule_hyper_parameters']['prompt_mode'],
               "decoder_vocab_size": TOKEN_NUM,
-              "decoder_num_layers": 30,
-              "decoder_num_heads": 9,
-              "decoder_num_kv_heads": 3,
-              "decoder_embed_dim": 576,
+              "decoder_num_layers": hyper_params.get('decoder_num_layers', 12),
+              "decoder_num_heads": hyper_params.get('decoder_num_heads', 9),
+              "decoder_num_kv_heads": hyper_params.get('decoder_num_kv_heads', 3),
+              "decoder_embed_dim": hyper_params.get('decoder_embed_dim', 576),
               "decoder_max_seq_len": 384,
-              "decoder_intermediate_dim": 1536,
+              "decoder_intermediate_dim": hyper_params.get('decoder_intermediate_dim', 1536),
               "decoder_attn_dropout": 0.0,
               "decoder_norm_eps": 1e-05,
               "decoder_rope_base": 10000,
               "decoder_encoder_max_seq_len": 19200,
-              "decoder_fusion_interval": 3,
-              "encoder_input_size": state_dict['hyper_parameters']['encoder_input_size'],
-              "encoder_name": state_dict['hyper_parameters']['encoder']}
+              "decoder_fusion_interval": hyper_params.get('decoder_fusion_interval', 3),
+              "encoder_input_size": hyper_params['encoder_input_size'],
+              "encoder_name": hyper_params['encoder']}
     model_type = 'kraken_llama_party'
     metadata = {'model_type': model_type,
                 'config': json.dumps(config)}

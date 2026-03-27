@@ -29,6 +29,7 @@ from typing import Literal, Tuple
 
 from torchmetrics.aggregation import MeanMetric
 
+from party.default_specs import RECOGNITION_HYPER_PARAMS
 from party.fusion import bytellama_vision_decoder, PartyModel
 
 logger = logging.getLogger(__name__)
@@ -61,26 +62,32 @@ class RecognitionModel(L.LightningModule):
     recognition model.
     """
     def __init__(self,
-                 quit: Literal['fixed', 'early'] = 'fixed',
-                 lag: int = 10,
-                 optimizer: str = 'Mars',
-                 lr: float = 1e-3,
-                 momentum: float = 0.9,
-                 weight_decay: float = 1e-3,
-                 schedule: Literal['cosine', 'exponential', 'step', 'reduceonplateau', 'constant'] = 'cosine',
-                 step_size: int = 10,
-                 gamma: float = 0.1,
-                 rop_factor: float = 0.1,
-                 rop_patience: int = 5,
-                 cos_t_max: float = 30,
-                 cos_min_lr: float = 1e-4,
-                 warmup: int = 15000,
-                 encoder: str = 'swin_base_patch4_window12_384.ms_in22k',
+                 quit: Literal['fixed', 'early'] = RECOGNITION_HYPER_PARAMS['quit'],
+                 lag: int = RECOGNITION_HYPER_PARAMS['lag'],
+                 optimizer: str = RECOGNITION_HYPER_PARAMS['optimizer'],
+                 lr: float = RECOGNITION_HYPER_PARAMS['lr'],
+                 momentum: float = RECOGNITION_HYPER_PARAMS['momentum'],
+                 weight_decay: float = RECOGNITION_HYPER_PARAMS['weight_decay'],
+                 schedule: Literal['cosine', 'exponential', 'step', 'reduceonplateau', 'constant'] = RECOGNITION_HYPER_PARAMS['schedule'],
+                 step_size: int = RECOGNITION_HYPER_PARAMS['step_size'],
+                 gamma: float = RECOGNITION_HYPER_PARAMS['gamma'],
+                 rop_factor: float = RECOGNITION_HYPER_PARAMS['rop_factor'],
+                 rop_patience: int = RECOGNITION_HYPER_PARAMS['rop_patience'],
+                 cos_t_max: float = RECOGNITION_HYPER_PARAMS['cos_t_max'],
+                 cos_min_lr: float = RECOGNITION_HYPER_PARAMS['cos_min_lr'],
+                 warmup: int = RECOGNITION_HYPER_PARAMS['warmup'],
+                 encoder: str = 'swin_tiny_patch4_window7_224',
                  encoder_input_size: Tuple[int, int] = (2560, 1920),
-                 decoder: str = 'mittagessen/bytellama_oscar',
+                 decoder: str = 'mittagessen/bytellama-43m-cc',
+                 decoder_num_layers: int = 12,
+                 decoder_num_heads: int = 9,
+                 decoder_num_kv_heads: int = 3,
+                 decoder_embed_dim: int = 576,
+                 decoder_intermediate_dim: int = 1536,
+                 decoder_fusion_interval: int = 3,
                  pretrained: bool = True,
-                 freeze_encoder: bool = False,
-                 batch_size: int = 16,
+                 freeze_encoder: bool = RECOGNITION_HYPER_PARAMS['freeze_encoder'],
+                 batch_size: int = RECOGNITION_HYPER_PARAMS['batch_size'],
                  **kwargs):
         super().__init__()
 
@@ -102,7 +109,13 @@ class RecognitionModel(L.LightningModule):
         l_idx = encoder_model.prune_intermediate_layers(indices=(-2,), prune_head=True, prune_norm=True)[0]
         l_red = encoder_model.feature_info[l_idx]['reduction']
 
-        decoder_model = bytellama_vision_decoder(pretrained=decoder if pretrained else None,
+        decoder_model = bytellama_vision_decoder(num_layers=decoder_num_layers,
+                                                 num_heads=decoder_num_heads,
+                                                 num_kv_heads=decoder_num_kv_heads,
+                                                 embed_dim=decoder_embed_dim,
+                                                 intermediate_dim=decoder_intermediate_dim,
+                                                 fusion_interval=decoder_fusion_interval,
+                                                 pretrained=decoder if pretrained else None,
                                                  encoder_max_seq_len=encoder_input_size[0] // l_red * encoder_input_size[1] // l_red)
 
         self.model = PartyModel(encoder=encoder_model,
@@ -317,7 +330,7 @@ def _configure_optimizer_and_lr_scheduler(hparams, model, loss_tracking_mode='mi
         ret['lr_scheduler'] = lr_sched
 
     if schedule == 'reduceonplateau':
-        lr_sched['monitor'] = 'val_accuracy'
+        lr_sched['monitor'] = 'val_metric'
         lr_sched['strict'] = False
         lr_sched['reduce_on_plateau'] = True
 
