@@ -372,25 +372,27 @@ def train(ctx, load_from_checkpoint, load_from_safetensors, load_from_repo,
                       logger=pl_logger_instance if pl_logger_instance else False,
                       **val_check_interval)
 
-    with trainer.init_module(empty_init=True):
-        if train_from_scratch:
-            message('Initializing new model.')
-            model = RecognitionModel(**dict(hyper_params, pretrained=False))
-        elif load_from_checkpoint:
-            message(f'Loading from checkpoint {load_from_checkpoint}.')
-            model = RecognitionModel.load_from_checkpoint(load_from_checkpoint,
-                                                          **hyper_params)
-        elif load_from_safetensors:
-            message(f'Loading from safetensors {load_from_safetensors}.')
-            model = RecognitionModel.load_from_safetensors(load_from_safetensors,
-                                                          **hyper_params)
-        elif resume_from_checkpoint:
-            message(f'Resuming from checkpoint {resume_from_checkpoint}.')
-            model = RecognitionModel.load_from_checkpoint(resume_from_checkpoint)
-        elif load_from_repo:
-            message(f'Loading from huggingface hub {load_from_repo}.')
-            model = RecognitionModel.load_from_repo(load_from_repo,
-                                                    **hyper_params)
+    if train_from_scratch:
+        message('Initializing new model.')
+        model = RecognitionModel(**dict(hyper_params, pretrained=True))
+    else:
+        with trainer.init_module(empty_init=True):
+            if load_from_checkpoint:
+                message(f'Loading from checkpoint {load_from_checkpoint}.')
+                model = RecognitionModel.load_from_checkpoint(load_from_checkpoint,
+                                                              **dict(hyper_params, pretrained=False))
+            elif load_from_safetensors:
+                message(f'Loading from safetensors {load_from_safetensors}.')
+                model = RecognitionModel.load_from_safetensors(load_from_safetensors,
+                                                              **hyper_params)
+            elif resume_from_checkpoint:
+                message(f'Resuming from checkpoint {resume_from_checkpoint}.')
+                model = RecognitionModel.load_from_checkpoint(resume_from_checkpoint,
+                                                              pretrained=False)
+            elif load_from_repo:
+                message(f'Loading from huggingface hub {load_from_repo}.')
+                model = RecognitionModel.load_from_repo(load_from_repo,
+                                                        **hyper_params)
 
     with threadpool_limits(limits=threads):
         if resume_from_checkpoint:
