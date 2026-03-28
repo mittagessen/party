@@ -34,8 +34,6 @@ from party.fusion import bytellama_vision_decoder, PartyModel
 
 logger = logging.getLogger(__name__)
 
-
-@torch.compile(dynamic=False)
 def model_step(model, criterion, batch):
     tokens = batch['tokens']
     # shift the tokens to create targets
@@ -88,6 +86,7 @@ class RecognitionModel(L.LightningModule):
                  pretrained: bool = True,
                  freeze_encoder: bool = RECOGNITION_HYPER_PARAMS['freeze_encoder'],
                  batch_size: int = RECOGNITION_HYPER_PARAMS['batch_size'],
+                 compile: bool = RECOGNITION_HYPER_PARAMS['compile'],
                  **kwargs):
         super().__init__()
 
@@ -133,7 +132,7 @@ class RecognitionModel(L.LightningModule):
         self.model.train()
 
         self.criterion = nn.CrossEntropyLoss()
-        self.model_step = model_step
+        self.model_step = torch.compile(model_step, dynamic=False) if compile else model_step
 
         self.val_mean = MeanMetric()
 
