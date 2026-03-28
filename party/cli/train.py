@@ -19,7 +19,6 @@ party.cli.train
 Command line driver for recognition training.
 """
 import logging
-from contextlib import nullcontext
 
 import click
 from threadpoolctl import threadpool_limits
@@ -33,122 +32,6 @@ logger = logging.getLogger('party')
 
 # suppress worker seeding message
 logging.getLogger("lightning.fabric.utilities.seed").setLevel(logging.ERROR)
-
-
-def _get_compile_warmup_device(accelerator, device):
-    import torch
-
-    if accelerator not in ['gpu', 'auto'] or not torch.cuda.is_available():
-        return None
-    if device == 'auto' or device is None:
-        return torch.device('cuda:0')
-    if isinstance(device, list) and device:
-        return torch.device(f'cuda:{device[0]}')
-    return torch.device('cuda:0')
-
-
-def _get_precision_context(precision: str, device_type: str):
-    import torch
-
-    if precision == 'bf16-mixed':
-        return torch.autocast(device_type=device_type, dtype=torch.bfloat16)
-    if precision in ['16-mixed', 'fp16-mixed']:
-        return torch.autocast(device_type=device_type, dtype=torch.float16)
-    return nullcontext()
-
-
-def _get_true_precision_dtype(precision: str):
-    import torch
-
-    if precision == 'bf16-true':
-        return torch.bfloat16
-    if precision in ['16-true', 'fp16-true']:
-        return torch.float16
-    if precision == '64-true':
-        return torch.float64
-    return None
-
-
-def _prewarm_compile_cache(model_kwargs,
-                           training_files,
-                           prompt_mode,
-                           precision,
-                           accelerator,
-                           device):
-    """
-    Compiles the train-step graphs once on a single GPU before DDP starts.
-
-    This populates the local FX/AOTAutograd/Inductor caches so worker ranks
-    can reuse them instead of all cold-compiling under the NCCL watchdog.
-    """
-    import gc
-    import os
-    import torch
-    import torch._inductor.config as inductor_config
-
-    from party.dataset import BinnedBaselineDataset
-    from party.model import RecognitionModel
-
-    warmup_device = _get_compile_warmup_device(accelerator, device)
-    if not model_kwargs.get('compile') or warmup_device is None:
-        return
-
-    os.environ.setdefault('TORCHINDUCTOR_FX_GRAPH_CACHE', '1')
-    os.environ.setdefault('TORCHINDUCTOR_AUTOGRAD_CACHE', '1')
-    inductor_config.fx_graph_cache = True
-    inductor_config.autograd_cache = True
-
-    probe_set = BinnedBaselineDataset(training_files,
-                                      prompt_mode=prompt_mode,
-                                      augmentation=False,
-                                      batch_size=model_kwargs['batch_size'])
-    max_seq_len = probe_set.max_seq_len
-    del probe_set
-
-    message(f'Prewarming torch.compile cache on {warmup_device}.')
-
-    model = RecognitionModel(**dict(model_kwargs, pretrained=False))
-    true_precision_dtype = _get_true_precision_dtype(precision)
-    if true_precision_dtype is not None:
-        model.to(device=warmup_device, dtype=true_precision_dtype)
-    else:
-        model.to(warmup_device)
-    model.train()
-
-    tokenizer = model.model.tokenizer
-    image_h, image_w = model.hparams.encoder_input_size
-    batch_size = model_kwargs['batch_size']
-    float_dtype = true_precision_dtype if true_precision_dtype is not None else torch.float32
-    image = torch.zeros((1, 3, image_h, image_w), device=warmup_device, dtype=float_dtype)
-    tokens = torch.full((batch_size, max_seq_len), -100, dtype=torch.long, device=warmup_device)
-    tokens[:, 0] = tokenizer.bos_id
-    if max_seq_len > 1:
-        tokens[:, 1] = 65
-    if max_seq_len > 2:
-        tokens[:, 2] = tokenizer.eos_id
-
-    warmup_modes = ['boxes', 'curves'] if prompt_mode == 'both' else [prompt_mode]
-
-    for mode in warmup_modes:
-        batch = {'image': image,
-                 'tokens': tokens.clone(),
-                 'boxes': None,
-                 'curves': None}
-        if mode == 'boxes':
-            batch['boxes'] = torch.rand((batch_size, 4, 2), device=warmup_device, dtype=float_dtype)
-        else:
-            batch['curves'] = torch.rand((batch_size, 4, 2), device=warmup_device, dtype=float_dtype)
-
-        model.zero_grad(set_to_none=True)
-        with _get_precision_context(precision, warmup_device.type):
-            loss = model.model_step(model.model, model.criterion, batch)
-        loss.backward()
-        torch.cuda.synchronize(warmup_device)
-
-    model.cpu()
-    del model
-    gc.collect()
-    torch.cuda.empty_cache()
 
 
 @click.command('convert')
@@ -328,10 +211,6 @@ def compile(ctx, output, files, normalization, normalize_whitespace,
               show_default=True,
               default=RECOGNITION_HYPER_PARAMS['augment'],
               help='Enable image augmentation')
-@click.option('--compile/--no-compile',
-              show_default=True,
-              default=RECOGNITION_HYPER_PARAMS['compile'],
-              help='Enable torch.compile() on the training step')
 @click.option('--prompt-mode',
               show_default=True,
               type=click.Choice(['boxes',
@@ -357,7 +236,7 @@ def train(ctx, load_from_checkpoint, load_from_safetensors, load_from_repo,
           quit, epochs, min_epochs, freeze_encoder, lag, min_delta, optimizer,
           lrate, momentum, weight_decay, gradient_clip_val, warmup, schedule,
           gamma, step_size, sched_patience, cos_max, cos_min_lr,
-          training_files, evaluation_files, workers, threads, augment, compile,
+          training_files, evaluation_files, workers, threads, augment,
           prompt_mode, accumulate_grad_batches, validate_before_train,
           pl_logger, ground_truth):
     """
@@ -408,7 +287,6 @@ def train(ctx, load_from_checkpoint, load_from_safetensors, load_from_repo,
                          'cos_t_max': cos_max,
                          'cos_min_lr': cos_min_lr,
                          'augment': augment,
-                         'compile': compile,
                          'accumulate_grad_batches': accumulate_grad_batches,
                          'gradient_clip_val': gradient_clip_val,
                          })
@@ -426,13 +304,6 @@ def train(ctx, load_from_checkpoint, load_from_safetensors, load_from_repo,
         accelerator, device = to_ptl_device(ctx.meta['device'])
     except Exception as e:
         raise click.BadOptionUsage('device', str(e))
-
-    _prewarm_compile_cache(hyper_params,
-                           ground_truth,
-                           prompt_mode,
-                           ctx.meta['precision'],
-                           accelerator,
-                           device)
 
     if hyper_params['freq'] > 1:
         val_check_interval = {'check_val_every_n_epoch': int(hyper_params['freq'])}
