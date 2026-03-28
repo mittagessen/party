@@ -190,7 +190,18 @@ class RecognitionModel(L.LightningModule):
 
         module = cls(*args, **kwargs, pretrained=False)
 
-        model_path = get_model(id) / 'model.safetensors'
+        repo_path = get_model(id)
+        
+        # Try multiple possible filenames
+        model_names = ['model.safetensors', 'party_european_langs.safetensors']
+        model_path = None
+    
+        for name in model_names:
+            candidate = repo_path / name
+            if candidate.exists():
+                model_path = candidate
+                break
+
         module.model.load_state_dict(load_file(model_path))
         module.model.train()
         return module

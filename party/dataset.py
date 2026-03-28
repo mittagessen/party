@@ -118,6 +118,7 @@ def _to_bbox(boundary, im_size):
 
 def compile(files: Optional[list[Union[str, 'PathLike']]] = None,
             output_file: Union[str, 'PathLike'] = None,
+            language: str = None,
             normalize_whitespace: bool = True,
             normalization: Optional[Literal['NFD', 'NFC', 'NFKD', 'NFKC']] = None,
             max_line_tokens: int = 384,
@@ -128,6 +129,7 @@ def compile(files: Optional[list[Union[str, 'PathLike']]] = None,
     Args:
         files: list of XML files
         output_file: destination to write arrow file to
+        language: language identifier, list in tokenizer.py
         normalize_whitespace: whether to normalize all whitespace to ' '
         normalization: Unicode normalization to apply to data.
         max_line_tokens: maximum number of tokens per line
@@ -180,10 +182,15 @@ def compile(files: Optional[list[Union[str, 'PathLike']]] = None,
                                 break
                             except Exception:
                                 continue
-                        # parse language by traversing path component
-                        for part in Path(file).parts[::-1]:
-                            if (lang := LANG_TO_ISO.get(part, 'und')) != 'und':
-                                break
+
+                        # if language is provided, use it; otherwise, determine from path
+                        if language is not None:
+                            lang = LANG_TO_ISO.get(language, 'und')
+                        else:
+                            # parse language by traversing path component
+                            for part in Path(file).parts[::-1]:
+                                if (lang := LANG_TO_ISO.get(part, 'und')) != 'und':
+                                    break 
                     except Exception:
                         continue
                     if im_path is None:
