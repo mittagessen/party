@@ -340,10 +340,14 @@ class TextLineDataModule(L.LightningDataModule):
         self.val_set.max_seq_len = self.train_set.max_seq_len
 
     def train_dataloader(self):
+        rank = get_rank() if is_initialized() else 0
         world_size = get_world_size() if is_initialized() else 1
+        generator = torch.Generator()
+        generator.manual_seed(torch.initial_seed() + rank)
         sampler = WeightedRandomSampler(self.train_set.page_weights,
                                         num_samples=max(1, self.train_set.num_batches // world_size),
-                                        replacement=True)
+                                        replacement=True,
+                                        generator=generator)
         return DataLoader(self.train_set,
                           batch_size=1,
                           sampler=sampler,

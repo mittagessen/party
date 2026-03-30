@@ -370,6 +370,7 @@ def train(ctx, load_from_checkpoint, load_from_safetensors, load_from_repo,
                       gradient_clip_val=hyper_params['gradient_clip_val'],
                       num_sanity_val_steps=0,
                       logger=pl_logger_instance if pl_logger_instance else False,
+                      use_distributed_sampler=False,
                       **val_check_interval)
 
     if train_from_scratch:
