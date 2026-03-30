@@ -34,7 +34,8 @@ from typing import (TYPE_CHECKING, Any, Callable, List, Literal, Optional,
 
 from functools import partial
 from torchvision.transforms import v2
-from torch.utils.data import Dataset, DataLoader, IterableDataset, get_worker_info
+from torch.utils.data import (Dataset, DataLoader, IterableDataset,
+                              WeightedRandomSampler, get_worker_info)
 
 
 from PIL import Image
@@ -339,8 +340,13 @@ class TextLineDataModule(L.LightningDataModule):
         self.val_set.max_seq_len = self.train_set.max_seq_len
 
     def train_dataloader(self):
+        world_size = get_world_size() if is_initialized() else 1
+        sampler = WeightedRandomSampler(self.train_set.page_weights,
+                                        num_samples=max(1, self.train_set.num_batches // world_size),
+                                        replacement=True)
         return DataLoader(self.train_set,
                           batch_size=1,
+                          sampler=sampler,
                           num_workers=self.hparams.num_workers,
                           pin_memory=True,
                           shuffle=False,
@@ -386,11 +392,13 @@ class BinnedBaselineDataset(Dataset):
         self.aug = None
         self.batch_size = batch_size
         self.max_seq_len = 0
-        self._len = 0
+        self._num_lines = 0
 
         self.tokenizer = OctetTokenizer()
 
         self.arrow_table = None
+        self.page_line_counts = []
+        self.page_weights = None
 
         for file in files:
             with pa.memory_map(file, 'rb') as source:
@@ -402,19 +410,19 @@ class BinnedBaselineDataset(Dataset):
                     self.arrow_table = ds_table
                 else:
                     self.arrow_table = pa.concat_tables([self.arrow_table, ds_table])
-                self._len += int.from_bytes(raw_metadata[b'num_lines'], 'little')
+                self._num_lines += int.from_bytes(raw_metadata[b'num_lines'], 'little')
                 self.max_seq_len = max(int.from_bytes(raw_metadata[b'max_octets_in_line'], 'little'), self.max_seq_len)
+                self.page_line_counts.extend(len(page.as_py()['lines']) for page in ds_table.column('pages'))
+
+        self.page_weights = torch.tensor(self.page_line_counts, dtype=torch.double)
 
         if augmentation:
             from party.augmentation import DefaultAugmenter
             self.aug = DefaultAugmenter()
 
     def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # just sample from a random page
         rng = np.random.default_rng()
-        idx = rng.integers(0, len(self.arrow_table))
-
-        item = self.arrow_table.column('pages')[idx].as_py()
+        item = self.arrow_table.column('pages')[index].as_py()
         logger.debug(f'Attempting to load {item["im"]}')
         im, page_lang, page_data = item['im'], _get_page_lang(item), item['lines']
         try:
@@ -431,7 +439,7 @@ class BinnedBaselineDataset(Dataset):
         # sample randomly between baselines
         sample = []
         if self.prompt_mode == 'both':
-            return_boxes = rng.choice([False, True], 1)
+            return_boxes = bool(rng.integers(0, 2))
         elif self.prompt_mode == 'boxes':
             return_boxes = True
         else:
@@ -449,7 +457,11 @@ class BinnedBaselineDataset(Dataset):
         return collate_sequences(im.unsqueeze(0), sample, self.max_seq_len)
 
     def __len__(self) -> int:
-        return self._len // self.batch_size
+        return len(self.arrow_table)
+
+    @property
+    def num_batches(self):
+        return self._num_lines // self.batch_size
 
 
 class ValidationBaselineDataset(IterableDataset):
