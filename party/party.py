@@ -31,8 +31,8 @@ from typing import Optional, Union, TYPE_CHECKING, Any
 from party.modules import (PromptEncoder, MultiHeadAttention, FeedForward,
                            TransformerSelfAttentionLayer, RMSNorm, TanhGate)
 from party.tokenizer import OctetTokenizer
-from party.configs import get_model_variant
-from party.fusion import PartyMultiScaleAdapter, bytellama_vision_decoder
+from party.configs import get_model_variant, PartyRecognitionInferenceConfig
+from party.fusion import bytellama_vision_decoder
 from party.dataset import get_default_transforms, _to_curve, _to_bbox
 
 if TYPE_CHECKING:
@@ -79,7 +79,7 @@ def _baseline_to_bbox(line: 'BaselineLine') -> 'BBoxLine':
 
 class SingleScaleAdapter(nn.Module):
     """
-    Single-scale adapter used by the original main-branch model.
+    Single-scale adapter mapping encoder features to the decoder embed dim.
     """
     def __init__(self,
                  num_layers: int,
@@ -90,7 +90,6 @@ class SingleScaleAdapter(nn.Module):
         mlp_ratio = 4
         hidden_dim = int(mlp_ratio * encoder_embed_dim)
         head_dim = encoder_embed_dim // num_heads
-        num_kv_heads = num_heads
         layers = []
         for _ in range(num_layers):
             self_attn = MultiHeadAttention(embed_dim=encoder_embed_dim,
@@ -98,8 +97,8 @@ class SingleScaleAdapter(nn.Module):
                                            num_kv_heads=num_heads,
                                            head_dim=head_dim,
                                            q_proj=nn.Linear(encoder_embed_dim, num_heads * head_dim, bias=False),
-                                           k_proj=nn.Linear(encoder_embed_dim, num_kv_heads * head_dim, bias=False),
-                                           v_proj=nn.Linear(encoder_embed_dim, num_kv_heads * head_dim, bias=False),
+                                           k_proj=nn.Linear(encoder_embed_dim, num_heads * head_dim, bias=False),
+                                           v_proj=nn.Linear(encoder_embed_dim, num_heads * head_dim, bias=False),
                                            output_proj=nn.Linear(encoder_embed_dim, encoder_embed_dim, bias=False),
                                            pos_embeddings=None,
                                            attn_dropout=0.0,
@@ -119,33 +118,8 @@ class SingleScaleAdapter(nn.Module):
         layers.append(nn.Linear(encoder_embed_dim, decoder_embed_dim))
         self.adapter = nn.Sequential(*layers)
 
-    def forward(self, encoder_hidden_states):
-        if isinstance(encoder_hidden_states, (list, tuple)):
-            if len(encoder_hidden_states) != 1:
-                raise ValueError(f'SingleScaleAdapter expects exactly one encoder feature map, got {len(encoder_hidden_states)}.')
-            encoder_hidden_states = encoder_hidden_states[0]
-        return self.adapter(encoder_hidden_states.flatten(-2).transpose(-1, -2))
-
-
-def _build_adapter(variant, encoder_channels, encoder_sizes, decoder_embed_dim):
-    """Returns (adapter_module, adapter_seq_len)."""
-    adapter_cfg = variant['adapter']
-    if len(variant['encoder']['out_indices']) == 1:
-        adapter = SingleScaleAdapter(num_layers=adapter_cfg['num_layers'],
-                                     num_heads=adapter_cfg['num_heads'],
-                                     encoder_embed_dim=encoder_channels[0],
-                                     decoder_embed_dim=decoder_embed_dim)
-        seq_len = encoder_sizes[0][0] * encoder_sizes[0][1]
-    else:
-        adapter = PartyMultiScaleAdapter(num_layers=adapter_cfg['num_layers'],
-                                         num_heads=adapter_cfg['num_heads'],
-                                         encoder_embed_dims=encoder_channels,
-                                         encoder_sizes=encoder_sizes,
-                                         decoder_embed_dim=decoder_embed_dim,
-                                         ds_factors=list(adapter_cfg['ds_factors']))
-        seq_len = sum((size[0] // ds) * (size[1] // ds)
-                      for size, ds in zip(encoder_sizes, adapter_cfg['ds_factors']))
-    return adapter, seq_len
+    def forward(self, encoder_hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.adapter(encoder_hidden_states.flatten(1, 2))
 
 
 class PartyModel(nn.Module, RecognitionBaseModel):
@@ -175,24 +149,18 @@ class PartyModel(nn.Module, RecognitionBaseModel):
         variant = get_model_variant(model_variant)
 
         # 1. Build encoder
+        timm.layers.use_fused_attn(experimental=True)
         encoder = timm.create_model(variant['encoder']['name'],
                                     pretrained=pretrained,
+                                    img_size=image_size,
                                     features_only=True,
                                     out_indices=variant['encoder']['out_indices'])
-        encoder_channels = encoder.feature_info.channels()
-        encoder_sizes = [(image_size[0] // r, image_size[1] // r)
-                         for r in encoder.feature_info.reduction()]
-
-        # 2. Compute adapter seq len for decoder cross-attention
-        adapter_cfg = variant['adapter']
-        if len(variant['encoder']['out_indices']) == 1:
-            adapter_seq_len = encoder_sizes[0][0] * encoder_sizes[0][1]
-        else:
-            adapter_seq_len = sum((size[0] // ds) * (size[1] // ds)
-                                 for size, ds in zip(encoder_sizes, adapter_cfg['ds_factors']))
+        encoder_embed_dim = encoder.feature_info.channels()[0]
+        reduction = encoder.feature_info.reduction()[0]
+        adapter_seq_len = (image_size[0] // reduction) * (image_size[1] // reduction)
         self.encoder_max_seq_len = adapter_seq_len
 
-        # 3. Build decoder
+        # 2. Build decoder
         decoder = bytellama_vision_decoder(
             pretrained=variant['decoder']['name'] if pretrained else None,
             num_layers=variant['decoder']['num_layers'],
@@ -204,10 +172,13 @@ class PartyModel(nn.Module, RecognitionBaseModel):
             fusion_interval=variant['fusion_interval'])
         decoder_embed_dim = decoder.tok_embeddings.embedding_dim
 
-        # 4. Build adapter
-        adapter, _ = _build_adapter(variant, encoder_channels, encoder_sizes, decoder_embed_dim)
+        # 3. Build adapter
+        adapter = SingleScaleAdapter(num_layers=variant['adapter']['num_layers'],
+                                     num_heads=variant['adapter']['num_heads'],
+                                     encoder_embed_dim=encoder_embed_dim,
+                                     decoder_embed_dim=decoder_embed_dim)
 
-        # 5. Line embedding (additive only)
+        # 4. Line embedding (additive only)
         line_embedding = PromptEncoder(decoder_embed_dim)
 
         self.nn = nn.ModuleDict({'encoder': encoder,
@@ -332,8 +303,28 @@ class PartyModel(nn.Module, RecognitionBaseModel):
         Computes the encoder embeddings *without* adding the curve positional
         embeddings.
         """
-        encoder_hidden_states = self.nn['encoder'](encoder_input)
-        return self.nn['adapter'](encoder_hidden_states)
+        # timm features_only returns a list; we always request a single stage.
+        feature_map, = self.nn['encoder'](encoder_input)
+        return self.nn['adapter'](feature_map)
+
+    def prepare_for_generation(self,
+                               batch_size: int,
+                               *,
+                               max_generated_tokens: int = 512) -> None:
+        """
+        Allocates KV caches and primes the model for autoregressive decoding.
+
+        Used by both standalone inference (:meth:`prepare_for_inference`) and
+        the Lightning-driven test loop, which manages device placement and
+        precision through ``Trainer`` rather than ``Fabric``.
+        """
+        self.eval()
+        self._batch_size = batch_size
+        self._max_generated_tokens = max_generated_tokens
+        self.setup_caches(batch_size=batch_size,
+                          encoder_max_seq_len=self.encoder_max_seq_len,
+                          decoder_max_seq_len=max_generated_tokens,
+                          dtype=next(self.parameters()).dtype)
 
     def prepare_for_inference(self, config: 'Config'):
         """
@@ -342,8 +333,13 @@ class PartyModel(nn.Module, RecognitionBaseModel):
         if self.ready_for_generation:
             logger.debug('Model has already been prepared for generation!')
 
-        self.eval()
+        if not isinstance(config, PartyRecognitionInferenceConfig):
+            upgraded = PartyRecognitionInferenceConfig()
+            upgraded.__dict__.update(config.__dict__)
+            config = upgraded
+
         self._inf_config = config
+        self.m_dtype = next(self.parameters()).dtype
 
         # create line extraction worker pool
         from torch.multiprocessing import Pool
@@ -352,15 +348,8 @@ class PartyModel(nn.Module, RecognitionBaseModel):
             import atexit
             atexit.register(self._line_extraction_pool.terminate)
 
-        self.m_dtype = next(self.parameters()).dtype
-        self._batch_size = config.batch_size
-        self._max_generated_tokens = config.max_generated_tokens
-
-        # set up caches
-        self.setup_caches(batch_size=config.batch_size,
-                          encoder_max_seq_len=self.encoder_max_seq_len,
-                          decoder_max_seq_len=config.max_generated_tokens,
-                          dtype=self.m_dtype)
+        self.prepare_for_generation(batch_size=config.batch_size,
+                                    max_generated_tokens=config.max_generated_tokens)
 
         self._fabric = Fabric(accelerator=self._inf_config.accelerator,
                               devices=self._inf_config.device,
