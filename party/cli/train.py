@@ -25,7 +25,7 @@ import importlib
 from pathlib import Path
 from party.tokenizer import ISO_TO_LANG
 from threadpoolctl import threadpool_limits
-from kraken.registry import OPTIMIZERS, SCHEDULERS, STOPPERS
+from kraken.registry import SCHEDULERS, STOPPERS
 
 from .util import _expand_gt, _validate_manifests, message
 
@@ -34,7 +34,6 @@ logger = logging.getLogger('party')
 
 # suppress worker seeding message
 logging.getLogger("lightning.fabric.utilities.seed").setLevel(logging.ERROR)
-
 
 @click.command('compile')
 @click.pass_context
@@ -127,24 +126,21 @@ def compile(ctx, **params):
 @click.option('--min-delta',
               type=float,
               help='Minimum improvement between epochs to reset early stopping. By default it scales the delta by the best loss')
-@click.option('--optimizer',
-              type=click.Choice(OPTIMIZERS),
-              help='Select optimizer')
 @click.option('-r',
               '--lrate',
               type=float,
               help='Learning rate')
-@click.option('--lr-pretrained-mult',
-              type=float,
-              help='Learning rate multiplier for pretrained encoder components.')
 @click.option('-m',
               '--momentum',
               type=float,
-              help='Momentum')
+              help='Muon momentum')
 @click.option('-w',
               '--weight-decay',
               type=float,
               help='Weight decay')
+@click.option('--label-smoothing',
+              type=float,
+              help='Label smoothing factor for cross-entropy loss during training.')
 @click.option('--gradient-clip-val',
               type=float,
               help='Gradient clip value')
@@ -180,10 +176,6 @@ def compile(ctx, **params):
 @click.option('--freeze-encoder/--no-freeze-encoder', help='Switch to freeze the encoder')
 @click.option('--warmup', type=int, help='Number of steps to ramp up to `lrate` initial learning rate.')
 @click.option('--augment/--no-augment', help='Enable image augmentation')
-@click.option('--prompt-corruption/--no-prompt-corruption', default=None, help='Enable prompt corruption augmentation (independent of --augment)')
-@click.option('--noisy-teacher-forcing', type=click.FloatRange(0.0, 1.0), help='Probability that each individual target token is altered for NTF.')
-@click.option('--noisy-teacher-forcing-warmup', type=click.IntRange(0), help='Number of optimization steps to ramp up NTF probability.')
-@click.option('--label-smoothing', type=click.FloatRange(0.0, 1.0), help='Amount of label smoothing')
 @click.option('--accumulate-grad-batches', type=int, help='Number of batches to accumulate gradient across.')
 @click.option('-t', '--training-files', 'training_data', multiple=True, type=click.File(mode='r', lazy=True),
               help='File(s) with additional paths to training data')
@@ -235,7 +227,7 @@ def train(ctx, **kwargs):
     if sum(map(bool, [resume, load, train_from_scratch])) > 1:
         raise click.BadOptionUsage('load', 'load/resume/train_from_scratch options are mutually exclusive.')
     elif resume is None and load is None and train_from_scratch is False:
-        load = '10.5281/zenodo.15075344'
+        train_from_scratch = True
 
     import torch
 
