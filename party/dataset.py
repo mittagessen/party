@@ -36,7 +36,6 @@ from typing import (TYPE_CHECKING, Any, Callable, Literal, Optional, Tuple,
 
 from PIL import Image
 from functools import partial
-from torchvision.io import decode_image, ImageReadMode
 from torchvision.transforms import v2
 from torch.utils.data import Dataset, IterableDataset, get_worker_info
 from torch.distributed import get_rank, get_world_size, is_initialized
@@ -64,6 +63,12 @@ except ImportError:
 
 Image.MAX_IMAGE_PIXELS = 20000 ** 2
 
+# Encodings tried when we have to re-encode a resized page; we keep whichever
+# variant produces the smaller payload.
+RESIZED_PAGE_ENCODINGS = (('JPEG', {'quality': 95}),
+                          ('PNG', {}))
+MAX_PAGE_LOAD_ATTEMPTS = 10
+
 
 def batched(iterable, n, *, strict=False):
     # batched('ABCDEFG', 3) → ABC DEF G
@@ -76,11 +81,29 @@ def batched(iterable, n, *, strict=False):
         yield batch
 
 
-def get_default_transforms(image_size: tuple[int, int] = (2560, 1920), dtype=torch.float32):
+def get_default_transforms(image_size: tuple[int, int] = (2560, 1920),
+                           dtype=torch.float32):
     return v2.Compose([v2.Resize(image_size),
                        v2.ToImage(),
                        v2.ToDtype(dtype, scale=True),
                        v2.Normalize(mean=[0.4850, 0.4560, 0.4060], std=[0.2290, 0.2240, 0.2250])])
+
+
+def _encode_page_image(path: Union[str, 'PathLike'],
+                       resize: Optional[Tuple[int, int]] = None) -> bytes:
+    if resize is None:
+        with open(path, 'rb') as fp:
+            return fp.read()
+
+    with Image.open(path) as image:
+        image = image.convert('RGB').resize((resize[1], resize[0]), Image.LANCZOS)
+        encoded_variants = []
+        for fmt, save_kwargs in RESIZED_PAGE_ENCODINGS:
+            image_buffer = io.BytesIO()
+            image.save(image_buffer, format=fmt, **save_kwargs)
+            encoded_variants.append(image_buffer.getvalue())
+
+    return min(encoded_variants, key=len)
 
 
 def _to_curve(baseline, im_size, min_points: int = 8, clamp_tolerance: float = 0.02):
@@ -203,17 +226,9 @@ def compile(files: Optional[list[Union[str, 'PathLike']]] = None,
                     try:
                         page = XMLPage(file)
                         seg = page.to_container()
-                        # pick image format with smallest size
-                        with Image.open(seg.imagename) as im:
-                            if resize:
-                                im = im.convert('RGB')
-                                im = im.resize((resize[1], resize[0]), Image.LANCZOS)
-                                im_buf = io.BytesIO()
-                                im.save(im_buf, format='JPEG', quality=95)
-                                im_bytes = im_buf.getvalue()
-                            else:
-                               with open(seg.imagename, 'rb') as fp:
-                                    im_bytes = fp.read()
+                        # Store only codecs that the training dataset can decode
+                        # natively, while keeping already-supported originals as-is.
+                        im_bytes = _encode_page_image(seg.imagename, resize=resize)
                     except Exception:
                         continue
                     page_data = []
@@ -287,6 +302,41 @@ def _validation_worker_init_fn(worker_id):
 
 def collate_null(batch):
     return batch[0]
+
+
+def _valid_geometry(geometry: Optional[torch.Tensor], eps: float = 1e-6) -> bool:
+    if geometry is None:
+        return True
+    if geometry.shape != (4, 2):
+        return False
+    return bool(torch.isfinite(geometry).all() and
+                torch.all(geometry >= -eps) and
+                torch.all(geometry <= 1.0 + eps))
+
+
+def _valid_bbox(bbox: Optional[torch.Tensor], eps: float = 1e-6) -> bool:
+    if bbox is None:
+        return True
+    if not _valid_geometry(bbox, eps=eps):
+        return False
+    xy_min = bbox[0]
+    xy_max = bbox[1]
+    size = bbox[3]
+    return bool(torch.all(xy_min <= xy_max + eps) and torch.all(size > eps))
+
+
+def _filter_valid_lines(lines: list[tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]]
+                        ) -> list[tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]]:
+    valid_lines = []
+    for tokens, curve, bbox in lines:
+        if curve is None and bbox is None:
+            continue
+        if not _valid_geometry(curve):
+            continue
+        if not _valid_bbox(bbox):
+            continue
+        valid_lines.append((tokens, curve, bbox))
+    return valid_lines
 
 
 def collate_sequences(im, page_data, max_seq_len: int, index: int):
@@ -374,38 +424,62 @@ class BinnedBaselineDataset(Dataset):
                 self.max_seq_len = max(int.from_bytes(raw_metadata[b'max_octets_in_line'], 'little'), self.max_seq_len)
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        item = self.arrow_table.column('pages')[index].as_py()
-        logger.debug(f'Attempting to load {item["im"]}')
-        im, page_data = item['im'], item['lines']
-        try:
-            im = decode_image(torch.frombuffer(bytearray(im), dtype=torch.uint8), mode=ImageReadMode.RGB)
-        except Exception:
-            return self[0]
+        current_index = index
+        for attempt in range(MAX_PAGE_LOAD_ATTEMPTS):
+            try:
+                item = self.arrow_table.column('pages')[current_index].as_py()
+                logger.debug(f'Attempting to load {item["im"]}')
+                im, page_data = item['im'], item['lines']
+                im = Image.open(io.BytesIO(im)).convert('RGB')
 
-        if self.prompt_mode == 'both':
-            rng = np.random.default_rng()
-            return_boxes = rng.choice([False, True], 1)
-        elif self.prompt_mode == 'boxes':
-            return_boxes = True
-        else:
-            return_boxes = False
+                if self.prompt_mode == 'both':
+                    rng = np.random.default_rng()
+                    return_boxes = rng.choice([False, True], 1)
+                elif self.prompt_mode == 'boxes':
+                    return_boxes = True
+                else:
+                    return_boxes = False
 
-        lines = []
-        for line in page_data:
-            tokens = torch.tensor(self.tokenizer.encode(line['text'], langs=line['lang'], add_bos=True, add_eos=True), dtype=torch.int32)
-            curve = torch.tensor(line['curve']).view(4, 2) if not return_boxes else None
-            bbox = torch.tensor(line['bbox']).view(4, 2) if return_boxes else None
-            lines.append((tokens, curve, bbox))
+                lines = []
+                for line in page_data:
+                    tokens = torch.tensor(self.tokenizer.encode(line['text'], langs=line['lang'], add_bos=True, add_eos=True), dtype=torch.int32)
+                    curve = torch.tensor(line['curve']).view(4, 2) if not return_boxes else None
+                    bbox = torch.tensor(line['bbox']).view(4, 2) if return_boxes else None
+                    lines.append((tokens, curve, bbox))
+                lines = _filter_valid_lines(lines)
 
-        if self.aug is not None:
-            im, lines = self.aug(im, lines)
-        if not lines:
-            return self[np.random.randint(len(self))]
-        im = self.transforms(im)
-        indices = np.random.choice(len(lines), self.batch_size, replace=True)
-        sample = [lines[i] for i in indices]
+                if self.aug is not None:
+                    aug_im, aug_lines = self.aug(im, lines)
+                    aug_lines = _filter_valid_lines(aug_lines)
+                    if aug_lines:
+                        im, lines = aug_im, aug_lines
+                    else:
+                        logger.debug(f'Augmentation removed all lines on page {current_index}; using unaugmented sample.')
+                if not lines:
+                    raise RuntimeError('Page does not contain any usable lines after preprocessing')
+                im = self.transforms(im)
+                # Keep the output size fixed at batch_size (torch.compile
+                # requires a static batch dim) while maximising unique line
+                # coverage per page. Use without-replacement whenever the page
+                # has at least batch_size lines; for the short-page edge case
+                # take every line once and only pad the overflow with replacement.
+                n_lines = len(lines)
+                if self.batch_size <= n_lines:
+                    indices = np.random.choice(n_lines, self.batch_size, replace=False)
+                else:
+                    indices = np.concatenate([
+                        np.random.permutation(n_lines),
+                        np.random.choice(n_lines, self.batch_size - n_lines, replace=True),
+                    ])
+                sample = [lines[i] for i in indices]
 
-        return collate_sequences(im.unsqueeze(0), sample, self.max_seq_len, index)
+                return collate_sequences(im.unsqueeze(0), sample, self.max_seq_len, current_index)
+            except Exception as exc:
+                next_index = int(np.random.randint(len(self)))
+                logger.warning(f'Failed to load training page at index {current_index} on attempt {attempt + 1}/{MAX_PAGE_LOAD_ATTEMPTS}: {exc}. Retrying with index {next_index}.')
+                current_index = next_index
+
+        raise RuntimeError(f'Unable to load a training page after {MAX_PAGE_LOAD_ATTEMPTS} attempts.')
 
     def __len__(self) -> int:
         return len(self.arrow_table)
@@ -476,7 +550,7 @@ class ValidationBaselineDataset(IterableDataset):
             item = self.arrow_table.column('pages')[idx].as_py()
             logger.debug(f'Attempting to load {item["im"]}')
             im, page_data = item['im'], item['lines']
-            im = decode_image(torch.frombuffer(bytearray(im), dtype=torch.uint8), mode=ImageReadMode.RGB)
+            im = Image.open(io.BytesIO(im)).convert('RGB')
             im = self.transforms(im)
 
             im = im.unsqueeze(0)
@@ -492,6 +566,7 @@ class ValidationBaselineDataset(IterableDataset):
                 return_curves = True
 
             for lines in batched(page_data, self.batch_size):
+                pad_n = self.batch_size - len(lines)
                 curves = []
                 boxes = []
                 tokens = []
@@ -501,9 +576,19 @@ class ValidationBaselineDataset(IterableDataset):
                     if return_boxes:
                         boxes.append(torch.tensor(line['bbox']).view(4, 2))
                     tokens.append(torch.tensor(self.tokenizer.encode(line['text'], langs=line['lang'], add_bos=True, add_eos=True), dtype=torch.int32))
+                # Pad each yielded batch to exactly self.batch_size so the
+                # downstream torch.compile(dynamic=False) graph sees a single
+                # batch shape per val epoch. Padded slots carry ignore_index
+                # tokens, so they contribute zero to val_mean.
+                for _ in range(pad_n):
+                    if return_curves:
+                        curves.append(torch.zeros(4, 2))
+                    if return_boxes:
+                        boxes.append(torch.zeros(4, 2))
+                    tokens.append(torch.tensor([-100], dtype=torch.int32))
                 tokens = torch.stack([F.pad(x, pad=(0, self.max_seq_len-len(x)), value=-100) for x in tokens]).long()
-                boxes = torch.stack(boxes) if len(boxes) else None
-                curves = torch.stack(curves) if len(curves) else None
+                boxes = torch.stack(boxes) if return_boxes else None
+                curves = torch.stack(curves) if return_curves else None
                 yield {'image': im,
                        'boxes': boxes,
                        'curves': curves,
