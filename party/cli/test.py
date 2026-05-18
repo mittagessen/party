@@ -24,7 +24,6 @@ import logging
 from dataclasses import asdict
 
 from .util import _expand_gt, _validate_manifests, message
-from party.default_specs import RECOGNITION_HYPER_PARAMS
 
 logging.captureWarnings(True)
 logger = logging.getLogger('party')
@@ -35,7 +34,6 @@ logging.getLogger("lightning.fabric.utilities.seed").setLevel(logging.ERROR)
 @click.command('test')
 @click.pass_context
 @click.option('-B', '--batch-size', show_default=True, type=click.INT,
-              default=RECOGNITION_HYPER_PARAMS['batch_size'],
               help='Batch sample size for parallel line generation per page.')
 @click.option('-m', '--load-from-repo',
               default=None,

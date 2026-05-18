@@ -14,7 +14,9 @@ from .util import _load_config, to_ptl_device
 
 from kraken.registry import PRECISIONS
 from kraken.configs import Config, TrainingDataConfig
-from party.configs import PartyRecognitionTrainingConfig, PartyRecognitionTrainingDataConfig
+from party.configs import (PartyRecognitionInferenceConfig,
+                            PartyRecognitionTrainingConfig,
+                            PartyRecognitionTrainingDataConfig)
 
 
 def set_logger(logger=None, level=logging.ERROR):
@@ -44,7 +46,8 @@ Image.MAX_IMAGE_PIXELS = 20000 ** 2
                                    default_map={**Config().__dict__,
                                                 **TrainingDataConfig().__dict__,
                                                 'compile': PartyRecognitionTrainingDataConfig().__dict__,
-                                                'train': {**PartyRecognitionTrainingConfig().__dict__, **PartyRecognitionTrainingDataConfig().__dict__}}))
+                                                'train': {**PartyRecognitionTrainingConfig().__dict__, **PartyRecognitionTrainingDataConfig().__dict__},
+                                                'test': PartyRecognitionInferenceConfig().__dict__}))
 @click.version_option()
 @click.pass_context
 @click.option('-v', '--verbose', default=0, count=True)
