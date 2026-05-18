@@ -1,10 +1,10 @@
 from kraken.configs import TrainingConfig, RecognitionTrainingDataConfig, RecognitionInferenceConfig
 
 MODEL_VARIANTS = {
-    # Tiny: ~10M LM params, ConvNeXt v2 Nano encoder (~15.6M)
+    # Tiny: 7M decoder with a 2-layer adapter and Swin Tiny encoder (~28M).
     'tiny': {
         'encoder': {
-            'name': 'convnextv2_nano.fcmae_ft_in22k_in1k',
+            'name': 'swin_tiny_patch4_window7_224.ms_in1k',
             'out_indices': (2,),
         },
         'decoder': {
@@ -16,16 +16,15 @@ MODEL_VARIANTS = {
             'intermediate_dim': 512,
         },
         'adapter': {
-            'ds_factors': (1,),
             'num_layers': 2,
             'num_heads': 8,
         },
         'fusion_interval': 3,
     },
-    # Small: ~21M LM params, ConvNeXt v2 Tiny encoder (~28.6M)
+    # Small: 16M decoder with a 2-layer adapter and Swin Small encoder (~49M).
     'small': {
         'encoder': {
-            'name': 'convnextv2_tiny.fcmae_ft_in22k_in1k',
+            'name': 'swin_small_patch4_window7_224.ms_in1k',
             'out_indices': (2,),
         },
         'decoder': {
@@ -37,16 +36,15 @@ MODEL_VARIANTS = {
             'intermediate_dim': 768,
         },
         'adapter': {
-            'ds_factors': (1,),
             'num_layers': 2,
             'num_heads': 8,
         },
         'fusion_interval': 3,
     },
-    # Base: ~40M LM params (pretrained), ConvNeXt v2 Base encoder (~89M)
+    # Base: 43M decoder with a 4-layer adapter and Swin Base encoder (~88M).
     'base': {
         'encoder': {
-            'name': 'convnextv2_base.fcmae_ft_in22k_in1k',
+            'name': 'swin_base_patch4_window7_224.ms_in22k_ft_in1k',
             'out_indices': (2,),
         },
         'decoder': {
@@ -58,16 +56,15 @@ MODEL_VARIANTS = {
             'intermediate_dim': 1536,
         },
         'adapter': {
-            'ds_factors': (1,),
             'num_layers': 4,
             'num_heads': 8,
         },
         'fusion_interval': 3,
     },
-    # Large: ~164M LM params, ConvNeXt v2 Large encoder (~198M)
+    # Large: ~164M decoder with a 4-layer adapter and Swin Large encoder (~197M).
     'large': {
         'encoder': {
-            'name': 'convnextv2_large.fcmae_ft_in22k_in1k',
+            'name': 'swin_large_patch4_window7_224.ms_in22k_ft_in1k',
             'out_indices': (2,),
         },
         'decoder': {
@@ -79,7 +76,6 @@ MODEL_VARIANTS = {
             'intermediate_dim': 2048,
         },
         'adapter': {
-            'ds_factors': (1,),
             'num_layers': 4,
             'num_heads': 8,
         },
@@ -129,22 +125,21 @@ class PartyRecognitionTrainingConfig(TrainingConfig):
 
         self.freeze_encoder = kwargs.pop('freeze_encoder', False)
         self.train_from_scratch = kwargs.pop('train_from_scratch', False)
-        self.noisy_teacher_forcing = kwargs.pop('noisy_teacher_forcing', 0.02)
-        self.noisy_teacher_forcing_warmup = kwargs.pop('noisy_teacher_forcing_warmup', None)
         self.label_smoothing = kwargs.pop('label_smoothing', 0.0)
-        # LR multiplier for pretrained encoder components.
-        self.lr_pretrained_mult = kwargs.pop('lr_pretrained_mult', 0.2)
+        # Only consulted by the Lightning test loop: prepend language tokens
+        # from the segmentation's language field when generating predictions.
+        self.add_lang_token = kwargs.pop('add_lang_token', False)
+        self.max_generated_tokens = kwargs.pop('max_generated_tokens', 512)
 
         kwargs.setdefault('quit', 'fixed')
-        kwargs.setdefault('epochs', 12)
+        kwargs.setdefault('epochs', 32)
         kwargs.setdefault('lrate', 5e-4)
+        kwargs.setdefault('momentum', 0.95)
         kwargs.setdefault('weight_decay', 1e-5)
         kwargs.setdefault('schedule', 'cosine')
-        kwargs.setdefault('cos_t_max', 12)
+        kwargs.setdefault('cos_t_max', 32)
         kwargs.setdefault('cos_min_lr', 5e-6)
         kwargs.setdefault('warmup', 1000)
-        if self.noisy_teacher_forcing_warmup is None:
-            self.noisy_teacher_forcing_warmup = kwargs['warmup']
         kwargs.setdefault('accumulate_grad_batches', 4)
         kwargs.setdefault('augment', True)
         super().__init__(**kwargs)
@@ -160,8 +155,8 @@ class PartyRecognitionTrainingDataConfig(RecognitionTrainingDataConfig):
         self.prompt_mode = kwargs.pop('prompt_mode', 'both')
         self.normalization = kwargs.pop('normalization', None)
         self.normalize_whitespace = kwargs.pop('normalize_whitespace', True)
-        self.prompt_corruption = kwargs.pop('prompt_corruption', False)
 
         kwargs.setdefault('batch_size', 16)
+        kwargs.setdefault('augment', True)
 
         super().__init__(**kwargs)
