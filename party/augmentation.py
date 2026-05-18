@@ -15,40 +15,139 @@
 """
 Utility functions for data loading and training of VGSL networks.
 """
-import logging
 import math
+
 import torch
 
-from torchvision.transforms.v2 import functional as F
 from torchvision.transforms import v2
+from torchvision.transforms.v2 import functional as F
 from torchvision.transforms.functional import InterpolationMode, _get_perspective_coeffs
+from typing import Callable
 
 
-logger = logging.getLogger(__name__)
+def _transform_points(points: torch.Tensor, matrix: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
+    """
+    Maps normalized prompt coordinates through the same geometric transform as
+    the page image.
 
-
-def _transform_points(points, M, size):
+    Torchvision's image warps use inverse mapping internally, so prompt points
+    must be transformed with the inverse matrix as well to stay aligned.
+    """
     w, h = size
+    dtype = points.dtype
+    device = points.device
 
-    # use inverse matrix for forward mapping of points
-    if M.shape[0] == 2:
-        M = torch.cat([M, torch.tensor([[0.0, 0.0, 1.0]])], dim=0)
-        M = torch.inverse(M)
-        M = M[:2, :]
+    if matrix.shape[0] == 2:
+        pad_row = torch.tensor([[0.0, 0.0, 1.0]], dtype=matrix.dtype, device=matrix.device)
+        matrix = torch.cat([matrix, pad_row], dim=0)
+        matrix = torch.inverse(matrix)[:2, :]
     else:
-        M = torch.inverse(M)
+        matrix = torch.inverse(matrix)
 
-    points = points * torch.tensor([w, h], dtype=torch.float32)
-    # into homogeneous coordinates
-    points = torch.cat([points, torch.ones(points.shape[0], 1)], dim=-1)
-    points = (M.float() @ points.T).T
-    if M.shape[0] == 3:
-        # perspective transform
-        points = points[:, :2] / points[:, 2, None]
+    scale = torch.tensor([w, h], dtype=dtype, device=device)
+    hom_points = torch.cat([points * scale,
+                            torch.ones((points.shape[0], 1), dtype=dtype, device=device)],
+                           dim=-1)
+    mapped = (matrix.to(dtype=dtype, device=device) @ hom_points.T).T
+    if matrix.shape[0] == 3:
+        mapped = mapped[:, :2] / mapped[:, 2, None]
     else:
-        # affine
-        points = points[:, :2]
-    return points / torch.tensor([w, h], dtype=torch.float32)
+        mapped = mapped[:, :2]
+    return mapped / scale
+
+
+def _points_within_image(points: torch.Tensor, eps: float = 1e-6) -> bool:
+    return bool(torch.isfinite(points).all() and
+                torch.all(points >= -eps) and
+                torch.all(points <= 1.0 + eps))
+
+
+def _box_to_corners(bbox: torch.Tensor) -> torch.Tensor:
+    xy_min = bbox[0]
+    xy_max = bbox[1]
+    return torch.stack([xy_min,
+                        torch.stack([xy_max[0], xy_min[1]]),
+                        xy_max,
+                        torch.stack([xy_min[0], xy_max[1]])],
+                       dim=0)
+
+
+def _box_from_corners(corners: torch.Tensor, eps: float = 1e-6) -> torch.Tensor | None:
+    if not _points_within_image(corners, eps=eps):
+        return None
+
+    xy_min = corners.min(dim=0).values
+    xy_max = corners.max(dim=0).values
+    size = xy_max - xy_min
+    if torch.any(size <= eps):
+        return None
+
+    center = 0.5 * (xy_min + xy_max)
+    bbox = torch.stack([xy_min, xy_max, center, size], dim=0)
+    return bbox.clamp(0.0, 1.0)
+
+
+def _crop_points(points: torch.Tensor,
+                 offset: torch.Tensor,
+                 crop_size: torch.Tensor,
+                 source_size: torch.Tensor) -> torch.Tensor:
+    offset = offset.to(dtype=points.dtype, device=points.device)
+    crop_size = crop_size.to(dtype=points.dtype, device=points.device)
+    source_size = source_size.to(dtype=points.dtype, device=points.device)
+    return ((points * source_size) - offset) / crop_size
+
+
+def _crop_bbox(bbox: torch.Tensor,
+               offset: torch.Tensor,
+               crop_size: torch.Tensor,
+               source_size: torch.Tensor) -> torch.Tensor | None:
+    corners = _crop_points(_box_to_corners(bbox), offset, crop_size, source_size)
+    return _box_from_corners(corners)
+
+
+def _transform_bbox(bbox: torch.Tensor,
+                    matrix: torch.Tensor,
+                    size: tuple[int, int]) -> torch.Tensor | None:
+    corners = _transform_points(_box_to_corners(bbox), matrix, size)
+    return _box_from_corners(corners)
+
+
+def _line_points(curve: torch.Tensor | None,
+                 bbox: torch.Tensor | None) -> torch.Tensor:
+    if curve is not None:
+        return curve
+    if bbox is not None:
+        return _box_to_corners(bbox)
+    raise ValueError('Line needs either curve or bbox geometry.')
+
+
+def _transform_lines(
+    lines: list[tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]],
+    point_transform: Callable[[torch.Tensor], torch.Tensor],
+    box_transform: Callable[[torch.Tensor], torch.Tensor | None],
+) -> list[tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]]:
+    transformed_lines = []
+    for tokens, curve, bbox in lines:
+        is_valid = True
+        if curve is not None:
+            curve = point_transform(curve)
+            if not _points_within_image(curve):
+                is_valid = False
+            else:
+                curve = curve.clamp(0.0, 1.0)
+        if bbox is not None:
+            bbox = box_transform(bbox)
+            if bbox is None:
+                is_valid = False
+        if is_valid:
+            transformed_lines.append((tokens, curve, bbox))
+    return transformed_lines
+
+
+def _sample_int_inclusive(low: int, high: int) -> int:
+    if low >= high:
+        return low
+    return int(torch.randint(low, high + 1, (1,)).item())
 
 
 class RandomResizedCrop(torch.nn.Module):
@@ -56,212 +155,138 @@ class RandomResizedCrop(torch.nn.Module):
                  size: tuple[int, int],
                  scale: tuple[float, float] = (0.5, 1.0),
                  ratio: tuple[float, float] = (0.75, 1.3333333333333333),
-                 interpolation = InterpolationMode.BILINEAR,
-                 p: float = 0.5):
+                 interpolation=InterpolationMode.BILINEAR,
+                 p: float = 0.1,
+                 max_attempts: int = 8):
         super().__init__()
         self.size = size
         self.scale = scale
         self.ratio = ratio
         self.interpolation = interpolation
         self.p = p
+        self.max_attempts = max_attempts
 
-    def forward(self, image, lines):
-        if torch.rand(1) < self.p:
-            orig_h, orig_w = image.shape[-2:]
+    def forward(self,
+                image: torch.Tensor,
+                lines: list[tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]]
+                ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]]]:
+        if torch.rand(1) >= self.p or not lines:
+            return image, lines
 
-            top, left, h, w = v2.RandomResizedCrop.get_params(image, self.scale, self.ratio)
+        orig_h, orig_w = image.shape[-2:]
+        source_size = torch.tensor([orig_w, orig_h], dtype=torch.float32)
 
-            image = F.resized_crop(image, top, left, h, w, self.size, self.interpolation)
+        for _ in range(self.max_attempts):
+            _, ref_curve, ref_bbox = lines[torch.randint(len(lines), (1,)).item()]
+            ref_points = _line_points(ref_curve, ref_bbox).to(dtype=torch.float32)
+            ref_points = ref_points * source_size
+            ref_min = ref_points.min(dim=0).values
+            ref_max = ref_points.max(dim=0).values
 
-            new_lines = []
-            for (tokens, curve, bbox) in lines:
-                is_valid = True
-                if curve is not None:
-                    new_curve = curve * torch.tensor([orig_w, orig_h], dtype=torch.float32)
-                    new_curve = new_curve - torch.tensor([left, top], dtype=torch.float32)
-                    new_curve = new_curve / torch.tensor([w, h], dtype=torch.float32)
-                    if torch.any(new_curve < 0) or torch.any(new_curve > 1):
-                        is_valid = False
-                    curve = new_curve
-                if bbox is not None:
-                    new_bbox = bbox * torch.tensor([orig_w, orig_h], dtype=torch.float32)
-                    new_bbox = new_bbox - torch.tensor([left, top], dtype=torch.float32)
-                    new_bbox = new_bbox / torch.tensor([w, h], dtype=torch.float32)
-                    if torch.any(new_bbox < 0) or torch.any(new_bbox > 1):
-                        is_valid = False
-                    bbox = new_bbox
-                if is_valid:
-                    new_lines.append((tokens, curve, bbox))
-            lines = new_lines
+            _, _, h, w = v2.RandomResizedCrop.get_params(image, self.scale, self.ratio)
+            if (ref_max[0] - ref_min[0]).item() > w or (ref_max[1] - ref_min[1]).item() > h:
+                continue
+
+            left_min = max(0, math.ceil((ref_max[0] - w).item()))
+            left_max = min(orig_w - w, math.floor(ref_min[0].item()))
+            top_min = max(0, math.ceil((ref_max[1] - h).item()))
+            top_max = min(orig_h - h, math.floor(ref_min[1].item()))
+            if left_min > left_max or top_min > top_max:
+                continue
+
+            left = _sample_int_inclusive(left_min, left_max)
+            top = _sample_int_inclusive(top_min, top_max)
+            offset = torch.tensor([left, top], dtype=torch.float32)
+            crop_size = torch.tensor([w, h], dtype=torch.float32)
+            transformed_lines = _transform_lines(
+                lines,
+                point_transform=lambda pts: _crop_points(pts, offset, crop_size, source_size),
+                box_transform=lambda box: _crop_bbox(box, offset, crop_size, source_size),
+            )
+            if transformed_lines:
+                image = F.resized_crop(image, top, left, h, w, self.size, self.interpolation)
+                return image, transformed_lines
+
         return image, lines
 
 
 class RandomRotation(torch.nn.Module):
-    def __init__(self, 
+    def __init__(self,
                  degrees: tuple[float, float] = (-5.0, 5.0),
                  interpolation=InterpolationMode.BILINEAR,
-                 p: float = 0.5):
+                 p: float = 0.1):
         super().__init__()
         self.degrees = degrees
         self.interpolation = interpolation
         self.p = p
 
-    def forward(self, image, lines):
-        if torch.rand(1) < self.p:
-            angle = torch.empty(1).uniform_(self.degrees[0], self.degrees[1]).item()
-            image = F.rotate(image, angle, self.interpolation)
+    def forward(self,
+                image: torch.Tensor,
+                lines: list[tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]]
+                ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]]]:
+        if torch.rand(1) >= self.p or not lines:
+            return image, lines
 
-            h, w = image.shape[-2:]
-            center = [w / 2, h / 2]
+        original_image = image
+        angle = torch.empty(1).uniform_(self.degrees[0], self.degrees[1]).item()
+        image = F.rotate(image, angle, self.interpolation)
 
-            # create rotation matrix
-            angle_rad = math.radians(angle)
-            cos_a = math.cos(angle_rad)
-            sin_a = math.sin(angle_rad)
+        h, w = image.shape[-2:]
+        center_x = w / 2
+        center_y = h / 2
+        angle_rad = math.radians(angle)
+        cos_a = math.cos(angle_rad)
+        sin_a = math.sin(angle_rad)
+        matrix = torch.tensor([[cos_a, -sin_a, center_x - center_x * cos_a + center_y * sin_a],
+                               [sin_a, cos_a, center_y - center_x * sin_a - center_y * cos_a]],
+                              dtype=torch.float32)
 
-            M = torch.tensor([[cos_a, -sin_a, center[0] - center[0] * cos_a + center[1] * sin_a],
-                              [sin_a, cos_a, center[1] - center[0] * sin_a - center[1] * cos_a]],
-                             dtype=torch.float32)
-
-            new_lines = []
-            for (tokens, curve, bbox) in lines:
-                is_valid = True
-                if curve is not None:
-                    curve = _transform_points(curve, M, (w, h))
-                    if torch.any(curve < 0) or torch.any(curve > 1):
-                        is_valid = False
-                if bbox is not None:
-                    bbox = _transform_points(bbox, M, (w, h))
-                    if torch.any(bbox < 0) or torch.any(bbox > 1):
-                        is_valid = False
-                if is_valid:
-                    new_lines.append((tokens, curve, bbox))
-            lines = new_lines
-        return image, lines
+        transformed_lines = _transform_lines(
+            lines,
+            point_transform=lambda pts: _transform_points(pts, matrix, (w, h)),
+            box_transform=lambda box: _transform_bbox(box, matrix, (w, h)),
+        )
+        if not transformed_lines:
+            return original_image, lines
+        return image, transformed_lines
 
 
 class RandomPerspectiveWarp(torch.nn.Module):
     def __init__(self,
                  distortion_scale: float = 0.2,
-                 p: float = 0.5,
-                 interpolation=InterpolationMode.BILINEAR):
+                 interpolation=InterpolationMode.BILINEAR,
+                 p: float = 0.1):
         super().__init__()
         self.distortion_scale = distortion_scale
-        self.p = p
         self.interpolation = interpolation
-
-    def forward(self, image, lines):
-        if torch.rand(1) < self.p:
-            h, w = image.shape[-2:]
-            startpoints, endpoints = v2.RandomPerspective.get_params(w, h, self.distortion_scale)
-
-            image = F.perspective(image, startpoints, endpoints, self.interpolation)
-
-            a, b, c, d, e, f, g, h_ = _get_perspective_coeffs(startpoints, endpoints)
-            M = torch.tensor([[a, b, c], [d, e, f], [g, h_, 1]], dtype=torch.float32)
-
-            new_lines = []
-            for (tokens, curve, bbox) in lines:
-                is_valid = True
-                if curve is not None:
-                    curve = _transform_points(curve, M, (w, h))
-                    if torch.any(curve < 0) or torch.any(curve > 1):
-                        is_valid = False
-                if bbox is not None:
-                    bbox = _transform_points(bbox, M, (w, h))
-                    if torch.any(bbox < 0) or torch.any(bbox > 1):
-                        is_valid = False
-                if is_valid:
-                    new_lines.append((tokens, curve, bbox))
-            lines = new_lines
-        return image, lines
-
-
-class RandomPromptCorruption(torch.nn.Module):
-    """
-    Applies prompt-only noise to line geometry to simulate segmentation drift.
-
-    The default magnitudes are intentionally conservative so corrupted prompts
-    stay within the typical inter-line spacing of densely set documents.
-    """
-    def __init__(self,
-                 p: float = 0.5,
-                 translate_factor: float = 0.015,
-                 translate_floor: float = 3e-4,
-                 scale_std: float = 0.015,
-                 rotate_degrees: float = 0.75,
-                 point_noise_factor: float = 0.004,
-                 point_noise_floor: float = 1.5e-4):
-        super().__init__()
         self.p = p
-        self.translate_factor = translate_factor
-        self.translate_floor = translate_floor
-        self.scale_std = scale_std
-        self.rotate_radians = math.radians(rotate_degrees)
-        self.point_noise_factor = point_noise_factor
-        self.point_noise_floor = point_noise_floor
 
-    @staticmethod
-    def _box_from_center_size(center: torch.Tensor, size: torch.Tensor) -> torch.Tensor:
-        center = center.clamp(1e-3, 1.0 - 1e-3)
-        max_half_size = torch.minimum(center, 1.0 - center)
-        size = torch.minimum(size, 2.0 * max_half_size).clamp_min(1e-3)
-        half_size = 0.5 * size
-        xy_min = center - half_size
-        xy_max = center + half_size
-        return torch.stack([xy_min, xy_max, center, size], dim=0)
+    def forward(self,
+                image: torch.Tensor,
+                lines: list[tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]]
+                ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]]]:
+        if torch.rand(1) >= self.p or not lines:
+            return image, lines
 
-    def _sample_shift(self, size: torch.Tensor) -> torch.Tensor:
-        shift_scale = self.translate_factor * size + self.translate_floor
-        return torch.randn_like(size) * shift_scale
+        original_image = image
+        h, w = image.shape[-2:]
+        startpoints, endpoints = v2.RandomPerspective.get_params(w, h, self.distortion_scale)
+        image = F.perspective(image, startpoints, endpoints, self.interpolation)
 
-    def _sample_size(self, size: torch.Tensor) -> torch.Tensor:
-        scale = torch.exp(torch.randn_like(size) * self.scale_std)
-        return (size * scale).clamp(1e-3, 1.0)
+        a, b, c, d, e, f, g, h_ = _get_perspective_coeffs(startpoints, endpoints)
+        matrix = torch.tensor([[a, b, c],
+                               [d, e, f],
+                               [g, h_, 1.0]],
+                              dtype=torch.float32)
 
-    def _corrupt_curve(self, curve: torch.Tensor) -> torch.Tensor:
-        bounds_min = curve.min(dim=0).values
-        bounds_max = curve.max(dim=0).values
-        size = (bounds_max - bounds_min).clamp_min(1e-3)
-        center = curve.mean(dim=0)
-
-        angle = torch.empty(1, device=curve.device, dtype=curve.dtype).uniform_(-self.rotate_radians, self.rotate_radians)
-        sin_a = torch.sin(angle)
-        cos_a = torch.cos(angle)
-        rotation = torch.stack([torch.stack([cos_a, -sin_a], dim=-1),
-                                torch.stack([sin_a, cos_a], dim=-1)], dim=-2).squeeze(0)
-
-        scale = torch.exp(torch.randn(2, device=curve.device, dtype=curve.dtype) * self.scale_std)
-        affine = rotation @ torch.diag(scale)
-        jitter = (curve - center) @ affine.T
-        jitter = jitter + self._sample_shift(size)
-        point_noise = torch.randn_like(curve) * (self.point_noise_factor * size + self.point_noise_floor)
-        return (center + jitter + point_noise).clamp(0.0, 1.0)
-
-    def _corrupt_box(self, bbox: torch.Tensor) -> torch.Tensor:
-        center = bbox[2]
-        size = bbox[3].clamp_min(1e-3)
-        center = (center + self._sample_shift(size)).clamp(0.0, 1.0)
-        size = self._sample_size(size)
-        return self._box_from_center_size(center, size)
-
-    def forward(self, lines):
-        if not lines:
-            return lines
-
-        corrupted_lines = []
-        for tokens, curve, bbox in lines:
-            if torch.rand(1) >= self.p:
-                corrupted_lines.append((tokens, curve, bbox))
-                continue
-
-            if curve is not None:
-                curve = self._corrupt_curve(curve)
-            if bbox is not None:
-                bbox = self._corrupt_box(bbox)
-
-            corrupted_lines.append((tokens, curve, bbox))
-        return corrupted_lines
+        transformed_lines = _transform_lines(
+            lines,
+            point_transform=lambda pts: _transform_points(pts, matrix, (w, h)),
+            box_transform=lambda box: _transform_bbox(box, matrix, (w, h)),
+        )
+        if not transformed_lines:
+            return original_image, lines
+        return image, transformed_lines
 
 
 class Augmenter(torch.nn.Module):
@@ -269,13 +294,13 @@ class Augmenter(torch.nn.Module):
     An augmenter that combines geometric and photometric transformations.
     """
     def __init__(self,
-                 image_size: tuple[int, int] = (2560, 1920),
-                 prompt_corruption: bool = True):
+                 image_size: tuple[int, int] = (2560, 1920)):
         super().__init__()
+        self.image_size = image_size
+        self.resize = v2.Resize(image_size, interpolation=InterpolationMode.BILINEAR)
         self.crop = RandomResizedCrop(size=image_size, p=0.1)
         self.rotate = RandomRotation(p=0.1)
         self.perspective = RandomPerspectiveWarp(p=0.1)
-        self.prompt_corruption = RandomPromptCorruption() if prompt_corruption else None
 
         self.photometric_transforms = v2.Compose([v2.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.5, hue=0.1),
                                                   v2.RandomGrayscale(),
@@ -291,10 +316,12 @@ class Augmenter(torch.nn.Module):
 
         """
         image = v2.ToImage()(image)
+        if tuple(image.shape[-2:]) != tuple(self.image_size):
+            image = self.resize(image)
         image = self.photometric_transforms(image)
-        #image, lines = self.crop(image, lines)
-        #image, lines = self.rotate(image, lines)
-        #image, lines = self.perspective(image, lines)
-        if self.prompt_corruption is not None:
-            lines = self.prompt_corruption(lines)
+        image, lines = self.crop(image, lines)
+        image, lines = self.rotate(image, lines)
+        image, lines = self.perspective(image, lines)
+        if tuple(image.shape[-2:]) != tuple(self.image_size):
+            image = self.resize(image)
         return image, lines
