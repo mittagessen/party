@@ -7,9 +7,9 @@ train:
   train_from_scratch: true
   # training data manifests
   training_data:
-     - /home/bkiessling/party_train.lst
+     - /home/bkiessling/train.lst
   evaluation_data:
-    - /home/bkiessling/party_val.lst
+    - /home/bkiessling/val.lst
   # directory to save checkpoints in
   checkpoint_path: /home/bkiessling/experiments/base_partyv2
   # model variant
@@ -29,13 +29,9 @@ train:
   cos_min_lr: 5e-6
   warmup: 1000
   augment: true
-  prompt_corruption: false 
   validate_before_train: false
   # effective batch size params
-  batch_size: 32
+  batch_size: 16
   val_batch_size: 64
-  accumulate_grad_batches: 8
-  noisy_teacher_forcing: 0.01
-  noisy_teacher_forcing_warmup: 10000
-  label_smoothing: 0.0
+  accumulate_grad_batches: 4
   pl_logger: wandb
