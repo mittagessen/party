@@ -71,26 +71,20 @@ class PromptEncoder(nn.Module):
                 curves: Optional[torch.FloatTensor] = None,
                 boxes: Optional[torch.FloatTensor] = None) -> torch.Tensor:
         """
-        Embeds different types of prompts, either cubic Bezier curves or
-        bounding boxes.
+        Embeds either cubic Bezier curves or bounding boxes (mutually exclusive).
 
         Args:
-          curves: Normalized point coordinates of shape (B_1, 4, 2)
-          boxes: Normalized bounding box corner coordinates of shape (B_2, 4, 2)
+          curves: Normalized point coordinates of shape (B, 4, 2)
+          boxes: Normalized bounding box corner coordinates of shape (B, 4, 2)
 
         Returns:
-          Embeddings for the points with shape (B_1+B_2, E)
+          Embeddings of shape (B, E).
         """
-        embeddings = torch.empty((0, self.embed_dim),
-                                 device=self.point_embeddings.weight.device)
         if curves is not None:
-            curve_embeddings = self._embed_curves(curves)
-            embeddings = torch.cat([embeddings, curve_embeddings])
+            return self._embed_curves(curves)
         if boxes is not None:
-            box_embeddings = self._embed_boxes(boxes)
-            embeddings = torch.cat([embeddings, box_embeddings])
-
-        return embeddings
+            return self._embed_boxes(boxes)
+        raise ValueError('PromptEncoder requires either curves or boxes.')
 
 
 class PromptCrossAttention(nn.Module):
