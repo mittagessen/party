@@ -116,7 +116,7 @@ def test(ctx, batch_size, load_from_repo, load_from_file, evaluation_files,
                                                    batch_size=batch_size,
                                                    val_batch_size=batch_size,
                                                    prompt_mode=prompt_mode,
-                                                   num_workers=ctx.meta['workers'],
+                                                   num_workers=ctx.meta['num_workers'],
                                                    normalization=normalization,
                                                    normalize_whitespace=normalize_whitespace)
     m_config = PartyRecognitionTrainingConfig(add_lang_token=add_lang_token)
