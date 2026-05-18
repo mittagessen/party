@@ -517,16 +517,19 @@ class PartyRecognitionModel(L.LightningModule):
         self.net.prepare_for_generation(batch_size=self._test_batch_size,
                                         max_generated_tokens=config.max_generated_tokens)
 
-        # Per-epoch metric state
-        self._test_micro_cer = CharErrorRate()
-        self._test_micro_wer = WordErrorRate()
-        self._test_page_macro_cer = MeanMetric()
-        self._test_page_macro_wer = MeanMetric()
-        self._test_per_lang_micro_cer = defaultdict(CharErrorRate)
-        self._test_per_lang_micro_wer = defaultdict(WordErrorRate)
-        self._test_per_lang_page_macro_cer = defaultdict(MeanMetric)
-        self._test_per_lang_page_macro_wer = defaultdict(MeanMetric)
-        self._test_per_script_page_macro_cer = defaultdict(MeanMetric)
+        # Per-epoch metric state. Metrics must live on self.device so their
+        # _sync_dist all_gather uses the NCCL backend under DDP; CPU tensors
+        # raise "No backend type associated with device type cpu".
+        device = self.device
+        self._test_micro_cer = CharErrorRate().to(device)
+        self._test_micro_wer = WordErrorRate().to(device)
+        self._test_page_macro_cer = MeanMetric().to(device)
+        self._test_page_macro_wer = MeanMetric().to(device)
+        self._test_per_lang_micro_cer = defaultdict(lambda: CharErrorRate().to(device))
+        self._test_per_lang_micro_wer = defaultdict(lambda: WordErrorRate().to(device))
+        self._test_per_lang_page_macro_cer = defaultdict(lambda: MeanMetric().to(device))
+        self._test_per_lang_page_macro_wer = defaultdict(lambda: MeanMetric().to(device))
+        self._test_per_script_page_macro_cer = defaultdict(lambda: MeanMetric().to(device))
         self._test_algn_gt: list[str] = []
         self._test_algn_pred: list[str] = []
 
@@ -544,8 +547,8 @@ class PartyRecognitionModel(L.LightningModule):
     
             page_cer = CharErrorRate().to(device)
             page_wer = WordErrorRate().to(device)
-            lang_page_cer: dict[str, CharErrorRate] = defaultdict(CharErrorRate)
-            lang_page_wer: dict[str, WordErrorRate] = defaultdict(WordErrorRate)
+            lang_page_cer: dict[str, CharErrorRate] = defaultdict(lambda: CharErrorRate().to(device))
+            lang_page_wer: dict[str, WordErrorRate] = defaultdict(lambda: WordErrorRate().to(device))
             page_algn_gt: list[str] = []
             page_algn_pred: list[str] = []
     
