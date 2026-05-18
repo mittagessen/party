@@ -211,6 +211,7 @@ class PartyModel(nn.Module, RecognitionBaseModel):
                                         dtype,
                                         encoder_max_seq_len=encoder_max_seq_len,
                                         decoder_max_seq_len=decoder_max_seq_len)
+        self._cache_batch_size = batch_size
 
     def caches_are_setup(self) -> bool:
         """
@@ -511,8 +512,8 @@ class PartyModel(nn.Module, RecognitionBaseModel):
             self.reset_caches()
 
             logger.info(f'Processing batch {batch_idx} of {len(batches)}')
-            if bsz != self._batch_size:
-                logger.debug(f'Resizing caches for last batch ({self._batch_size} -> {bsz})')
+            if bsz != self._cache_batch_size:
+                logger.debug(f'Resizing caches ({self._cache_batch_size} -> {bsz})')
                 self.setup_caches(batch_size=bsz,
                                   encoder_max_seq_len=self.encoder_max_seq_len,
                                   decoder_max_seq_len=self._max_generated_tokens,
