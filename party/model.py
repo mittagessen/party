@@ -578,10 +578,10 @@ class PartyRecognitionModel(L.LightningModule):
                 self._test_per_script_page_macro_cer[k].update(v)
     
             for lang in lang_page_cer:
-                self._test_per_lang_page_macro_cer[lang].update(lang_page_cer[lang].compute())
-                self._test_per_lang_page_macro_wer[lang].update(lang_page_wer[lang].compute())
-            self._test_page_macro_cer.update(page_cer.compute())
-            self._test_page_macro_wer.update(page_wer.compute())
+                self._test_per_lang_page_macro_cer[lang].update(float(lang_page_cer[lang].compute()))
+                self._test_per_lang_page_macro_wer[lang].update(float(lang_page_wer[lang].compute()))
+            self._test_page_macro_cer.update(float(page_cer.compute()))
+            self._test_page_macro_wer.update(float(page_wer.compute()))
         except Exception:
             logger.warning(f'Sample {batch_idx} failed to process.', exc_info=True)
 
