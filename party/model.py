@@ -582,6 +582,8 @@ class PartyRecognitionModel(L.LightningModule):
                 self._test_per_lang_page_macro_wer[lang].update(float(lang_page_wer[lang].compute()))
             self._test_page_macro_cer.update(float(page_cer.compute()))
             self._test_page_macro_wer.update(float(page_wer.compute()))
+        except RuntimeError:
+            raise
         except Exception:
             logger.warning(f'Sample {batch_idx} failed to process.', exc_info=True)
 

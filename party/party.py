@@ -531,7 +531,7 @@ class PartyModel(nn.Module, RecognitionBaseModel):
                                   encoder_hidden_states=encoder_hidden_states,
                                   encoder_mask=encoder_mask[:bsz, ...],
                                   mask=curr_masks,
-                                  input_pos=input_pos[:, :_prompt_length].squeeze())
+                                  input_pos=input_pos[:, :_prompt_length].squeeze(0))
             tokens = torch.argmax(logits, dim=-1)[:, -1:]
             confs = logits[:, -1].softmax(-1)
             generated_tokens = [tokens[:, -1]]
