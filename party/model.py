@@ -543,7 +543,11 @@ class PartyRecognitionModel(L.LightningModule):
                                   for line in bounds.lines]).view(-1, 4, 2).to(device)
     
             prompt_mode = self._test_prompt_mode
-            languages = bounds.language if self._test_add_lang_token else None
+            if self._test_add_lang_token:
+                languages = [line.language or bounds.language or None
+                             for line in bounds.lines]
+            else:
+                languages = None
     
             page_cer = CharErrorRate().to(device)
             page_wer = WordErrorRate().to(device)

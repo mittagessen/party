@@ -21,9 +21,9 @@ import logging
 from torch import nn
 import numpy as np
 
-from dataclasses import asdict, replace
+from dataclasses import replace
 from kraken.models import RecognitionBaseModel
-from kraken.containers import BaselineOCRRecord, BBoxOCRRecord, BBoxLine
+from kraken.containers import BaselineOCRRecord, BBoxOCRRecord
 from lightning.fabric import Fabric
 from collections.abc import Generator
 from typing import Optional, Union, TYPE_CHECKING, Any
@@ -50,7 +50,12 @@ def _box_prompt_fn(line: Union['BaselineLine', 'BBoxLine'],
     """
     Converts a BBoxLine or BaselineLine to a bounding box representation.
     """
-    bbox = _to_bbox([line.bbox] if line.type == 'bbox' else line.boundary, im_size)
+    if line.type == 'bbox':
+        xmin, ymin, xmax, ymax = line.bbox
+        boundary = [(xmin, ymin), (xmax, ymax)]
+    else:
+        boundary = line.boundary
+    bbox = _to_bbox(boundary, im_size)
     return bbox.as_py() if bbox is not None else None
 
 
@@ -61,20 +66,6 @@ def _curve_prompt_fn(line: 'BaselineLine',
     """
     curve = _to_curve(line.baseline, im_size)
     return curve.as_py() if curve is not None else None
-
-
-def _baseline_to_bbox(line: 'BaselineLine') -> 'BBoxLine':
-    """
-    Converts a BaselineLine to a BBoxLine.
-    """
-    d = asdict(line)
-    d.pop('baseline')
-    d.pop('type')
-    flat_box = [point for pol in d.pop('boundary') for point in pol]
-    xmin, xmax = min(flat_box[::2]), max(flat_box[::2])
-    ymin, ymax = min(flat_box[1::2]), max(flat_box[1::2])
-    d['bbox'] = (xmin, ymin, xmax, ymax)
-    return BBoxLine(**d)
 
 
 class SingleScaleAdapter(nn.Module):
@@ -314,12 +305,13 @@ class PartyModel(nn.Module, RecognitionBaseModel):
                                max_generated_tokens: int = 512) -> None:
         """
         Allocates KV caches and primes the model for autoregressive decoding.
-
-        Used by both standalone inference (:meth:`prepare_for_inference`) and
-        the Lightning-driven test loop, which manages device placement and
-        precision through ``Trainer`` rather than ``Fabric``.
         """
         self.eval()
+        decoder_max_seq_len = self.nn['decoder'].max_seq_len
+        if max_generated_tokens > decoder_max_seq_len:
+            logger.warning(f'max_generated_tokens ({max_generated_tokens}) exceeds decoder '
+                           f'max_seq_len ({decoder_max_seq_len}); clamping.')
+            max_generated_tokens = decoder_max_seq_len
         self._batch_size = batch_size
         self._max_generated_tokens = max_generated_tokens
         self.setup_caches(batch_size=batch_size,
@@ -342,13 +334,6 @@ class PartyModel(nn.Module, RecognitionBaseModel):
         self._inf_config = config
         self.m_dtype = next(self.parameters()).dtype
 
-        # create line extraction worker pool
-        from torch.multiprocessing import Pool
-        if getattr(self, '_image_extraction_pool', None) is None:
-            self._line_extraction_pool = Pool(self._inf_config.num_line_workers)
-            import atexit
-            atexit.register(self._line_extraction_pool.terminate)
-
         self.prepare_for_generation(batch_size=config.batch_size,
                                     max_generated_tokens=config.max_generated_tokens)
 
@@ -368,18 +353,12 @@ class PartyModel(nn.Module, RecognitionBaseModel):
         with self._fabric.init_tensor():
             image_input = self.im_transforms(im).unsqueeze(0)
 
-            cfg_prompt_mode = self._inf_config.prompt_mode
-            if cfg_prompt_mode is not None:
-                if cfg_prompt_mode == 'curves' and segmentation.type == 'bbox':
-                    raise ValueError('Prompt mode set to curves but segmentation is of bounding box type.')
-                prompt_mode = cfg_prompt_mode
-            elif segmentation.type == 'baselines':
-                prompt_mode = 'curves'
-            else:
-                prompt_mode = 'boxes'
+            if self._inf_config.prompt_mode == 'curves' and segmentation.type == 'bbox':
+                raise ValueError('Prompt mode set to curves but segmentation is of bounding box type.')
+            prompt_mode = self._inf_config.prompt_mode or (
+                'curves' if segmentation.type == 'baselines' else 'boxes')
 
             valid_lines = []
-            valid_line_indices = []
             lines_data = []
             for idx, line in enumerate(segmentation.lines):
                 line_data = _curve_prompt_fn(line, im.size) if prompt_mode == 'curves' else _box_prompt_fn(line, im.size)
@@ -387,7 +366,6 @@ class PartyModel(nn.Module, RecognitionBaseModel):
                     logger.info(f'Skipping line {idx} due to invalid prompt geometry.')
                     continue
                 valid_lines.append(line)
-                valid_line_indices.append(idx)
                 lines_data.append(line_data)
 
             if not lines_data:
@@ -396,9 +374,11 @@ class PartyModel(nn.Module, RecognitionBaseModel):
 
             lines = torch.tensor(lines_data).view(-1, 4, 2)
 
-            languages = segmentation.language if self._inf_config.add_lang_token else None
-            if isinstance(languages, (list, tuple)) and len(languages) == len(segmentation.lines):
-                languages = [languages[idx] for idx in valid_line_indices]
+            if self._inf_config.add_lang_token:
+                languages = [line.language or segmentation.language or None
+                             for line in valid_lines]
+            else:
+                languages = None
 
             for (pred_text, pred_confs, pred_langs), line in zip(
                 self.predict_string(encoder_input=image_input,
@@ -426,13 +406,10 @@ class PartyModel(nn.Module, RecognitionBaseModel):
                                             line=line,
                                             display_order=False)
                 else:
+                    bbox_line = line if line.type == 'bbox' else line.to_bbox(
+                        text_direction=segmentation.text_direction)
                     if n_chars > 0:
-                        if line.type == 'bbox':
-                            xmin, ymin, xmax, ymax = line.bbox
-                        else:
-                            flat_box = [point for pol in line.boundary for point in pol]
-                            xmin, xmax = min(flat_box[::2]), max(flat_box[::2])
-                            ymin, ymax = min(flat_box[1::2]), max(flat_box[1::2])
+                        xmin, ymin, xmax, ymax = bbox_line.bbox
                         step = (xmax - xmin) / n_chars
                         cuts = [((int(xmin + i * step), ymin),
                                  (int(xmin + (i + 1) * step), ymin),
@@ -445,7 +422,7 @@ class PartyModel(nn.Module, RecognitionBaseModel):
                     yield BBoxOCRRecord(prediction=pred_text,
                                         cuts=cuts,
                                         confidences=pred_confs,
-                                        line=_baseline_to_bbox(line) if line.type != 'bbox' else line,
+                                        line=bbox_line,
                                         display_order=False)
 
     @torch.inference_mode()
@@ -453,7 +430,7 @@ class PartyModel(nn.Module, RecognitionBaseModel):
                        encoder_input: torch.FloatTensor,
                        curves: Optional[torch.FloatTensor] = None,
                        boxes: Optional[torch.FloatTensor] = None,
-                       languages: Optional[list[str]] = None) -> Generator[tuple[torch.Tensor, torch.Tensor], None, None]:
+                       languages: Optional[list[Optional[list[str]]]] = None) -> Generator[tuple[torch.Tensor, torch.Tensor], None, None]:
         """
         Predicts text from an input page image and a number of cubic Bézier
         curves.
@@ -462,7 +439,15 @@ class PartyModel(nn.Module, RecognitionBaseModel):
             encoder_input: Image input for the encoder with shape ``1 x c x h x w``
             curves: Curves to be embedded and added to the encoder embeddings (``n x 4 x 2``)
             boxes: Boxes to be embedded and added to the encoder embeddings (``n x 4 x 2``)
-            batch_size: Number of curves to generate text for simultaneously.
+            languages: Optional per-line language conditioning. One entry per
+                       line in ``curves``/``boxes``; each entry is either a
+                       list of ISO-639-3 language identifiers to be prepended
+                       to that line's prompt, or ``None`` to leave it
+                       unconditioned. Pass ``None`` (the default) to disable
+                       language conditioning for all lines. Lines with
+                       differing prompt lengths are left-padded; padding
+                       positions are masked out of both self- and
+                       cross-attention.
 
         Yields:
             One tensor of integer labels and one tensor of float confidences,
@@ -475,48 +460,60 @@ class PartyModel(nn.Module, RecognitionBaseModel):
             raise ValueError('`curves` and `boxes` are mutually exclusive.')
         if curves is None and boxes is None:
             raise ValueError('One of `curves` or `boxes` needs to be set.')
-        logger.debug('Computing encoder embeddings')
 
+        line_pos = curves if curves is not None else boxes
+        n_lines = line_pos.size(0)
+        if languages is not None and len(languages) != n_lines:
+            raise ValueError(f'`languages` must contain one entry per line '
+                             f'({n_lines}); got {len(languages)}.')
+
+        logger.debug('Computing encoder embeddings')
         adapter_output = self.forward_encoder_embeddings(encoder_input)
         device = adapter_output.device
 
-        _prompt = torch.tensor(self.tokenizer.encode('', langs=languages, add_eos=False),
-                               device=device,
-                               dtype=torch.long).repeat(self._batch_size, 1)
-        _prompt_length = _prompt.size(1)
+        # Build per-line prompts (varying lengths when languages differ).
+        line_prompts = [self.tokenizer.encode('',
+                                              langs=languages[i] if languages is not None else None,
+                                              add_eos=False)
+                        for i in range(n_lines)]
 
         eos_token = torch.tensor(self.tokenizer.eos_id, device=device, dtype=torch.long)
+        cache_size = self._max_generated_tokens
 
-        line_pos = curves if curves is not None else boxes
-        batches = torch.split(line_pos, self._batch_size)
+        n_batches = (n_lines + self._batch_size - 1) // self._batch_size
+        for batch_idx in range(n_batches):
+            start = batch_idx * self._batch_size
+            end = min(start + self._batch_size, n_lines)
+            bsz = end - start
+            batch = line_pos[start:end]
+            batch_prompts = line_prompts[start:end]
+            prompt_lens = [len(p) for p in batch_prompts]
+            max_prompt_len = max(prompt_lens)
 
-        total_response_length = _prompt_length + self._max_generated_tokens
-        # generate a regular causal mask
-        masks = torch.tril(torch.ones(total_response_length,
-                                      self._max_generated_tokens,
-                                      dtype=torch.bool,
-                                      device=device)).unsqueeze(0)
-        input_pos = torch.arange(0, total_response_length, device=device).unsqueeze(0)
+            if max_prompt_len >= cache_size:
+                raise ValueError(f'Prompt length {max_prompt_len} leaves no room to '
+                                 f'generate within decoder cache ({cache_size}).')
 
-        # Mask is shape (batch_size, max_seq_len, image_embedding_len)
-        encoder_mask = torch.ones((self._batch_size,
-                                   _prompt_length,
-                                   self.encoder_max_seq_len),
-                                  dtype=torch.bool,
-                                  device=device)
+            pad_lens = torch.tensor([max_prompt_len - L for L in prompt_lens],
+                                    device=device, dtype=torch.long)
 
-        for batch_idx, batch in enumerate(batches):
-
-            bsz = batch.size(0)
+            # Left-pad each line's prompt with pad_id so all rows end at column
+            # (max_prompt_len - 1) regardless of original prompt length.
+            prompt_tokens = torch.full((bsz, max_prompt_len),
+                                       fill_value=self.tokenizer.pad_id,
+                                       dtype=torch.long,
+                                       device=device)
+            for i, p in enumerate(batch_prompts):
+                prompt_tokens[i, -len(p):] = torch.tensor(p, dtype=torch.long, device=device)
 
             self.reset_caches()
 
-            logger.info(f'Processing batch {batch_idx} of {len(batches)}')
+            logger.info(f'Processing batch {batch_idx + 1} of {n_batches}')
             if bsz != self._cache_batch_size:
                 logger.debug(f'Resizing caches ({self._cache_batch_size} -> {bsz})')
                 self.setup_caches(batch_size=bsz,
                                   encoder_max_seq_len=self.encoder_max_seq_len,
-                                  decoder_max_seq_len=self._max_generated_tokens,
+                                  decoder_max_seq_len=cache_size,
                                   dtype=next(self.nn['encoder'].parameters()).dtype)
 
             logger.debug('Computing additive line embeddings.')
@@ -524,20 +521,34 @@ class PartyModel(nn.Module, RecognitionBaseModel):
                                                         boxes=batch if boxes is not None else None)
             encoder_hidden_states = adapter_output + line_embeddings.unsqueeze(1)
 
+            # Self-attention mask, shape [bsz, max_prompt_len, cache_size]:
+            # - real query rows attend causally to real key positions only,
+            # - pad query rows get a diagonal-only mask (outputs ignored) to
+            #   prevent all-False rows from producing NaNs in softmax.
+            q_pos = torch.arange(max_prompt_len, device=device).view(1, -1, 1)
+            k_pos = torch.arange(cache_size, device=device).view(1, 1, -1)
+            pad_lens_v = pad_lens.view(-1, 1, 1)
+            real_q = q_pos >= pad_lens_v
+            real_k = k_pos >= pad_lens_v
+            prefill_mask = (real_q & real_k & (k_pos <= q_pos)) | (~real_q & (k_pos == q_pos))
+
+            # Encoder mask: real query rows attend to all encoder embeddings;
+            # pad rows have all-False rows, which TransformerCrossAttentionLayer
+            # handles via its skip-mask path.
+            encoder_mask = real_q.expand(-1, -1, self.encoder_max_seq_len).contiguous()
+
             logger.debug('Prefilling cache.')
-            # prefill step
-            curr_masks = masks[:, :_prompt_length]
-            logits = self.forward(tokens=_prompt[:bsz, ...],
+            logits = self.forward(tokens=prompt_tokens,
                                   encoder_hidden_states=encoder_hidden_states,
-                                  encoder_mask=encoder_mask[:bsz, ...],
-                                  mask=curr_masks,
-                                  input_pos=input_pos[:, :_prompt_length].squeeze(0))
+                                  encoder_mask=encoder_mask,
+                                  mask=prefill_mask,
+                                  input_pos=torch.arange(0, max_prompt_len, device=device))
             tokens = torch.argmax(logits, dim=-1)[:, -1:]
             confs = logits[:, -1].softmax(-1)
             generated_tokens = [tokens[:, -1]]
             generated_confidences = [confs.gather(-1, tokens).squeeze(1)]
             logger.debug(f'Generated {generated_tokens[-1]} with conf {generated_confidences[-1]}')
-            curr_pos = _prompt_length
+            curr_pos = max_prompt_len
 
             # keeps track of EOS tokens emitted by each sequence in a batch
             eos_token_reached = torch.zeros(bsz, dtype=torch.bool, device=device)
@@ -546,34 +557,32 @@ class PartyModel(nn.Module, RecognitionBaseModel):
             # mask used for setting all values from EOS token to pad_id in output sequences.
             eos_token_mask = torch.ones(bsz, 0, dtype=torch.int32, device=device)
 
-            if eos_token_reached.all():
-                break
+            if not eos_token_reached.all():
+                for _ in range(cache_size - max_prompt_len - 1):
+                    logger.debug('Generating...')
+                    eos_token_mask = torch.cat([eos_token_mask,
+                                                ~eos_token_reached.reshape(bsz, 1)], dim=-1)
 
-            for _ in range(self._max_generated_tokens - (1 + _prompt_length)):
-                logger.debug('Generating...')
-                # update eos_token_mask if an EOS token was emitted in a previous step
-                eos_token_mask = torch.cat([eos_token_mask, ~eos_token_reached.reshape(bsz, 1)], dim=-1)
+                    # Step mask: each row can attend to its real key range
+                    # [pad_lens[b], curr_pos].
+                    step_mask = (k_pos >= pad_lens_v) & (k_pos <= curr_pos)
 
-                curr_input_pos = input_pos[:, curr_pos]
-                curr_masks = masks[:, curr_pos, None, :]
+                    logits = self.forward(tokens=tokens.clone(),
+                                          mask=step_mask,
+                                          input_pos=torch.tensor([curr_pos], device=device))
+                    tokens = torch.argmax(logits, dim=-1)
+                    confs = logits[:, -1].softmax(-1)
+                    generated_tokens.append(tokens[:, -1])
+                    generated_confidences.append(confs.gather(-1, tokens).squeeze(1))
+                    logger.debug(f'Generated {generated_tokens[-1]} with conf {generated_confidences[-1]}')
 
-                # no need for encoder embeddings anymore as they're in the cache now
-                logits = self.forward(tokens=tokens.clone(),
-                                      mask=curr_masks,
-                                      input_pos=curr_input_pos)
-                tokens = torch.argmax(logits, dim=-1)
-                confs = logits[:, -1].softmax(-1)
-                generated_tokens.append(tokens[:, -1])
-                generated_confidences.append(confs.gather(-1, tokens).squeeze(1))
-                logger.debug(f'Generated {generated_tokens[-1]} with conf {generated_confidences[-1]}')
+                    curr_pos += 1
+                    eos_token_reached |= tokens[:, -1] == eos_token
+                    if eos_token_reached.all():
+                        break
 
-                curr_pos += 1
-
-                eos_token_reached |= tokens[:, -1] == eos_token
-                if eos_token_reached.all():
-                    break
-
-            eos_token_mask = torch.cat([eos_token_mask, ~eos_token_reached.reshape(bsz, 1)], dim=-1)
+            eos_token_mask = torch.cat([eos_token_mask,
+                                        ~eos_token_reached.reshape(bsz, 1)], dim=-1)
 
             # mask out generated tokens beyond EOS token
             generated_tokens = torch.stack(generated_tokens).T
@@ -583,12 +592,12 @@ class PartyModel(nn.Module, RecognitionBaseModel):
             generated_confidences *= eos_token_mask
             yield generated_tokens[..., :-1], generated_confidences[..., :-1]
 
-    @torch.inference_mode
+    @torch.inference_mode()
     def predict_string(self,
                        encoder_input: torch.FloatTensor,
                        curves: Optional[torch.FloatTensor] = None,
                        boxes: Optional[torch.FloatTensor] = None,
-                       languages: Optional[list[str]] = None) -> Generator[str, None, None]:
+                       languages: Optional[list[Optional[list[str]]]] = None) -> Generator[str, None, None]:
         """
         Predicts text from an input page image and a number of cubic Bézier
         curves.
@@ -596,7 +605,11 @@ class PartyModel(nn.Module, RecognitionBaseModel):
         Args:
             encoder_input: Image input for the encoder with shape ``[1 x c x h x w]``
             curves: Curves to be embedded and added to the encoder embeddings (``n x 4 x 2``)
-            languages: ISO693-3 identifiers of the languages of the lines.
+            languages: Optional per-line language conditioning. One entry per
+                       input line; each entry is a list of ISO-639-3 language
+                       identifiers for that line, or ``None`` to leave it
+                       unconditioned. Pass ``None`` (default) to disable
+                       language conditioning for all lines.
 
         Yields:
         """
