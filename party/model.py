@@ -32,6 +32,8 @@ from torch.distributed import ReduceOp, all_reduce, get_world_size, is_initializ
 from torch.utils.data import RandomSampler, DataLoader
 
 from party.party import PartyModel
+from party.modules import PrototypeHead
+from party.tokenizer import CodePointTokenizer
 from party.dataset import (collate_null, get_default_transforms,
                            BinnedBaselineDataset, TestBaselineDataset,
                            ValidationBaselineDataset,
@@ -56,8 +58,55 @@ def _shift_targets(tokens: torch.Tensor, ignore_index: int) -> torch.Tensor:
     return torch.hstack((tokens[..., 1:], ignore_idxs)).reshape(-1)
 
 
+def _get_prototype_head(model) -> Optional[PrototypeHead]:
+    module_dict = getattr(model, 'nn', None)
+    if module_dict is None:
+        return None
+    try:
+        decoder = module_dict['decoder']
+    except Exception:
+        return None
+    output = getattr(decoder, 'output', None)
+    if isinstance(output, PrototypeHead):
+        return output
+    return None
+
+
+def apply_arcface_margin(logits: torch.Tensor,
+                         targets: torch.Tensor,
+                         margin: torch.Tensor,
+                         temperature: torch.Tensor,
+                         ignore_index: int = -100) -> torch.Tensor:
+    """
+    Applies an ArcFace angular margin to target logits.
+
+    A margin of zero is a numerical no-op (cos_m=1, sin_m=0 → adjusted equals
+    the original target logits), so the caller may always call this; it's
+    only worth gating to save compute, not for correctness.
+    """
+    valid = targets != ignore_index
+    safe_targets = torch.where(valid, targets, torch.zeros_like(targets))
+    safe_targets_col = safe_targets.unsqueeze(1)
+
+    tau = torch.clamp(temperature, min=1.0, max=100.0).to(dtype=logits.dtype, device=logits.device)
+    margin = margin.to(dtype=logits.dtype, device=logits.device)
+
+    target_logits = logits.gather(1, safe_targets_col).squeeze(1)
+    cos_theta = (target_logits / tau).clamp(-1.0 + 1e-7, 1.0 - 1e-7)
+    sin_theta = torch.sqrt(torch.clamp(1.0 - cos_theta * cos_theta, min=0.0))
+    cos_m = torch.cos(margin)
+    sin_m = torch.sin(margin)
+    adjusted = tau * (cos_theta * cos_m - sin_theta * sin_m)
+
+    new_target_logits = torch.where(valid, adjusted, target_logits)
+    delta = (new_target_logits - target_logits).unsqueeze(1)
+    return logits.scatter_add(1, safe_targets_col, delta)
+
+
 @torch.compile(dynamic=False)
-def model_step(model, tokens, image, curves, boxes, ignore_index, label_smoothing: float = 0.0):
+def model_step(model, tokens, image, curves, boxes, ignore_index,
+               label_smoothing: float = 0.0,
+               proto_margin: Optional[torch.Tensor] = None):
     targets = _shift_targets(tokens, ignore_index)
 
     # our tokens already contain BOS/EOS tokens so we just run them
@@ -69,6 +118,16 @@ def model_step(model, tokens, image, curves, boxes, ignore_index, label_smoothin
                    encoder_boxes=boxes)
 
     logits = logits.reshape(-1, logits.shape[-1])
+    proto_head = _get_prototype_head(model)
+    # Gate only on type-stable Python values (None vs Tensor, training vs not)
+    # so torch.compile specializes at most a handful of times rather than
+    # re-specializing on the literal margin value every step.
+    if proto_head is not None and proto_margin is not None and model.training:
+        logits = apply_arcface_margin(logits,
+                                      targets,
+                                      margin=proto_margin,
+                                      temperature=proto_head.temperature,
+                                      ignore_index=ignore_index)
     token_loss = F.cross_entropy(logits,
                                  targets,
                                  ignore_index=ignore_index,
@@ -212,7 +271,14 @@ def _should_use_muon(name: str,
     return True
 
 
-def get_parameter_groups(model) -> list[dict[str, Any]]:
+def _is_prototype_temperature(name: str) -> bool:
+    # The PrototypeHead temperature is a 0-d nn.Parameter that scales cosine
+    # similarities; we keep it on AdamW with a reduced LR so it doesn't drift
+    # aggressively early in training.
+    return name.endswith('nn.decoder.output.temperature') or name == 'nn.decoder.output.temperature'
+
+
+def get_parameter_groups(model, base_lr: Optional[float] = None) -> list[dict[str, Any]]:
     owners = _get_parameter_owners(model)
     muon_params = []
     muon_param_names = []
@@ -220,12 +286,17 @@ def get_parameter_groups(model) -> list[dict[str, Any]]:
     adamw_excluded_2d_param_names = []
     adamw_other_params = []
     adamw_other_param_names = []
+    temperature_params = []
+    temperature_param_names = []
 
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
             continue
         owner = owners.get(name)
-        if _should_use_muon(name, parameter, owner):
+        if _is_prototype_temperature(name):
+            temperature_params.append(parameter)
+            temperature_param_names.append(name)
+        elif _should_use_muon(name, parameter, owner):
             muon_params.append(parameter)
             muon_param_names.append(name)
         elif parameter.ndim == 2:
@@ -251,6 +322,14 @@ def get_parameter_groups(model) -> list[dict[str, Any]]:
                              'param_names': adamw_other_param_names,
                              'name': 'adamw_non_2d',
                              'use_muon': False})
+    if temperature_params:
+        temperature_group: dict[str, Any] = {'params': temperature_params,
+                                             'param_names': temperature_param_names,
+                                             'name': 'adamw_proto_temperature',
+                                             'use_muon': False}
+        if base_lr is not None:
+            temperature_group['lr'] = base_lr * 1.0
+        param_groups.append(temperature_group)
     return param_groups
 
 
@@ -297,6 +376,11 @@ class PartyTextLineDataModule(L.LightningDataModule):
             raise ValueError('No valid validation data provided. Please add some.')
         self.train_set.max_seq_len = max(self.train_set.max_seq_len, self.val_set.max_seq_len)
         self.val_set.max_seq_len = self.train_set.max_seq_len
+        # Share a single frozen tokenizer across train and val so encoded
+        # token IDs are consistent.
+        self.tokenizer = CodePointTokenizer.merge([self.train_set.tokenizer, self.val_set.tokenizer])
+        self.train_set.tokenizer = self.tokenizer
+        self.val_set.tokenizer = self.tokenizer
         logger.info('Training set language statistics:')
         for lang, count in sorted(self.train_set.lang_counts.items(), key=lambda x: -x[1]):
             logger.info(f'  {lang}: {count}')
@@ -314,6 +398,7 @@ class PartyTextLineDataModule(L.LightningDataModule):
                                                 prompt_mode=prompt_mode)
             if len(self.test_set) == 0:
                 raise ValueError('No valid test data provided. Please add some.')
+            self.tokenizer = self.test_set.tokenizer
 
     def train_dataloader(self):
         world_size = get_world_size() if is_initialized() else 1
@@ -399,6 +484,21 @@ class PartyRecognitionModel(L.LightningModule):
     def forward(self, x, curves):
         return self.net(encoder_input=x, encoder_curves=curves)
 
+    def _current_proto_margin(self) -> Optional[torch.Tensor]:
+        """
+        Returns the current ArcFace margin as a 0-d tensor on ``self.device``,
+        or ``None`` when margin training is disabled (so model_step can gate
+        without baking the literal margin value into the compiled graph).
+        """
+        margin = float(getattr(self.hparams.config, 'proto_margin', 0.0))
+        if margin <= 0.0:
+            return None
+        warmup_steps = int(getattr(self.hparams.config, 'warmup', 0) or 0)
+        if warmup_steps > 0:
+            scale = min(1.0, float(self.trainer.global_step + 1) / warmup_steps)
+            margin = margin * scale
+        return torch.tensor(margin, device=self.device, dtype=torch.float32)
+
     def training_step(self, batch, batch_idx):
         loss, _, valid_count = self.model_step(self.net,
                                                batch['tokens'],
@@ -406,7 +506,8 @@ class PartyRecognitionModel(L.LightningModule):
                                                batch['curves'],
                                                batch['boxes'],
                                                self.criterion.ignore_index,
-                                               self.hparams.config.label_smoothing)
+                                               self.hparams.config.label_smoothing,
+                                               self._current_proto_margin())
         finite_loss = torch.isfinite(loss.detach())
         if is_initialized():
             finite_flag = finite_loss.to(dtype=torch.int32)
@@ -621,8 +722,18 @@ class PartyRecognitionModel(L.LightningModule):
     def setup(self, stage: Optional[str] = None):
         if stage in [None, 'fit']:
             if self.net is None:
-                self.net = PartyModel(model_variant=self.hparams.config.model_variant,
-                                      image_size=self.trainer.datamodule.hparams.data_config.image_size)
+                data_tokenizer = getattr(self.trainer.datamodule, 'tokenizer', None)
+                tokenizer_state = data_tokenizer.save() if data_tokenizer is not None else None
+                config = self.hparams.config
+                self.net = PartyModel(model_variant=config.model_variant,
+                                      image_size=self.trainer.datamodule.hparams.data_config.image_size,
+                                      tokenizer_state=tokenizer_state,
+                                      proto_temperature_init=getattr(config, 'proto_temperature_init', 10.0),
+                                      proto_margin=getattr(config, 'proto_margin', 0.0))
+                pretrained_path = getattr(config, 'pretrained_weights_path', None)
+                if pretrained_path:
+                    logger.info(f'Loading pretrained conventional party weights from {pretrained_path}.')
+                    self.net.load_pretrained_party_weights(pretrained_path)
 
             if self.hparams.config.freeze_encoder:
                 for param in self.net.nn['encoder'].parameters():
@@ -636,6 +747,9 @@ class PartyRecognitionModel(L.LightningModule):
         shouldn't be overwritten in on_load_checkpoint.
         """
         checkpoint['_module_config'] = self.hparams.config
+        tokenizer = getattr(self.net, 'tokenizer', None) if self.net is not None else None
+        if tokenizer is not None:
+            checkpoint['_tokenizer_state'] = tokenizer.save()
 
     def on_load_checkpoint(self, checkpoint):
         """
@@ -647,8 +761,12 @@ class PartyRecognitionModel(L.LightningModule):
 
         module_config = checkpoint['_module_config']
         data_config = checkpoint['datamodule_hyper_parameters']['data_config']
+        tokenizer_state = checkpoint.get('_tokenizer_state')
         self.net = PartyModel(model_variant=module_config.model_variant,
-                               image_size=data_config.image_size)
+                              image_size=data_config.image_size,
+                              tokenizer_state=tokenizer_state,
+                              proto_temperature_init=getattr(module_config, 'proto_temperature_init', 10.0),
+                              proto_margin=getattr(module_config, 'proto_margin', 0.0))
 
     @classmethod
     def load_from_repo(cls,
@@ -667,13 +785,15 @@ class PartyRecognitionModel(L.LightningModule):
                           path: Union[str, 'PathLike'],
                           config: PartyRecognitionTrainingConfig) -> 'PartyRecognitionModel':
         """
-        Initializes the module from a model weights file.
+        Initializes the module from a "conventional" (non-prototype) party
+        safetensors weights file.
+
+        The actual weight surgery (drop tok_embeddings/output, load the rest
+        into a freshly-built prototype model) is deferred to :meth:`setup`,
+        which runs after the datamodule has built its tokenizer.
         """
-        from kraken.models import load_models
-        models = load_models(path, tasks=['recognition'])
-        if len(models) != 1:
-            raise ValueError(f'Found {len(models)} segmentation models in model file.')
-        return cls(config=config, model=models[0])
+        config.pretrained_weights_path = str(path)
+        return cls(config=config)
 
     def configure_callbacks(self):
         callbacks = []
@@ -692,16 +812,18 @@ class PartyRecognitionModel(L.LightningModule):
     # batch-wise learning rate warmup. In lr_scheduler_step() calls to the
     # scheduler are performed at every step.
     def configure_optimizers(self):
-        param_groups = get_parameter_groups(self.net)
+        config = self.hparams.config
+        param_groups = get_parameter_groups(self.net, base_lr=config.lrate)
 
         # Log parameter groups
         for pg in param_groups:
             n_params = sum(p.numel() for p in pg['params'])
             logger.info(f"Param group '{pg['name']}': {n_params:,} params")
 
-        # Store initial LRs for warmup
-        config = self.hparams.config
-        self._initial_lrs = [config.lrate for _ in param_groups]
+        # Store per-group initial LRs for warmup. Groups that pre-set their
+        # own LR (e.g. the prototype temperature group) keep that target;
+        # everything else warms up to the base lrate.
+        self._initial_lrs = [pg.get('lr', config.lrate) for pg in param_groups]
         optimizer = MuonWithAuxAdam(param_groups,
                                     lr=config.lrate,
                                     weight_decay=config.weight_decay,

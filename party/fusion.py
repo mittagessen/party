@@ -21,12 +21,11 @@ import logging
 from torch import nn
 from typing import Optional
 
-from party.tokenizer import TOKEN_NUM
 from party.modules import (MultiHeadAttention, RMSNorm, TanhGate,
                            TransformerCrossAttentionLayer, TransformerDecoder,
                            TransformerSelfAttentionLayer,
                            FusionLayer, scale_hidden_dim_for_mlp,
-                           Llama3ScaledRoPE, llama3_mlp)
+                           Llama3ScaledRoPE, llama3_mlp, PrototypeHead)
 
 
 logger = logging.getLogger(__name__)
@@ -34,7 +33,7 @@ logger = logging.getLogger(__name__)
 __all__ = ['bytellama_vision_decoder']
 
 
-def bytellama_vision_decoder(vocab_size: int = TOKEN_NUM,
+def bytellama_vision_decoder(vocab_size: int,
                              num_layers: int = 30,
                              num_heads: int = 9,
                              num_kv_heads: int = 3,
@@ -46,6 +45,8 @@ def bytellama_vision_decoder(vocab_size: int = TOKEN_NUM,
                              rope_base: int = 10000,
                              encoder_max_seq_len: int = 56700,
                              fusion_interval: int = 3,
+                             temperature_init: float = 10.0,
+                             margin: float = 0.0,
                              pretrained: Optional[str] = None,
                              **kwargs) -> TransformerDecoder:
     """
@@ -89,13 +90,19 @@ def bytellama_vision_decoder(vocab_size: int = TOKEN_NUM,
               'norm_eps': norm_eps,
               'rope_base': rope_base,
               'encoder_max_seq_len': encoder_max_seq_len,
-              'fusion_interval': fusion_interval}
+              'fusion_interval': fusion_interval,
+              'temperature_init': temperature_init,
+              'margin': margin}
 
     if pretrained:
         from huggingface_hub import hf_hub_download
         with open(hf_hub_download(repo_id=pretrained, filename='config.json'), 'r') as fp:
             config.update(json.load(fp))
-            config['vocab_size'] = TOKEN_NUM
+            # Output/input token spaces are task-specific and initialized from
+            # scratch from the dataset's CodePointTokenizer.
+            config['vocab_size'] = vocab_size
+            config['temperature_init'] = temperature_init
+            config['margin'] = margin
 
     head_dim = config['embed_dim'] // config['num_heads']
     num_kv_heads = config['num_kv_heads'] if config['num_kv_heads'] else config['num_heads']
@@ -163,7 +170,11 @@ def bytellama_vision_decoder(vocab_size: int = TOKEN_NUM,
             layers.append(decoder_layer)
 
     tok_embeddings = nn.Embedding(config['vocab_size'], config['embed_dim'])
-    output_proj = nn.Linear(config['embed_dim'], config['vocab_size'], bias=False)
+    output_proj = PrototypeHead(config['embed_dim'],
+                                config['vocab_size'],
+                                temperature_init=config['temperature_init'],
+                                margin=config['margin'])
+    output_proj.tie_embeddings(tok_embeddings)
 
     decoder = TransformerDecoder(tok_embeddings=tok_embeddings,
                                  layers=layers,
@@ -178,6 +189,11 @@ def bytellama_vision_decoder(vocab_size: int = TOKEN_NUM,
         from safetensors import safe_open
         with safe_open(weight_path, framework='pt') as f:
             state_dict = {k: f.get_tensor(k) for k in f.keys()}
+        # Pretrained ByteLlama uses a different vocabulary; the token embedding
+        # and output projection are reinitialized from scratch to match the
+        # task tokenizer and prototype head.
+        state_dict.pop('tok_embeddings.weight', None)
+        state_dict.pop('output.weight', None)
         decoder.load_state_dict(state_dict, strict=False)
 
     return decoder

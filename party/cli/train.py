@@ -42,6 +42,7 @@ logging.getLogger("lightning.fabric.utilities.seed").setLevel(logging.ERROR)
               callback=_validate_manifests, type=click.File(mode='r', lazy=True),
               help='File(s) with additional paths to training data.')
 @click.option('-u', '--normalization', type=click.Choice(['NFD', 'NFKD', 'NFC', 'NFKC']),
+              default='NFC', show_default=True,
               help='Ground truth normalization')
 @click.option('-n', '--normalize-whitespace/--no-normalize-whitespace',
               help='Normalizes unicode whitespace')
@@ -141,6 +142,12 @@ def compile(ctx, **params):
 @click.option('--label-smoothing',
               type=float,
               help='Label smoothing factor for cross-entropy loss during training.')
+@click.option('--proto-margin',
+              type=float,
+              help='ArcFace angular margin applied to prototype logits during training.')
+@click.option('--proto-temperature-init',
+              type=float,
+              help='Initial prototype-logit temperature (learnable scalar).')
 @click.option('--gradient-clip-val',
               type=float,
               help='Gradient clip value')

@@ -126,6 +126,13 @@ class PartyRecognitionTrainingConfig(TrainingConfig):
         self.freeze_encoder = kwargs.pop('freeze_encoder', False)
         self.train_from_scratch = kwargs.pop('train_from_scratch', False)
         self.label_smoothing = kwargs.pop('label_smoothing', 0.0)
+        self.proto_margin = kwargs.pop('proto_margin', 0.0)
+        self.proto_temperature_init = kwargs.pop('proto_temperature_init', 10.0)
+        # When set, load weights from a "conventional" party safetensors file
+        # into the prototype model after construction, reinitializing the
+        # prototype-specific layers (tok_embeddings, output head). Set by
+        # cli/train.py when --load points at a non-prototype safetensors file.
+        self.pretrained_weights_path = kwargs.pop('pretrained_weights_path', None)
         # Only consulted by the Lightning test loop: prepend language tokens
         # from the segmentation's language field when generating predictions.
         self.add_lang_token = kwargs.pop('add_lang_token', False)
@@ -153,7 +160,7 @@ class PartyRecognitionTrainingDataConfig(RecognitionTrainingDataConfig):
         self.val_batch_size = kwargs.pop('val_batch_size', None)
         self.image_size = kwargs.pop('image_size', (2560, 1920))
         self.prompt_mode = kwargs.pop('prompt_mode', 'both')
-        self.normalization = kwargs.pop('normalization', None)
+        self.normalization = kwargs.pop('normalization', 'NFC')
         self.normalize_whitespace = kwargs.pop('normalize_whitespace', True)
 
         kwargs.setdefault('batch_size', 16)
