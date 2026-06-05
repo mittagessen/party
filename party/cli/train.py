@@ -142,6 +142,12 @@ def compile(ctx, **params):
 @click.option('--label-smoothing',
               type=float,
               help='Label smoothing factor for cross-entropy loss during training.')
+@click.option('--noisy-teacher-forcing',
+              type=float,
+              help='Probability of replacing each decoder-input code-point token with a random one.')
+@click.option('--noisy-teacher-forcing-warmup',
+              type=int,
+              help='Number of steps to ramp up the noisy-teacher-forcing probability.')
 @click.option('--proto-margin',
               type=float,
               help='ArcFace angular margin applied to prototype logits during training.')

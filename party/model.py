@@ -33,7 +33,7 @@ from torch.utils.data import RandomSampler, DataLoader
 
 from party.party import PartyModel
 from party.modules import PrototypeHead
-from party.tokenizer import CodePointTokenizer
+from party.tokenizer import CodePointTokenizer, CODEPOINT_OFFSET
 from party.dataset import (collate_null, get_default_transforms,
                            BinnedBaselineDataset, TestBaselineDataset,
                            ValidationBaselineDataset,
@@ -103,11 +103,40 @@ def apply_arcface_margin(logits: torch.Tensor,
     return logits.scatter_add(1, safe_targets_col, delta)
 
 
+def apply_noisy_teacher_forcing(tokens: torch.Tensor,
+                                p: torch.Tensor,
+                                min_label: int,
+                                max_label: int,
+                                ignore_index: int = -100) -> torch.Tensor:
+    """
+    Randomly replaces decoder-input code-point tokens with random code points.
+
+    ``p`` is a 0-d tensor (not a float) to keep it out of the compiled graph as
+    a constant, as with the ArcFace margin.
+    """
+    noise = torch.randint_like(tokens, low=min_label, high=max_label)
+    prob = torch.rand_like(tokens, dtype=torch.float)
+    p = p.to(dtype=prob.dtype, device=prob.device)
+    valid = (tokens >= min_label) & (tokens < max_label) & (tokens != ignore_index)
+    replace = valid & (prob < p)
+    return torch.where(replace, noise, tokens)
+
+
 @torch.compile(dynamic=False)
 def model_step(model, tokens, image, curves, boxes, ignore_index,
                label_smoothing: float = 0.0,
-               proto_margin: Optional[torch.Tensor] = None):
+               proto_margin: Optional[torch.Tensor] = None,
+               ntf_p: Optional[torch.Tensor] = None,
+               ntf_min_label: int = CODEPOINT_OFFSET,
+               ntf_max_label: int = CODEPOINT_OFFSET):
+    # targets come from the clean tokens, before noising
     targets = _shift_targets(tokens, ignore_index)
+
+    if ntf_p is not None and model.training:
+        tokens = apply_noisy_teacher_forcing(tokens, ntf_p,
+                                             min_label=ntf_min_label,
+                                             max_label=ntf_max_label,
+                                             ignore_index=ignore_index)
 
     # our tokens already contain BOS/EOS tokens so we just run them
     # through the model after replacing ignored indices.
@@ -499,6 +528,19 @@ class PartyRecognitionModel(L.LightningModule):
             margin = margin * scale
         return torch.tensor(margin, device=self.device, dtype=torch.float32)
 
+    def _current_ntf_p(self) -> Optional[torch.Tensor]:
+        """
+        Returns the current noisy-teacher-forcing probability as a 0-d tensor,
+        or ``None`` when NTF is disabled.
+        """
+        p = float(getattr(self.hparams.config, 'noisy_teacher_forcing', 0.0) or 0.0)
+        if p <= 0.0:
+            return None
+        warmup_steps = int(getattr(self.hparams.config, 'noisy_teacher_forcing_warmup', 0) or 0)
+        if warmup_steps > 0:
+            p = p * min(1.0, float(self.trainer.global_step + 1) / warmup_steps)
+        return torch.tensor(p, device=self.device, dtype=torch.float32)
+
     def training_step(self, batch, batch_idx):
         loss, _, valid_count = self.model_step(self.net,
                                                batch['tokens'],
@@ -507,7 +549,10 @@ class PartyRecognitionModel(L.LightningModule):
                                                batch['boxes'],
                                                self.criterion.ignore_index,
                                                self.hparams.config.label_smoothing,
-                                               self._current_proto_margin())
+                                               self._current_proto_margin(),
+                                               self._current_ntf_p(),
+                                               CODEPOINT_OFFSET,
+                                               self.net.tokenizer.vocab_size)
         finite_loss = torch.isfinite(loss.detach())
         if is_initialized():
             finite_flag = finite_loss.to(dtype=torch.int32)

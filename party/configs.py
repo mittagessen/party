@@ -126,6 +126,11 @@ class PartyRecognitionTrainingConfig(TrainingConfig):
         self.freeze_encoder = kwargs.pop('freeze_encoder', False)
         self.train_from_scratch = kwargs.pop('train_from_scratch', False)
         self.label_smoothing = kwargs.pop('label_smoothing', 0.0)
+        # Noisy teacher forcing: probability of replacing each decoder-input
+        # code-point token with a random one, optionally ramped over the first
+        # `noisy_teacher_forcing_warmup` steps.
+        self.noisy_teacher_forcing = kwargs.pop('noisy_teacher_forcing', 0.0)
+        self.noisy_teacher_forcing_warmup = kwargs.pop('noisy_teacher_forcing_warmup', 0)
         self.proto_margin = kwargs.pop('proto_margin', 0.0)
         self.proto_temperature_init = kwargs.pop('proto_temperature_init', 10.0)
         # When set, load weights from a "conventional" party safetensors file
