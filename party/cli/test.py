@@ -64,7 +64,7 @@ def test(ctx, batch_size, load_from_repo, load_from_file, evaluation_files,
     if load_from_file and load_from_repo:
         raise click.BadOptionUsage('load_from_file', 'load_from_* options are mutually exclusive.')
     elif load_from_file is None and load_from_repo is None:
-        load_from_repo = '10.5281/zenodo.14616981'
+        load_from_repo = '10.5281/zenodo.14616980'
 
     import torch
 

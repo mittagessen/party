@@ -8,7 +8,7 @@ Party consists of a Swin vision transformer encoder, baseline positional embeddi
 
 The last iteration of party introduced language tokens to permit steering the model's output toward a specific language on a per-line level during inference. Their use is optional but recommended on difficult material to prevent random switching between languages. When no language tag is given the model will generate one or more tokens indicating which languages it thinks are contained in an individual line.
 
-The new base model with language token support is currently embargoed but a model fine-tuned for a number of European languages is available [here](https://zenodo.org/records/15764161).
+The base model with language token support is available [here](https://doi.org/10.5281/zenodo.14616980).
 
 While the model performs quite well on languages and scripts that are commonly found in the training data, **it is generally expected that it requires fine-tuning for practical use, in particular to ensure alignment with desired transcription guidelines.**
 
@@ -26,15 +26,15 @@ The current compilation code determines the language on a page level by traversi
 
 To fine-tune the pretrained base model dataset files in listed in manifest files on all available GPUs:
 
-        $ party train --load-from-repo 10.5281/zenodo.15764161 --workers 32 -t train.lst -e val.lst
+        $ party train --load-from-repo 10.5281/zenodo.14616980 --workers 32 -t train.lst -e val.lst
 
 With the default parameters both baseline and bounding box prompts are randomly sampled from the training data. It is suggested that you fine-tune the model with uni-modal line embeddings by only selecting the line format that your segmentation method produces, i.e.:
 
-        $ party train --load-from-repo 10.5281/zenodo.15764161 -t train.lst -e val.lst --prompt-mode curves
+        $ party train --load-from-repo 10.5281/zenodo.14616980 -t train.lst -e val.lst --prompt-mode curves
 
 or:
 
-        $ party train --load-from-repo 10.5281/zenodo.15764161 -t train.lst -e val.lst --prompt-mode boxes
+        $ party train --load-from-repo 10.5281/zenodo.14616980 -t train.lst -e val.lst --prompt-mode boxes
 
 To continue training from an existing checkpoint:
 
@@ -52,7 +52,7 @@ Inference and teseting requires a working [kraken](https://kraken.re) installati
 
 To recognize text in pre-segmented page images in PageXML or ALTO with the pretrained model run:
 
-        $ party -d cuda:0 ocr -i in.xml out.xml --load-from-repo 10.5281/zenodo.15764161 
+        $ party -d cuda:0 ocr -i in.xml out.xml --load-from-repo 10.5281/zenodo.14616980 
 
 The paths to the image file(s) is automatically extracted from the XML input file(s).
 
@@ -95,7 +95,7 @@ When no language tag is given the model will predict by itself which languages a
 
 with the `-l` option of the `ocr` subcomand:
 
-    $ party -d cuda:0 ocr -i in.xml out.xml --load-from-repo 10.5281/zenodo.15764161 -l grc
+    $ party -d cuda:0 ocr -i in.xml out.xml --load-from-repo 10.5281/zenodo.14616980 -l grc
 
 A single language can be defined per call.
 
@@ -114,8 +114,8 @@ Testing for now only works from binary dataset files. As with for inference curv
 
         $  party -d cuda:0 test --curves --load-from-file arabic.safetensors  */*.arrow
         $  party -d cuda:0 test --boxes --load-from-file arabic.safetensors  */*.arrow
-        $  party -d cuda:0 test --curves --load-from-repo 10.5281/zenodo.15764161 */*.arrow
-        $  party -d cuda:0 test --boxes --load-from-repo 10.5281/zenodo.15764161 */*.arrow
+        $  party -d cuda:0 test --curves --load-from-repo 10.5281/zenodo.14616980 */*.arrow
+        $  party -d cuda:0 test --boxes --load-from-repo 10.5281/zenodo.14616980 */*.arrow
 
 ## Performance
 
