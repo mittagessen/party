@@ -1,5 +1,79 @@
-[project]
-
 [build-system]
-requires = ["pbr>=5.7.0", "setuptools>=36.6.0", "wheel"]
-build-backend = "pbr.build"
+requires = ["hatchling", "versioningit"]
+build-backend = "hatchling.build"
+
+[project]
+name = "party"
+dynamic = ["version"]
+description = "Page-wise Recognition of Text-y: line transcription without bounding polygons"
+readme = {file = "README.md", content-type = "text/markdown"}
+license = "Apache-2.0"
+requires-python = ">=3.10,<3.14"
+authors = [
+    {name = "Benjamin Kiessling", email = "mittagessen@l.unchti.me"},
+]
+keywords = ["htr", "ocr"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.5.0",
+    "timm",
+    "pillow-jxl-plugin",
+    "python-bidi",
+    "click",
+    "rich",
+    "threadpoolctl",
+    "lightning",
+    "lxml",
+    "pyarrow",
+    "htrmopo>=0.3,~=0.3",
+    "kraken~=7.0.0b5",
+]
+
+[project.urls]
+Homepage = "http://kraken.re"
+
+[project.scripts]
+party = "party.cli:cli"
+
+[project.entry-points."kraken.models"]
+PartyModel = "party.party:PartyModel"
+
+[project.entry-points."kraken.lightning_modules"]
+PartyRecognitionModel = "party.model:PartyRecognitionModel"
+
+[project.entry-points."kraken.configs"]
+PartyRecognitionTrainingDataConfig = "party.configs:PartyRecognitionTrainingDataConfig"
+PartyRecognitionTrainingConfig = "party.configs:PartyRecognitionTrainingConfig"
+PartyRecognitionInferenceConfig = "party.configs:PartyRecognitionInferenceConfig"
+
+[tool.hatch.version]
+source = "versioningit"
+
+[tool.versioningit]
+default-version = "0.0.0+unknown"
+
+[tool.versioningit.vcs]
+method = "git"
+default-tag = "0.0.0"
+
+[tool.hatch.build]
+exclude = [
+    "**/__pycache__",
+    "**/*.pyc",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["party"]
+
+[tool.hatch.build.targets.sdist]
+include = ["party/"]

@@ -99,8 +99,8 @@ class KVCache(nn.Module):
         k_out = self.k_cache
         v_out = self.v_cache
 
-        k_out[:, :, self.cache_pos[:seq_len]] = k_val
-        v_out[:, :, self.cache_pos[:seq_len]] = v_val
+        k_out[:, :, self.cache_pos[:seq_len]] = k_val.to(k_out.dtype)
+        v_out[:, :, self.cache_pos[:seq_len]] = v_val.to(v_out.dtype)
 
         # forward cache_pos seq_len positions along
         # cache_pos starts at (0, 1, 2, 3, 4, 5, ...)

@@ -17,42 +17,40 @@ Utility functions for data loading and training of VGSL networks.
 """
 import io
 import gc
+import json
 import torch
 import ctypes
 import torch.nn.functional as F
 import numpy as np
-import lightning.pytorch as L
 
 import tempfile
 import pyarrow as pa
 
+from collections import Counter
+
 from pathlib import Path
 from itertools import islice
 
-from torch.distributed import get_rank, get_world_size, is_initialized
-
-from typing import (TYPE_CHECKING, Any, Callable, Literal, Optional, Union,
-                    Sequence)
-
-from itertools import chain
-from functools import partial
-from torchvision.transforms import v2
-from torch.utils.data import (Dataset, DataLoader, IterableDataset,
-                              get_worker_info, RandomSampler,
-                              WeightedRandomSampler)
+from typing import (TYPE_CHECKING, Any, Callable, Literal, Optional, Tuple,
+                    Union, Sequence)
 
 from PIL import Image
+from functools import partial
+from torchvision.transforms import v2
+from torch.utils.data import Dataset, IterableDataset, get_worker_info
+from torch.distributed import get_rank, get_world_size, is_initialized
+
 
 from scipy.special import comb
 
-from party.tokenizer import OctetTokenizer, LANG_TO_ISO
+from party.tokenizer import OctetTokenizer
 
 
 if TYPE_CHECKING:
     from os import PathLike
     from kraken.containers import Segmentation
 
-__all__ = ['TextLineDataModule']
+__all__ = ['BinnedBaselineDataset', 'ValidationBaselineDataset', 'get_default_transforms', 'collate_null']
 
 import logging
 
@@ -64,6 +62,12 @@ except ImportError:
     logger.info('No JPEG-XL plugin found')
 
 Image.MAX_IMAGE_PIXELS = 20000 ** 2
+
+# Encodings tried when we have to re-encode a resized page; we keep whichever
+# variant produces the smaller payload.
+RESIZED_PAGE_ENCODINGS = (('JPEG', {'quality': 95}),
+                          ('PNG', {}))
+MAX_PAGE_LOAD_ATTEMPTS = 10
 
 
 def batched(iterable, n, *, strict=False):
@@ -77,16 +81,42 @@ def batched(iterable, n, *, strict=False):
         yield batch
 
 
-def get_default_transforms(dtype=torch.float32):
-    return v2.Compose([v2.Resize((2560, 1920)),
+def get_default_transforms(image_size: tuple[int, int] = (2560, 1920),
+                           dtype=torch.float32):
+    return v2.Compose([v2.Resize(image_size),
                        v2.ToImage(),
                        v2.ToDtype(dtype, scale=True),
                        v2.Normalize(mean=[0.4850, 0.4560, 0.4060], std=[0.2290, 0.2240, 0.2250])])
 
 
-def _to_curve(baseline, im_size, min_points: int = 8):
+def _encode_page_image(path: Union[str, 'PathLike'],
+                       resize: Optional[Tuple[int, int]] = None) -> bytes:
+    if resize is None:
+        with open(path, 'rb') as fp:
+            return fp.read()
+
+    with Image.open(path) as image:
+        image = image.convert('RGB').resize((resize[1], resize[0]), Image.LANCZOS)
+        encoded_variants = []
+        for fmt, save_kwargs in RESIZED_PAGE_ENCODINGS:
+            image_buffer = io.BytesIO()
+            image.save(image_buffer, format=fmt, **save_kwargs)
+            encoded_variants.append(image_buffer.getvalue())
+
+    return min(encoded_variants, key=len)
+
+
+def _to_curve(baseline, im_size, min_points: int = 8, clamp_tolerance: float = 0.02):
     """
     Converts poly(base)lines to Bezier curves.
+
+    Args:
+        baseline:
+        im_size: (width, height)
+        min_points:
+        clamp_tolerance: normalized distance beyond [0, 1] that is still
+                         clamped. Values exceeding this cause the line to
+                         be skipped (returns None).
     """
     from shapely.geometry import LineString
 
@@ -96,13 +126,28 @@ def _to_curve(baseline, im_size, min_points: int = 8):
         baseline = np.stack([np.array(ls.interpolate(x, normalized=True).coords)[0] for x in np.linspace(0, 1, 8)])
     # control points
     curve = np.concatenate(([baseline[0]], bezier_fit(baseline), [baseline[-1]]))/im_size
+    # reject lines with non-finite or substantially out-of-bounds values
+    if not np.all(np.isfinite(curve)):
+        logger.info('Skipping line with non-finite curve points')
+        return None
+    if np.any(curve < -clamp_tolerance) or np.any(curve > 1 + clamp_tolerance):
+        logger.info('Skipping line with curve points substantially outside image bounds')
+        return None
+    curve = np.clip(curve, 0.0, 1.0)
     curve = curve.flatten()
     return pa.scalar(curve, type=pa.list_(pa.float32()))
 
 
-def _to_bbox(boundary, im_size):
+def _to_bbox(boundary, im_size, clamp_tolerance: float = 0.02):
     """
     Converts a bounding polygon to a bbox in xyxyc_xc_yhw format.
+
+    Args:
+        boundary:
+        im_size: (width, height)
+        clamp_tolerance: normalized distance beyond [0, 1] that is still
+                         clamped. Values exceeding this cause the line to
+                         be skipped (returns None).
     """
     flat_box = [point for pol in boundary for point in pol]
     xmin, xmax = min(flat_box[::2]), max(flat_box[::2])
@@ -112,6 +157,13 @@ def _to_bbox(boundary, im_size):
     cx = (xmin + xmax) / 2
     cy = (ymin + ymax) / 2
     bbox = np.array([[xmin, ymin], [xmax, ymax], [cx, cy], [w, h]]) / im_size
+    if not np.all(np.isfinite(bbox)):
+        logger.info('Skipping line with non-finite bbox values')
+        return None
+    if np.any(bbox < -clamp_tolerance) or np.any(bbox > 1 + clamp_tolerance):
+        logger.info('Skipping line with bbox substantially outside image bounds')
+        return None
+    bbox = np.clip(bbox, 0.0, 1.0)
     bbox = bbox.flatten()
     return pa.scalar(bbox, type=pa.list_(pa.float32()))
 
@@ -121,7 +173,9 @@ def compile(files: Optional[list[Union[str, 'PathLike']]] = None,
             normalize_whitespace: bool = True,
             normalization: Optional[Literal['NFD', 'NFC', 'NFKD', 'NFKC']] = None,
             max_line_tokens: int = 384,
-            callback: Callable[[int, int], None] = lambda chunk, lines: None) -> None:
+            resize: Optional[Tuple[int, int]] = None,
+            allow_textless: bool = False,
+            callback: Callable[[int, int], None] = lambda chunk, lines: None) -> Counter:
     """
     Compiles a collection of XML facsimile files into a binary arrow dataset.
 
@@ -131,6 +185,8 @@ def compile(files: Optional[list[Union[str, 'PathLike']]] = None,
         normalize_whitespace: whether to normalize all whitespace to ' '
         normalization: Unicode normalization to apply to data.
         max_line_tokens: maximum number of tokens per line
+        resize: optional (height, width) tuple to resize images to
+        allow_textless: if True, include lines without text
         callback: progress callback
     """
     from kraken.lib import functional_im_transforms as F_t
@@ -140,10 +196,10 @@ def compile(files: Optional[list[Union[str, 'PathLike']]] = None,
 
     # pyarrow structs
     line_struct = pa.struct([('text', pa.string()),
+                             ('lang', pa.list_(pa.string())),
                              ('curve', pa.list_(pa.float32())),
                              ('bbox', pa.list_(pa.float32()))])
     page_struct = pa.struct([('im', pa.binary()),
-                             ('lang', pa.string()),
                              ('lines', pa.list_(line_struct))])
 
     tokenizer = OctetTokenizer()
@@ -154,6 +210,7 @@ def compile(files: Optional[list[Union[str, 'PathLike']]] = None,
         text_transforms.append(F_t.text_whitespace_normalize)
 
     num_lines = 0
+    lang_counts = Counter()
     # helper variables to enable padding to longest sequence without iterating
     # over set during training.
     max_lines_in_page = 0
@@ -167,44 +224,43 @@ def compile(files: Optional[list[Union[str, 'PathLike']]] = None,
             with pa.ipc.new_file(sink, schema) as writer:
                 for file in files:
                     try:
-                        page = XMLPage(file).to_container()
-                        # pick image format with smallest size
-                        image_candidates = list(set(page.imagename.with_suffix(x) for x in ['.jxl', '.png']).union([page.imagename]))
-                        cand_idxs = np.argsort([t.stat().st_size if t.exists() else np.inf for t in image_candidates])
-                        im_path = None
-                        for idx in cand_idxs:
-                            try:
-                                with Image.open(image_candidates[idx]) as im:
-                                    im_size = im.size
-                                im_path = image_candidates[idx]
-                                break
-                            except Exception:
-                                continue
-                        # parse language by traversing path component
-                        for part in Path(file).parts[::-1]:
-                            if (lang := LANG_TO_ISO.get(part, 'und')) != 'und':
-                                break
+                        page = XMLPage(file)
+                        seg = page.to_container()
+                        # Store only codecs that the training dataset can decode
+                        # natively, while keeping already-supported originals as-is.
+                        im_bytes = _encode_page_image(seg.imagename, resize=resize)
                     except Exception:
                         continue
-                    if im_path is None:
-                        continue
                     page_data = []
+                    page_lang_counts = Counter()
                     prev_max_octets_in_line = max_octets_in_line
-                    for line in page.lines:
+                    for line in seg.lines:
                         try:
                             text = line.text
                             for func in text_transforms:
                                 text = func(text)
-                            if not text:
+                            if not text and not allow_textless:
                                 logger.info(f'Text line "{line.text}" is empty after transformations')
                                 continue
+                            if not text:
+                                text = ''
                             if not line.baseline:
                                 logger.info('No baseline given for line')
                                 continue
-                            max_octets_in_line = max(len(tokenizer.encode(text, add_bos=False, add_eos=False)), max_octets_in_line)
+                            line_langs = line.language if line.language else ['und']
+                            for lang in line_langs:
+                                page_lang_counts[lang] += 1
+                            curve = _to_curve(line.baseline, page.image_size)
+                            if curve is None:
+                                continue
+                            bbox = _to_bbox(line.boundary, page.image_size)
+                            if bbox is None:
+                                continue
+                            max_octets_in_line = max(len(tokenizer.encode(text, langs=line_langs, add_bos=True, add_eos=True)), max_octets_in_line)
                             page_data.append(pa.scalar({'text': pa.scalar(text),
-                                                        'curve': _to_curve(line.baseline, im_size),
-                                                        'bbox': _to_bbox(line.boundary, im_size)},
+                                                        'lang': line_langs,
+                                                        'curve': curve,
+                                                        'bbox': bbox},
                                                        line_struct))
                             num_lines += 1
                         except Exception:
@@ -214,10 +270,8 @@ def compile(files: Optional[list[Union[str, 'PathLike']]] = None,
                         max_octets_in_line = prev_max_octets_in_line
                         continue
                     if len(page_data) > 1:
-                        with open(im_path, 'rb') as fp:
-                            im = fp.read()
-                        ar = pa.array([pa.scalar({'im': im,
-                                                  'lang': lang,
+                        lang_counts.update(page_lang_counts)
+                        ar = pa.array([pa.scalar({'im': im_bytes,
                                                   'lines': page_data}, page_struct)], page_struct)
                         writer.write(pa.RecordBatch.from_arrays([ar], schema=schema))
                         max_lines_in_page = max(len(page_data), max_lines_in_page)
@@ -225,7 +279,8 @@ def compile(files: Optional[list[Union[str, 'PathLike']]] = None,
         with pa.memory_map(tmpfile.name, 'rb') as source:
             metadata = {'num_lines': num_lines.to_bytes(4, 'little'),
                         'max_lines_in_page': max_lines_in_page.to_bytes(4, 'little'),
-                        'max_octets_in_line': max_octets_in_line.to_bytes(4, 'little')}
+                        'max_octets_in_line': max_octets_in_line.to_bytes(4, 'little'),
+                        'lang_counts': json.dumps(dict(lang_counts)).encode('utf-8')}
             schema = schema.with_metadata(metadata)
             ds_table = pa.ipc.open_file(source).read_all()
             new_table = ds_table.replace_schema_metadata(metadata)
@@ -233,6 +288,7 @@ def compile(files: Optional[list[Union[str, 'PathLike']]] = None,
                 with pa.ipc.new_file(sink, schema=schema) as writer:
                     for batch in new_table.to_batches():
                         writer.write(batch)
+    return lang_counts
 
 
 def _validation_worker_init_fn(worker_id):
@@ -246,6 +302,41 @@ def _validation_worker_init_fn(worker_id):
 
 def collate_null(batch):
     return batch[0]
+
+
+def _valid_geometry(geometry: Optional[torch.Tensor], eps: float = 1e-6) -> bool:
+    if geometry is None:
+        return True
+    if geometry.shape != (4, 2):
+        return False
+    return bool(torch.isfinite(geometry).all() and
+                torch.all(geometry >= -eps) and
+                torch.all(geometry <= 1.0 + eps))
+
+
+def _valid_bbox(bbox: Optional[torch.Tensor], eps: float = 1e-6) -> bool:
+    if bbox is None:
+        return True
+    if not _valid_geometry(bbox, eps=eps):
+        return False
+    xy_min = bbox[0]
+    xy_max = bbox[1]
+    size = bbox[3]
+    return bool(torch.all(xy_min <= xy_max + eps) and torch.all(size > eps))
+
+
+def _filter_valid_lines(lines: list[tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]]
+                        ) -> list[tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]]:
+    valid_lines = []
+    for tokens, curve, bbox in lines:
+        if curve is None and bbox is None:
+            continue
+        if not _valid_geometry(curve):
+            continue
+        if not _valid_bbox(bbox):
+            continue
+        valid_lines.append((tokens, curve, bbox))
+    return valid_lines
 
 
 def collate_sequences(im, page_data, max_seq_len: int, index: int):
@@ -273,81 +364,6 @@ def collate_sequences(im, page_data, max_seq_len: int, index: int):
             'index': index}
 
 
-class TextLineDataModule(L.LightningDataModule):
-    def __init__(self,
-                 training_data: list[Union[str, 'PathLike']],
-                 evaluation_data: list[Union[str, 'PathLike']],
-                 prompt_mode: Literal['boxes', 'curves', 'both'] = 'both',
-                 augmentation: bool = False,
-                 batch_size: int = 16,
-                 val_batch_size: Optional[int] = None,
-                 num_workers: int = 8,
-                 sampling_weights: Optional[list[float]] = None,
-                 **kwargs):
-        super().__init__()
-
-        if sampling_weights is not None and len(sampling_weights) != len(sampling_weights):
-            raise ValueError('Per-file sampling weights need to be same length as training_data.')
-
-        self.save_hyperparameters()
-        self.hparams.val_batch_size = batch_size if not val_batch_size else val_batch_size
-
-        self.im_transforms = get_default_transforms()
-
-        # tokenizer is stateless so we can just initiate it here
-        tokenizer = OctetTokenizer()
-
-        self.pad_id = tokenizer.pad_id
-        self.bos_id = tokenizer.bos_id
-        self.eos_id = tokenizer.eos_id
-
-        self.num_classes = tokenizer.max_label + 1
-
-    def setup(self, stage: str):
-        """
-        Actually builds the datasets.
-        """
-        self.train_set = BinnedBaselineDataset(self.hparams.training_data,
-                                               im_transforms=self.im_transforms,
-                                               augmentation=self.hparams.augmentation,
-                                               batch_size=self.hparams.batch_size)
-        self.val_set = ValidationBaselineDataset(self.hparams.evaluation_data,
-                                                 im_transforms=self.im_transforms,
-                                                 augmentation=self.hparams.augmentation,
-                                                 batch_size=self.hparams.val_batch_size)
-        self.train_set.max_seq_len = max(self.train_set.max_seq_len, self.val_set.max_seq_len)
-        self.val_set.max_seq_len = self.train_set.max_seq_len
-
-    def train_dataloader(self):
-        world_size = get_world_size() if is_initialized() else 1
-        if self.hparams.sampling_weights:
-            weights = list(chain(*[(weight,) * ppf for weight, ppf in zip(self.train_set.pages_per_file, self.hparams.sampling_weights)]))
-            sampler = WeightedRandomSampler(weights,
-                                            replacement=True,
-                                            num_samples=self.train_set.num_batches // world_size)
-        else:
-            sampler = RandomSampler(self.train_set,
-                                    replacement=True,
-                                    num_samples=self.train_set.num_batches // world_size)
-
-        return DataLoader(self.train_set,
-                          num_workers=self.hparams.num_workers,
-                          batch_size=1,
-                          sampler=sampler,
-                          pin_memory=True,
-                          shuffle=False,
-                          collate_fn=collate_null)
-
-    def val_dataloader(self):
-        return DataLoader(self.val_set,
-                          shuffle=False,
-                          batch_size=1,
-                          num_workers=self.hparams.num_workers,
-                          pin_memory=True,
-                          collate_fn=collate_null,
-                          worker_init_fn=_validation_worker_init_fn)
-
-
 class BinnedBaselineDataset(Dataset):
     """
     Dataset for training a line recognition model from baseline data.
@@ -363,8 +379,6 @@ class BinnedBaselineDataset(Dataset):
     assumption that each page contains the same number of lines).
 
     Args:
-        im_transforms: Function taking an PIL.Image and returning a tensor
-                       suitable for forward passes.
         prompt_mode: Select line prompt sampling mode: `boxes` for bbox-only,
                      `curves` for curves-only, and `both` for randomly
                      switching between the two.
@@ -375,14 +389,14 @@ class BinnedBaselineDataset(Dataset):
     def __init__(self,
                  files: Sequence[Union[str, 'PathLike']],
                  im_transforms: Callable[[Any], torch.Tensor] = None,
+                 augmentation: Callable[[Any], torch.Tensor] = None,
                  prompt_mode: Literal['boxes', 'curves', 'both'] = 'both',
-                 augmentation: bool = False,
                  batch_size: int = 32) -> None:
         super().__init__()
         self.files = files
-        self.transforms = im_transforms
         self.prompt_mode = prompt_mode
-        self.aug = None
+        self.transforms = im_transforms
+        self.aug = augmentation
         self.batch_size = batch_size
         self.max_seq_len = 0
         self._len = 0
@@ -391,6 +405,7 @@ class BinnedBaselineDataset(Dataset):
 
         self.arrow_table = None
         self.pages_per_file = []
+        self.lang_counts = Counter()
 
         for file in files:
             with pa.memory_map(file, 'rb') as source:
@@ -398,6 +413,8 @@ class BinnedBaselineDataset(Dataset):
                 raw_metadata = ds_table.schema.metadata
                 if not raw_metadata or b'num_lines' not in raw_metadata:
                     raise ValueError(f'{file} does not contain a valid metadata record.')
+                if b'lang_counts' in raw_metadata:
+                    self.lang_counts.update(json.loads(raw_metadata[b'lang_counts']))
                 if not self.arrow_table:
                     self.arrow_table = ds_table
                 else:
@@ -406,41 +423,63 @@ class BinnedBaselineDataset(Dataset):
                 self._len += int.from_bytes(raw_metadata[b'num_lines'], 'little')
                 self.max_seq_len = max(int.from_bytes(raw_metadata[b'max_octets_in_line'], 'little'), self.max_seq_len)
 
-        if augmentation:
-            from party.augmentation import DefaultAugmenter
-            self.aug = DefaultAugmenter()
-
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        item = self.arrow_table.column('pages')[index].as_py()
-        logger.debug(f'Attempting to load {item["im"]}')
-        im, lang, page_data = item['im'], item['lang'], item['lines']
-        try:
-            im = Image.open(io.BytesIO(im)).convert('RGB')
-        except Exception:
-            return self[0]
+        current_index = index
+        for attempt in range(MAX_PAGE_LOAD_ATTEMPTS):
+            try:
+                item = self.arrow_table.column('pages')[current_index].as_py()
+                logger.debug(f'Attempting to load {item["im"]}')
+                im, page_data = item['im'], item['lines']
+                im = Image.open(io.BytesIO(im)).convert('RGB')
 
-        im = self.transforms(im)
-        if self.aug:
-            im = im.permute((1, 2, 0)).numpy()
-            o = self.aug(image=im)
-            im = torch.tensor(o['image'].transpose(2, 0, 1))
+                if self.prompt_mode == 'both':
+                    rng = np.random.default_rng()
+                    return_boxes = rng.choice([False, True], 1)
+                elif self.prompt_mode == 'boxes':
+                    return_boxes = True
+                else:
+                    return_boxes = False
 
-        # sample randomly between baselines
-        sample = []
-        if self.prompt_mode == 'both':
-            rng = np.random.default_rng()
-            return_boxes = rng.choice([False, True], 1)
-        elif self.prompt_mode == 'boxes':
-            return_boxes = True
-        else:
-            return_boxes = False
-        for x in rng.choice(len(page_data), self.batch_size, replace=True, shuffle=False):
-            line = page_data[x]
-            tokens = torch.tensor(self.tokenizer.encode(line['text'], langs=[lang], add_bos=True, add_eos=True), dtype=torch.int32)
-            curve = torch.tensor(line['curve']).view(4, 2) if not return_boxes else None
-            bbox = torch.tensor(line['bbox']).view(4, 2) if return_boxes else None
-            sample.append((tokens, curve, bbox))
-        return collate_sequences(im.unsqueeze(0), sample, self.max_seq_len, index)
+                lines = []
+                for line in page_data:
+                    tokens = torch.tensor(self.tokenizer.encode(line['text'], langs=line['lang'], add_bos=True, add_eos=True), dtype=torch.int32)
+                    curve = torch.tensor(line['curve']).view(4, 2) if not return_boxes else None
+                    bbox = torch.tensor(line['bbox']).view(4, 2) if return_boxes else None
+                    lines.append((tokens, curve, bbox))
+                lines = _filter_valid_lines(lines)
+
+                if self.aug is not None:
+                    aug_im, aug_lines = self.aug(im, lines)
+                    aug_lines = _filter_valid_lines(aug_lines)
+                    if aug_lines:
+                        im, lines = aug_im, aug_lines
+                    else:
+                        logger.debug(f'Augmentation removed all lines on page {current_index}; using unaugmented sample.')
+                if not lines:
+                    raise RuntimeError('Page does not contain any usable lines after preprocessing')
+                im = self.transforms(im)
+                # Keep the output size fixed at batch_size (torch.compile
+                # requires a static batch dim) while maximising unique line
+                # coverage per page. Use without-replacement whenever the page
+                # has at least batch_size lines; for the short-page edge case
+                # take every line once and only pad the overflow with replacement.
+                n_lines = len(lines)
+                if self.batch_size <= n_lines:
+                    indices = np.random.choice(n_lines, self.batch_size, replace=False)
+                else:
+                    indices = np.concatenate([
+                        np.random.permutation(n_lines),
+                        np.random.choice(n_lines, self.batch_size - n_lines, replace=True),
+                    ])
+                sample = [lines[i] for i in indices]
+
+                return collate_sequences(im.unsqueeze(0), sample, self.max_seq_len, current_index)
+            except Exception as exc:
+                next_index = int(np.random.randint(len(self)))
+                logger.warning(f'Failed to load training page at index {current_index} on attempt {attempt + 1}/{MAX_PAGE_LOAD_ATTEMPTS}: {exc}. Retrying with index {next_index}.')
+                current_index = next_index
+
+        raise RuntimeError(f'Unable to load a training page after {MAX_PAGE_LOAD_ATTEMPTS} attempts.')
 
     def __len__(self) -> int:
         return len(self.arrow_table)
@@ -463,25 +502,23 @@ class ValidationBaselineDataset(IterableDataset):
         prompt_mode: Select line prompt sampling mode: `boxes` for bbox-only,
                      `curves` for curves-only, and `both` for randomly
                      switching between the two.
-        augmentation: Enables augmentation.
     """
     def __init__(self,
                  files: Sequence[Union[str, 'PathLike']],
                  im_transforms: Callable[[Any], torch.Tensor] = None,
                  prompt_mode: Literal['boxes', 'curves', 'both'] = 'both',
-                 augmentation: bool = False,
                  batch_size: int = 32) -> None:
         super().__init__()
         self.files = files
         self.transforms = im_transforms
         self.prompt_mode = prompt_mode
-        self.aug = None
         self.batch_size = batch_size
         self.max_seq_len = 0
 
         self.tokenizer = OctetTokenizer()
 
         self.arrow_table = None
+        self.lang_counts = Counter()
 
         for file in files:
             with pa.memory_map(file, 'rb') as source:
@@ -489,15 +526,13 @@ class ValidationBaselineDataset(IterableDataset):
                 raw_metadata = ds_table.schema.metadata
                 if not raw_metadata or b'num_lines' not in raw_metadata:
                     raise ValueError(f'{file} does not contain a valid metadata record.')
+                if b'lang_counts' in raw_metadata:
+                    self.lang_counts.update(json.loads(raw_metadata[b'lang_counts']))
                 if not self.arrow_table:
                     self.arrow_table = ds_table
                 else:
                     self.arrow_table = pa.concat_tables([self.arrow_table, ds_table])
                 self.max_seq_len = max(int.from_bytes(raw_metadata[b'max_octets_in_line'], 'little'), self.max_seq_len)
-
-        if augmentation:
-            from party.augmentation import DefaultAugmenter
-            self.aug = DefaultAugmenter()
 
     def __iter__(self):
         device_rank, world_size = (get_rank(), get_world_size()) if is_initialized() else (0, 1)
@@ -514,13 +549,9 @@ class ValidationBaselineDataset(IterableDataset):
         for idx in range(replica_rank, len_ds, num_replicas):
             item = self.arrow_table.column('pages')[idx].as_py()
             logger.debug(f'Attempting to load {item["im"]}')
-            im, lang, page_data = item['im'], item['lang'], item['lines']
+            im, page_data = item['im'], item['lines']
             im = Image.open(io.BytesIO(im)).convert('RGB')
             im = self.transforms(im)
-            if self.aug:
-                im = im.permute((1, 2, 0)).numpy()
-                o = self.aug(image=im)
-                im = torch.tensor(o['image'].transpose(2, 0, 1))
 
             im = im.unsqueeze(0)
 
@@ -535,6 +566,7 @@ class ValidationBaselineDataset(IterableDataset):
                 return_curves = True
 
             for lines in batched(page_data, self.batch_size):
+                pad_n = self.batch_size - len(lines)
                 curves = []
                 boxes = []
                 tokens = []
@@ -543,11 +575,20 @@ class ValidationBaselineDataset(IterableDataset):
                         curves.append(torch.tensor(line['curve']).view(4, 2))
                     if return_boxes:
                         boxes.append(torch.tensor(line['bbox']).view(4, 2))
-                    tokens.append(torch.tensor(self.tokenizer.encode(line['text'], langs=[lang], add_bos=True, add_eos=True), dtype=torch.int32))
-
+                    tokens.append(torch.tensor(self.tokenizer.encode(line['text'], langs=line['lang'], add_bos=True, add_eos=True), dtype=torch.int32))
+                # Pad each yielded batch to exactly self.batch_size so the
+                # downstream torch.compile(dynamic=False) graph sees a single
+                # batch shape per val epoch. Padded slots carry ignore_index
+                # tokens, so they contribute zero to val_mean.
+                for _ in range(pad_n):
+                    if return_curves:
+                        curves.append(torch.zeros(4, 2))
+                    if return_boxes:
+                        boxes.append(torch.zeros(4, 2))
+                    tokens.append(torch.tensor([-100], dtype=torch.int32))
                 tokens = torch.stack([F.pad(x, pad=(0, self.max_seq_len-len(x)), value=-100) for x in tokens]).long()
-                boxes = torch.stack(boxes) if len(boxes) else None
-                curves = torch.stack(curves) if len(curves) else None
+                boxes = torch.stack(boxes) if return_boxes else None
+                curves = torch.stack(curves) if return_curves else None
                 yield {'image': im,
                        'boxes': boxes,
                        'curves': curves,
@@ -594,9 +635,10 @@ class TestBaselineDataset(Dataset):
         from kraken.containers import Segmentation, BaselineLine, BBoxLine
 
         item = self.arrow_table.column('pages')[index].as_py()
-        im, lang, page_data = item['im'], item['lang'], item['lines']
+        im, page_data = item['im'], item['lines']
         im = Image.open(io.BytesIO(im)).convert('RGB')
 
+        all_langs = list({lang for line in page_data for lang in line['lang']})
         if self.prompt_mode == 'curves':
             lines = [BaselineLine(id='_foo',
                                   baseline=line['curve'],
@@ -609,7 +651,7 @@ class TestBaselineDataset(Dataset):
                                 script_detection=False,
                                 text_direction='horizontal-lr',
                                 lines=lines,
-                                language=[lang])
+                                language=all_langs)
 
 
 # magic lsq cubic bezier fit function from the internet.

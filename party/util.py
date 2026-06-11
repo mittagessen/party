@@ -47,7 +47,6 @@ def checkpoint_to_kraken(checkpoint_path: Union[str, 'PathLike'],
               "decoder_norm_eps": 1e-05,
               "decoder_rope_base": 10000,
               "decoder_encoder_max_seq_len": 19200,
-              "decoder_fusion_interval": 3,
               "encoder_input_size": state_dict['hyper_parameters']['encoder_input_size'],
               "encoder_name": state_dict['hyper_parameters']['encoder']}
     model_type = 'kraken_llama_party'

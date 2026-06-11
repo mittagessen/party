@@ -1,32 +1,31 @@
 precision: bf16-mixed
 device: auto
-workers: 4  # because of page-wise sampling it is not necessary to scale worker
+num_workers: 4  # because of page-wise sampling it is not necessary to scale worker
             # number with batch size.
-threads: 1
+num_threads: 1
 train:
+  model_variant: base
   # training data manifests
-  training_files: 
+  training_data: 
     - /home/mittagessen/party_dataset/train.lst
     - /home/mittagessen/party_dataset/train_2.lst
-  evaluation_files: 
+  evaluation_data: 
     - /home/mittagessen/party_dataset/val.lst
-  # 
   # directory to save checkpoints in
-  output: /home/mittagessen/party_models
+  checkpoint_path: /home/mittagessen/party_models
   # text transforms
   normalization: NFD
   normalize_whitespace: true
-  # whether to train on bbox, baseline, or both line prompts
+  # whether to train on `boxes`, `curves`, or `both` line prompt types
   prompt_mode: both
   # base configuration of training epochs and LR schedule
-  epochs: 24
+  epochs: 32
   lrate: 5e-4
   schedule: cosine 
-  cos_max: 18
+  cos_t_max: 32
   cos_min_lr: 5e-6
   warmup: 1000
-  augmentation: true
-  validate_before_train: false
+  augment: true
   # effective batch size params
   batch_size: 16
   val_batch_size: 32

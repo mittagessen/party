@@ -21,8 +21,9 @@ Command line driver helpers
 import os
 import yaml
 import glob
+import difflib
 import logging
-from typing import List, Optional, Tuple
+from typing import Optional
 
 import click
 import lightning as L
@@ -40,17 +41,36 @@ logger = logging.getLogger('party')
 
 
 def _recursive_update(a: dict[str, Any],
-                      b: dict[str, Any]) -> dict[str, Any]:
+                      b: dict[str, Any],
+                      cmd: Optional[click.BaseCommand] = None) -> dict[str, Any]:
     """Like standard ``dict.update()``, but recursive so sub-dict gets updated.
 
-    Ignore elements present in ``b`` but not in ``a``. Unless ``strict`` is set to
-    `True`, in which case a `ValueError` exception will be raised.
+    Warns on keys present in ``b`` but not in ``a`` and not valid option names
+    for the command ``cmd`` and suggests alternatives.
     """
+    valid_keys = set(a.keys())
+    if cmd is not None:
+        for param in cmd.params:
+            if param.name:
+                valid_keys.add(param.name)
+        if isinstance(cmd, click.MultiCommand):
+            valid_keys.update(cmd.list_commands(None))
     for k, v in b.items():
+        if k not in valid_keys:
+            matches = difflib.get_close_matches(k, valid_keys)
+            msg = f'Ignoring unknown configuration key "{k}" in experiment file.'
+            if matches:
+                msg += f' Did you mean "{matches[0]}"?'
+            logger.warning(msg)
+        subcmd = None
+        if cmd is not None and isinstance(cmd, click.MultiCommand):
+            subcmd = cmd.get_command(None, k)
         if isinstance(v, dict) and isinstance(a.get(k), dict):
-            a[k] = _recursive_update(a[k], v)
+            a[k] = _recursive_update(a[k], v, subcmd)
+        elif isinstance(v, dict) and subcmd is not None:
+            a[k] = _recursive_update({}, v, subcmd)
         else:
-            a[k] = b[k]
+            a[k] = v
     return a
 
 
@@ -67,7 +87,7 @@ def _load_config(ctx: click.Context,
             # Update the default_map.
             if ctx.default_map is None:
                 ctx.default_map = {}
-            ctx.default_map = _recursive_update(ctx.default_map, conf)
+            ctx.default_map = _recursive_update(ctx.default_map, conf, ctx.command)
         except FileNotFoundError:
             logger.critical(f"No configuration file {path} found.")
 
@@ -96,7 +116,7 @@ def message(msg, **styles):
         click.secho(msg, **styles)
 
 
-def to_ptl_device(device: str) -> Tuple[str, Optional[List[int]]]:
+def to_ptl_device(device: str) -> tuple[str, Optional[list[int]]]:
     if device.strip() == 'auto':
         return 'auto', 'auto'
     devices = device.split(',')
@@ -112,39 +132,3 @@ def to_ptl_device(device: str) -> Tuple[str, Optional[List[int]]]:
             dev = 'gpu'
         return dev, [int(x[1]) for x in devices]
     raise Exception(f'Invalid device {device} specified')
-
-
-class FreezeEncoder(BaseFinetuning):
-    """
-    Callback freezing the encoder for a fixed number of iterations.
-    """
-
-    def __init__(self, unfreeze_at_iterations=10):
-        super().__init__()
-        self.unfreeze_at_iteration = unfreeze_at_iterations
-
-    def freeze_before_training(self, pl_module):
-        pass
-
-    def finetune_function(self, pl_module, current_epoch, optimizer):
-        pass
-
-    def on_train_start(self, trainer: "L.Trainer", pl_module: "L.LightningModule") -> None:
-        self.freeze(pl_module.nn['encoder'])
-
-    def on_train_batch_start(self, trainer: "L.Trainer", pl_module: "L.LightningModule", batch, batch_idx) -> None:
-        """
-        Called for each training batch.
-        """
-        if trainer.global_step == self.unfreeze_at_iteration:
-            for opt_idx, optimizer in enumerate(trainer.optimizers):
-                num_param_groups = len(optimizer.param_groups)
-                self.unfreeze_and_add_param_group(modules=pl_module.nn['encoder'],
-                                                  optimizer=optimizer,
-                                                  train_bn=True,)
-                current_param_groups = optimizer.param_groups
-                self._store(pl_module, opt_idx, num_param_groups, current_param_groups)
-
-    def on_train_epoch_start(self, trainer: "L.Trainer", pl_module: "L.LightningModule") -> None:
-        """Called when the epoch begins."""
-        pass
