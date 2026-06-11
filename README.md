@@ -22,7 +22,9 @@ Party needs to be trained on datasets precompiled from PageXML or ALTO files con
 
         $ party compile -o dataset.arrow *.xml
 
-The language tokens are derived from line-level language metadata in the XML files. If your 
+The language tokens are derived from line-level language metadata in the XML files. If your files do not contain any (most don't) the token will be set to `und`. There is a helper subcommand that can be used to rewrite files and set languages for every line:
+
+        $ party set-lang ces *.xml
 
 To fine-tune the pretrained base model dataset files in listed in manifest files on all available GPUs:
 
