@@ -56,11 +56,6 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-try:
-    import pillow_jxl # NOQA
-except ImportError:
-    logger.info('No JPEG-XL plugin found')
-
 Image.MAX_IMAGE_PIXELS = 20000 ** 2
 
 # Encodings tried when we have to re-encode a resized page; we keep whichever

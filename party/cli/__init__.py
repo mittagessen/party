@@ -9,6 +9,7 @@ from rich.traceback import install
 from .train import train, compile
 from .test import test
 from .set_lang import set_lang
+from .adapt import adapt
 
 from .util import _load_config, to_ptl_device
 
@@ -47,6 +48,7 @@ Image.MAX_IMAGE_PIXELS = 20000 ** 2
                                                 **TrainingDataConfig().__dict__,
                                                 'compile': PartyRecognitionTrainingDataConfig().__dict__,
                                                 'train': {**PartyRecognitionTrainingConfig().__dict__, **PartyRecognitionTrainingDataConfig().__dict__},
+                                                'adapt': PartyRecognitionTrainingDataConfig().__dict__,
                                                 'test': PartyRecognitionInferenceConfig().__dict__}))
 @click.version_option()
 @click.pass_context
@@ -103,6 +105,7 @@ cli.add_command(compile)
 cli.add_command(train)
 cli.add_command(test)
 cli.add_command(set_lang)
+cli.add_command(adapt)
 
 
 if __name__ == '__main__':

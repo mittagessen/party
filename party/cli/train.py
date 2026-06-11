@@ -187,6 +187,9 @@ def compile(ctx, **params):
               help='Minimal final learning rate for cosine LR scheduler.')
 @click.option('--gradient-clip-val', help='Gradient clip value', type=float)
 @click.option('--freeze-encoder/--no-freeze-encoder', help='Switch to freeze the encoder')
+@click.option('--resize', type=click.Choice(['union', 'new']),
+              help='prototype set resize policy when fine-tuning: `union` appends new code points, `new` '
+                   'restricts the inventory to the dataset.')
 @click.option('--warmup', type=int, help='Number of steps to ramp up to `lrate` initial learning rate.')
 @click.option('--augment/--no-augment', help='Enable image augmentation')
 @click.option('--accumulate-grad-batches', type=int, help='Number of batches to accumulate gradient across.')

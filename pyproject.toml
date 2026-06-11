@@ -25,7 +25,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "torch>=2.5.0",
+    "torch>=2.9.0",
     "timm",
     "pillow-jxl-plugin",
     "python-bidi",

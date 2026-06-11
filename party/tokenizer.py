@@ -469,10 +469,10 @@ class CodePointTokenizer(object):
     - CODEPOINT_OFFSET+: registered Unicode code points
 
     The tokenizer can be in either a thawed state (new code points are
-    registered on demand during encoding) or a frozen state (encoding an
-    unseen code point raises). Datasets register their code points at compile
-    time; once a model is built around a tokenizer the tokenizer is frozen so
-    that the vocabulary is stable.
+    registered on demand during encoding) or a frozen state (encoding an unseen
+    code point raises). Datasets register their code points at compile time;
+    once a model is built around a tokenizer the tokenizer is frozen so that
+    the vocabulary is stable.
     """
     pad_id = PAD_ID
     bos_id = BOS_ID
@@ -543,6 +543,20 @@ class CodePointTokenizer(object):
         code point values.
         """
         return self.register_codepoint_values(ord(char) for char in text)
+
+    def extend_preserving(self, codepoints: Iterable[int]) -> list[int]:
+        """
+        Appends new code points without renumbering existing ones, restoring the
+        prior frozen state afterwards. Returns newly-added values in append
+        order.
+        """
+        was_frozen = self._frozen
+        self._frozen = False
+        try:
+            added = self.register_codepoint_values(codepoints)
+        finally:
+            self._frozen = was_frozen
+        return added
 
     def _get_lang_token(self, lang: str) -> int:
         return LANG_OFFSET + ISO_TO_IDX.get(lang, ISO_TO_IDX['und'])

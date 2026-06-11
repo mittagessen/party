@@ -125,21 +125,13 @@ class PartyRecognitionTrainingConfig(TrainingConfig):
 
         self.freeze_encoder = kwargs.pop('freeze_encoder', False)
         self.train_from_scratch = kwargs.pop('train_from_scratch', False)
+        self.resize = kwargs.pop('resize', 'union')
         self.label_smoothing = kwargs.pop('label_smoothing', 0.0)
-        # Noisy teacher forcing: probability of replacing each decoder-input
-        # code-point token with a random one, optionally ramped over the first
-        # `noisy_teacher_forcing_warmup` steps.
         self.noisy_teacher_forcing = kwargs.pop('noisy_teacher_forcing', 0.0)
         self.noisy_teacher_forcing_warmup = kwargs.pop('noisy_teacher_forcing_warmup', 0)
         self.proto_margin = kwargs.pop('proto_margin', 0.0)
         self.proto_temperature_init = kwargs.pop('proto_temperature_init', 10.0)
-        # When set, load weights from a "conventional" party safetensors file
-        # into the prototype model after construction, reinitializing the
-        # prototype-specific layers (tok_embeddings, output head). Set by
-        # cli/train.py when --load points at a non-prototype safetensors file.
         self.pretrained_weights_path = kwargs.pop('pretrained_weights_path', None)
-        # Only consulted by the Lightning test loop: prepend language tokens
-        # from the segmentation's language field when generating predictions.
         self.add_lang_token = kwargs.pop('add_lang_token', False)
         self.max_generated_tokens = kwargs.pop('max_generated_tokens', 512)
 

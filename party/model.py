@@ -58,20 +58,6 @@ def _shift_targets(tokens: torch.Tensor, ignore_index: int) -> torch.Tensor:
     return torch.hstack((tokens[..., 1:], ignore_idxs)).reshape(-1)
 
 
-def _get_prototype_head(model) -> Optional[PrototypeHead]:
-    module_dict = getattr(model, 'nn', None)
-    if module_dict is None:
-        return None
-    try:
-        decoder = module_dict['decoder']
-    except Exception:
-        return None
-    output = getattr(decoder, 'output', None)
-    if isinstance(output, PrototypeHead):
-        return output
-    return None
-
-
 def apply_arcface_margin(logits: torch.Tensor,
                          targets: torch.Tensor,
                          margin: torch.Tensor,
@@ -79,10 +65,6 @@ def apply_arcface_margin(logits: torch.Tensor,
                          ignore_index: int = -100) -> torch.Tensor:
     """
     Applies an ArcFace angular margin to target logits.
-
-    A margin of zero is a numerical no-op (cos_m=1, sin_m=0 → adjusted equals
-    the original target logits), so the caller may always call this; it's
-    only worth gating to save compute, not for correctness.
     """
     valid = targets != ignore_index
     safe_targets = torch.where(valid, targets, torch.zeros_like(targets))
@@ -147,15 +129,11 @@ def model_step(model, tokens, image, curves, boxes, ignore_index,
                    encoder_boxes=boxes)
 
     logits = logits.reshape(-1, logits.shape[-1])
-    proto_head = _get_prototype_head(model)
-    # Gate only on type-stable Python values (None vs Tensor, training vs not)
-    # so torch.compile specializes at most a handful of times rather than
-    # re-specializing on the literal margin value every step.
-    if proto_head is not None and proto_margin is not None and model.training:
+    if model.training:
         logits = apply_arcface_margin(logits,
                                       targets,
                                       margin=proto_margin,
-                                      temperature=proto_head.temperature,
+                                      temperature=model._prototype_head().temperature,
                                       ignore_index=ignore_index)
     token_loss = F.cross_entropy(logits,
                                  targets,
@@ -213,9 +191,6 @@ class MuonWithAuxAdam(Optimizer):
                  lr: float,
                  weight_decay: float,
                  momentum: float):
-        if not hasattr(torch.optim, 'Muon'):
-            raise RuntimeError('party requires torch.optim.Muon, available in torch 2.10+.')
-
         normalized_groups = []
         muon_group_count = 0
         for group in param_groups:
@@ -359,6 +334,7 @@ def get_parameter_groups(model, base_lr: Optional[float] = None) -> list[dict[st
         if base_lr is not None:
             temperature_group['lr'] = base_lr * 1.0
         param_groups.append(temperature_group)
+
     return param_groups
 
 
@@ -372,13 +348,9 @@ class PartyTextLineDataModule(L.LightningDataModule):
         if not (data_config.training_data and data_config.evaluation_data) and not data_config.test_data:
             raise ValueError('Invalid specification of training/evaluation/test data.')
 
-        self._build_fit_sets = bool(data_config.training_data and data_config.evaluation_data)
         self._build_test_set = bool(data_config.test_data)
 
-        # Eagerly build fit datasets so callers can inspect language statistics
-        # before training (see cli/train.py); test set is built lazily in
-        # setup('test') to avoid loading test data during fit.
-        if self._build_fit_sets:
+        if data_config.training_data and data_config.evaluation_data:
             self._init_fit_sets()
 
     def _init_fit_sets(self):
@@ -420,8 +392,6 @@ class PartyTextLineDataModule(L.LightningDataModule):
     def setup(self, stage: Optional[str] = None):
         if stage == 'test' and self._build_test_set and not hasattr(self, 'test_set'):
             data_config = self.hparams.data_config
-            # TestBaselineDataset is generative (returns (PIL.Image, Segmentation)
-            # tuples); 'both' is meaningless here, default to curves.
             prompt_mode = data_config.prompt_mode if data_config.prompt_mode in ('curves', 'boxes') else 'curves'
             self.test_set = TestBaselineDataset(files=data_config.test_data,
                                                 prompt_mode=prompt_mode)
@@ -456,9 +426,6 @@ class PartyTextLineDataModule(L.LightningDataModule):
                           worker_init_fn=_validation_worker_init_fn)
 
     def test_dataloader(self):
-        # One page per step: TestBaselineDataset yields (PIL.Image, Segmentation)
-        # tuples and the model's test_step handles batched line generation
-        # internally via PartyModel.predict_string.
         return DataLoader(self.test_set,
                           shuffle=False,
                           batch_size=1,
@@ -468,9 +435,8 @@ class PartyTextLineDataModule(L.LightningDataModule):
 
 @dataclass
 class PartyTestMetrics:
-    """Aggregated test metrics for a party model.
-
-    Mirrors the keyword arguments of :func:`party.report.render_report`.
+    """
+    Aggregated test metrics for a party model.
     """
     micro_cer: float
     micro_wer: float
@@ -553,28 +519,11 @@ class PartyRecognitionModel(L.LightningModule):
                                                self._current_ntf_p(),
                                                CODEPOINT_OFFSET,
                                                self.net.tokenizer.vocab_size)
-        finite_loss = torch.isfinite(loss.detach())
-        if is_initialized():
-            finite_flag = finite_loss.to(dtype=torch.int32)
-            all_reduce(finite_flag, op=ReduceOp.MIN)
-            all_ranks_finite = bool(finite_flag.item())
-        else:
-            all_ranks_finite = bool(finite_loss.item())
 
-        if not all_ranks_finite:
-            sample_index = batch.get('index', 'unknown')
-            if not bool(finite_loss.item()):
-                logger.warning(f'NaN/Inf loss detected at batch {batch_idx}, sample {sample_index}, rank {self.global_rank}; skipping optimizer signal for this batch')
-            zero_loss = loss.new_zeros(())
-            for parameter in self.net.parameters():
-                if parameter.requires_grad:
-                    zero_loss = zero_loss + parameter.sum() * 0.0
-            loss = zero_loss
+        if batch['curves'] is not None:
+            _update_loss_metric(self.train_curves_mean, loss, valid_count)
         else:
-            if batch['curves'] is not None:
-                _update_loss_metric(self.train_curves_mean, loss, valid_count)
-            else:
-                _update_loss_metric(self.train_boxes_mean, loss, valid_count)
+            _update_loss_metric(self.train_boxes_mean, loss, valid_count)
 
         self.log('train_loss_step',
                  loss,
@@ -663,9 +612,6 @@ class PartyRecognitionModel(L.LightningModule):
         self.net.prepare_for_generation(batch_size=self._test_batch_size,
                                         max_generated_tokens=config.max_generated_tokens)
 
-        # Per-epoch metric state. Metrics must live on self.device so their
-        # _sync_dist all_gather uses the NCCL backend under DDP; CPU tensors
-        # raise "No backend type associated with device type cpu".
         device = self.device
         self._test_micro_cer = CharErrorRate().to(device)
         self._test_micro_wer = WordErrorRate().to(device)
@@ -779,28 +725,58 @@ class PartyRecognitionModel(L.LightningModule):
                 if pretrained_path:
                     logger.info(f'Loading pretrained conventional party weights from {pretrained_path}.')
                     self.net.load_pretrained_party_weights(pretrained_path)
+            else:
+                # A net loaded from a checkpoint/weights file may carry a
+                # different inventory than the dataset; grow/reindex it.
+                self._grow_vocabulary()
 
-            if self.hparams.config.freeze_encoder:
-                for param in self.net.nn['encoder'].parameters():
-                    param.requires_grad = False
-                for param in self.net.nn['adapter'].parameters():
-                    param.requires_grad = False
+            self._apply_freeze_mask()
+
+    def _retokenize_datamodule(self, tokenizer) -> None:
+        dm = self.trainer.datamodule
+        dm.tokenizer = tokenizer
+        if getattr(dm, 'train_set', None) is not None:
+            dm.train_set.tokenizer = tokenizer
+        if getattr(dm, 'val_set', None) is not None:
+            dm.val_set.tokenizer = tokenizer
+
+    def _grow_vocabulary(self) -> None:
+        """
+        Reconciles a loaded net's prototype inventory with the datamodule's
+        tokenizer per the configured resizing policy.
+        """
+        from party.adapt import adapt_model
+
+        dm_tokenizer = self.trainer.datamodule.tokenizer
+        config = self.hparams.config
+        resize = getattr(config, 'resize', 'union')
+        base = set(self.net.tokenizer.codepoints)
+        target = dm_tokenizer.codepoints
+        if resize != 'new' and all(cp in base for cp in target):
+            # No new code points: keep the net's table, but align dataset
+            # encoding to its token IDs (ordering may otherwise differ).
+            self._retokenize_datamodule(self.net.tokenizer)
+            return
+
+        report = adapt_model(self.net, target, resize=resize,
+                             support_loader=None, recalibrate=False)
+        self._retokenize_datamodule(self.net.tokenizer)
+        logger.info(f'Grew vocabulary {report.vocab_before} -> {report.vocab_after} '
+                    f'(+{len(report.added)} added, -{len(report.dropped)} dropped, '
+                    f'resize={resize}).')
+
+    def _apply_freeze_mask(self) -> None:
+        if self.hparams.config.freeze_encoder:
+            for param in self.net.nn['encoder'].parameters():
+                param.requires_grad = False
+            for param in self.net.nn['adapter'].parameters():
+                param.requires_grad = False
 
     def on_save_checkpoint(self, checkpoint):
-        """
-        Save hyperparameters a second time so we can set parameters that
-        shouldn't be overwritten in on_load_checkpoint.
-        """
         checkpoint['_module_config'] = self.hparams.config
-        tokenizer = getattr(self.net, 'tokenizer', None) if self.net is not None else None
-        if tokenizer is not None:
-            checkpoint['_tokenizer_state'] = tokenizer.save()
+        checkpoint['_tokenizer_state'] = self.net.tokenizer.save()
 
     def on_load_checkpoint(self, checkpoint):
-        """
-        Reconstruct the model from the spec here and not in setup() as
-        otherwise the weight loading will fail.
-        """
         if not isinstance(checkpoint['_module_config'], PartyRecognitionTrainingConfig):
             raise ValueError('Checkpoint is not a party model.')
 
@@ -832,10 +808,6 @@ class PartyRecognitionModel(L.LightningModule):
         """
         Initializes the module from a "conventional" (non-prototype) party
         safetensors weights file.
-
-        The actual weight surgery (drop tok_embeddings/output, load the rest
-        into a freshly-built prototype model) is deferred to :meth:`setup`,
-        which runs after the datamodule has built its tokenizer.
         """
         config.pretrained_weights_path = str(path)
         return cls(config=config)
