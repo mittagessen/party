@@ -344,22 +344,23 @@ def refine_prototypes(model: 'PartyModel',
     model.train()
     done = 0
     try:
-        while done < steps:
-            for batch in support_loader:
-                if done >= steps:
-                    break
-                tokens, image, curves, boxes = _move(batch, fabric)
-                targets = _shift_targets(tokens, ignore_index)
-                tokens_in = tokens.masked_fill(tokens == ignore_index, 0)
-                with fabric.autocast():
-                    logits = model(tokens=tokens_in, encoder_input=image,
-                                   encoder_curves=curves, encoder_boxes=boxes)
-                    logits = logits.reshape(-1, logits.shape[-1])
-                    loss = F.cross_entropy(logits, targets, ignore_index=ignore_index)
-                optim.zero_grad()
-                fabric.backward(loss)
-                optim.step()
-                done += 1
+        with torch.enable_grad():
+            while done < steps:
+                for batch in support_loader:
+                    if done >= steps:
+                        break
+                    tokens, image, curves, boxes = _move(batch, fabric)
+                    targets = _shift_targets(tokens, ignore_index)
+                    tokens_in = tokens.masked_fill(tokens == ignore_index, 0)
+                    with fabric.autocast():
+                        logits = model(tokens=tokens_in, encoder_input=image,
+                                       encoder_curves=curves, encoder_boxes=boxes)
+                        logits = logits.reshape(-1, logits.shape[-1])
+                        loss = F.cross_entropy(logits, targets, ignore_index=ignore_index)
+                    optim.zero_grad()
+                    fabric.backward(loss)
+                    optim.step()
+                    done += 1
     finally:
         for name, p in model.named_parameters():
             p.requires_grad = saved[name]
