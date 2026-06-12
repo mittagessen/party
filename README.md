@@ -65,6 +65,20 @@ To recognize text in pre-segmented page images in PageXML or ALTO download the b
 
 The paths to the image file(s) is automatically extracted from the XML input file(s).
 
+Alternatively, party ships its own `ocr` command that exposes the
+party-specific inference options:
+
+        $ party --precision bf16-mixed -d cuda:0 ocr -m 10.5281/zenodo.14616980 -a -i in.xml out.xml -B 32 --add-lang-token
+
+As party is a recognition-only model the input **must** be a pre-segmented
+PageXML or ALTO file. The model can be selected either from the
+[HTRMoPo](https://htrmopo.org) repository with `-m` or from a local
+safetensors/checkpoint file with `-l`. If neither is given the base model is
+downloaded automatically. Output serialization defaults to ALTO (`-a`) but
+PageXML (`-x`), hOCR (`-h`), abbyyXML (`-y`), and plain text (`-n`) are
+available as well. Language conditioning can be enabled with
+`--add-lang-token`.
+
 ## Testing
 
 Testing for now only works from binary dataset files. As with for inference curve prompts are selected if the model supports both, but an explicit line prompt type can be selected.

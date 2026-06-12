@@ -8,6 +8,7 @@ from rich.traceback import install
 
 from .train import train, compile
 from .test import test
+from .ocr import ocr
 from .set_lang import set_lang
 
 from .util import _load_config, to_ptl_device
@@ -47,7 +48,8 @@ Image.MAX_IMAGE_PIXELS = 20000 ** 2
                                                 **TrainingDataConfig().__dict__,
                                                 'compile': PartyRecognitionTrainingDataConfig().__dict__,
                                                 'train': {**PartyRecognitionTrainingConfig().__dict__, **PartyRecognitionTrainingDataConfig().__dict__},
-                                                'test': PartyRecognitionInferenceConfig().__dict__}))
+                                                'test': PartyRecognitionInferenceConfig().__dict__,
+                                                'ocr': PartyRecognitionInferenceConfig().__dict__}))
 @click.version_option()
 @click.pass_context
 @click.option('-v', '--verbose', default=0, count=True)
@@ -102,6 +104,7 @@ def cli(ctx, **kwargs):
 cli.add_command(compile)
 cli.add_command(train)
 cli.add_command(test)
+cli.add_command(ocr)
 cli.add_command(set_lang)
 
 
