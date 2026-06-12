@@ -475,6 +475,7 @@ class PartyRecognitionModel(L.LightningModule):
         self.val_boxes_mean = MeanMetric()
 
         self.model_step = model_step
+        self.compile_for_test = False
 
     def forward(self, x, curves):
         return self.net(encoder_input=x, encoder_curves=curves)
@@ -733,6 +734,9 @@ class PartyRecognitionModel(L.LightningModule):
 
             self._apply_freeze_mask()
 
+            if stage == 'test' and getattr(self, 'compile_for_test', False):
+                self._compile_net()
+
     def _retokenize_datamodule(self, tokenizer) -> None:
         dm = self.trainer.datamodule
         dm.tokenizer = tokenizer
@@ -765,6 +769,13 @@ class PartyRecognitionModel(L.LightningModule):
         logger.info(f'Grew vocabulary {report.vocab_before} -> {report.vocab_after} '
                     f'(+{len(report.added)} added, -{len(report.dropped)} dropped, '
                     f'resize={resize}).')
+
+    def _compile_net(self) -> None:
+        try:
+            self.net = torch.compile(self.net, mode='max-autotune')
+            logger.info('Compiled net for testing.')
+        except Exception:
+            logger.warning('torch.compile() of net failed; running uncompiled.')
 
     def _apply_freeze_mask(self) -> None:
         if self.hparams.config.freeze_encoder:

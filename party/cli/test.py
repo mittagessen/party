@@ -133,15 +133,16 @@ def test(ctx, batch_size, load_from_repo, load_from_file, evaluation_files,
 
     with trainer.init_module(empty_init=False):
         message(f'Loading from {load_from_file}.')
-        model = PartyRecognitionModel.load_from_weights(load_from_file, config=m_config)
+        if str(load_from_file).endswith('.ckpt'):
+            model = PartyRecognitionModel.load_from_checkpoint(load_from_file,
+                                                               config=m_config,
+                                                               weights_only=False)
+        else:
+            model = PartyRecognitionModel.load_from_weights(load_from_file, config=m_config)
 
-        if compile:
-            click.echo('Compiling model ', nl=False)
-            try:
-                model.net = torch.compile(model.net, mode='max-autotune')
-                click.secho('✓', fg='green')
-            except Exception:
-                click.secho('✗', fg='red')
+        # The net may be built lazily in `setup()` (weights path), so defer
+        # compilation until after it exists rather than compiling `None` here.
+        model.compile_for_test = compile
 
         if quantize:
             click.echo('Quantizing model ', nl=False)
