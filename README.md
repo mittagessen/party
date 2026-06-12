@@ -56,57 +56,19 @@ To recognize text in pre-segmented page images in PageXML or ALTO with the pretr
 
 The paths to the image file(s) is automatically extracted from the XML input file(s).
 
-When no language tag is given the model will predict by itself which languages are found in it. To explicitly prompt the model to predict a particular language use one of the identifiers below:
+Alternatively, party ships its own `ocr` command that exposes the
+party-specific inference options:
 
-|Language|Identifier|
-|--------|----------|
-|Ancient Greek|grc|
-|Catalan|cat|
-|Church Slavonic|chu|
-|Corsican|cos|
-|Czech|ces|
-|Dutch|nld|
-|English|eng|
-|Finnish|fin|
-|French|fra|
-|German|deu|
-|German Shorthand|qaa|
-|Irish|gle|
-|Italian|ita|
-|Latin|lat|
-|Latvian|lav|
-|Lithuanian|lit|
-|Middle Dutch|dum|
-|Middle French|frm|
-|Newari|new|
-|Norwegian|nor|
-|Occitan|oci|
-|Persian|fas|
-|Picard|pcd|
-|Polish|pol|
-|Portuguese|por|
-|Romanian|ron|
-|Russian|rus|
-|Serbian (cyrillic)|qab|
-|Slovenian|slv|
-|Spanish|spa|
-|Swedish|swe|
-|Ukrainian|ukr|
+        $ party --precision bf16-mixed -d cuda:0 ocr -m 10.5281/zenodo.14616980 -a -i in.xml out.xml -B 32 --add-lang-token
 
-with the `-l` option of the `ocr` subcomand:
-
-    $ party -d cuda:0 ocr -i in.xml out.xml --load-from-repo 10.5281/zenodo.15764161 -l grc
-
-A single language can be defined per call.
-
-When the recognizer supports both curves and box prompts, curves are selected by default. To select a prompt type explicitly you can use the `--curves` and `--boxes` switches:
-
-        $ party -d cuda:0 ocr -i in.xml out.xml --curves --compile
-        $ party -d cuda:0 ocr -i in.xml out.xml --boxes --compile
-
-Inference from a converted checkpoint:
-
-        $ party -d cuda:0 ocr -i in.xml out.xml --curves --load-from-file model.safetensors
+As party is a recognition-only model the input **must** be a pre-segmented
+PageXML or ALTO file. The model can be selected either from the
+[HTRMoPo](https://htrmopo.org) repository with `-m` or from a local
+safetensors/checkpoint file with `-l`. If neither is given the base model is
+downloaded automatically. Output serialization defaults to ALTO (`-a`) but
+PageXML (`-x`), hOCR (`-h`), abbyyXML (`-y`), and plain text (`-n`) are
+available as well. Language conditioning can be enabled with
+`--add-lang-token`.
 
 ## Testing
 
