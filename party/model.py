@@ -605,6 +605,7 @@ class PartyRecognitionModel(L.LightningModule):
 
         self._test_batch_size = data_config.val_batch_size or data_config.batch_size
         self._test_add_lang_token = bool(getattr(config, 'add_lang_token', False))
+        self.net = self.trainer.precision_plugin.convert_module(self.net)
         self._test_im_transforms = get_default_transforms(image_size=data_config.image_size,
                                                           dtype=next(self.net.parameters()).dtype)
         self._test_prompt_mode = self.trainer.datamodule.test_set.prompt_mode
@@ -711,7 +712,7 @@ class PartyRecognitionModel(L.LightningModule):
             self.log(f'test_{k}', getattr(self.test_metrics, k), on_epoch=True, logger=True)
 
     def setup(self, stage: Optional[str] = None):
-        if stage in [None, 'fit']:
+        if stage in [None, 'fit', 'test']:
             if self.net is None:
                 data_tokenizer = getattr(self.trainer.datamodule, 'tokenizer', None)
                 tokenizer_state = data_tokenizer.save() if data_tokenizer is not None else None
