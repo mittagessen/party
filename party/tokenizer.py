@@ -557,7 +557,7 @@ class OctetTokenizer(object):
         confs = []
         ics = []
         confidences = confidences.tolist()
-        for id, conf in zip((id.to_bytes() for id in bytes(ids)), confidences):
+        for id, conf in zip((id.to_bytes(1, 'big') for id in bytes(ids)), confidences):
             try:
                 c = decoder.decode(id)
                 ics.append(conf)
