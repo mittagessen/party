@@ -31,7 +31,7 @@ from typing import Optional, Union, TYPE_CHECKING, Any
 from party.modules import (PromptEncoder, MultiHeadAttention, FeedForward,
                            TransformerSelfAttentionLayer, RMSNorm, TanhGate,
                            PrototypeHead)
-from party.tokenizer import CodePointTokenizer
+from party.tokenizer import CodePointTokenizer, CODEPOINT_OFFSET, MASK_ID
 from party.configs import get_model_variant, PartyRecognitionInferenceConfig
 from party.fusion import bytellama_vision_decoder
 from party.dataset import get_default_transforms, _to_curve, _to_bbox
@@ -141,6 +141,9 @@ class PartyModel(nn.Module, RecognitionBaseModel):
         self.user_metadata.update(kwargs)
         self.user_metadata['proto_temperature_init'] = proto_temperature_init
         self.user_metadata['proto_margin'] = proto_margin
+        # autoregressive weights load into this model without complaint but
+        # decode into garbage, so record how it was trained to decode
+        self.user_metadata['decoder_mode'] = 'diffusion'
 
         if isinstance(tokenizer_arg, CodePointTokenizer):
             self.tokenizer = tokenizer_arg
@@ -204,7 +207,8 @@ class PartyModel(nn.Module, RecognitionBaseModel):
                      dtype: torch.dtype,
                      *,
                      encoder_max_seq_len: int = None,
-                     decoder_max_seq_len: int = None):
+                     decoder_max_seq_len: int = None,
+                     self_attn_cache: bool = False):
         """
         Sets up key-value attention caches for inference for ``self.decoder``.
         For each layer in ``self.decoder.layers``:
@@ -217,11 +221,16 @@ class PartyModel(nn.Module, RecognitionBaseModel):
             dtype (torch.dtype): dtype for the caches.
             encoder_max_seq_len (int): maximum encoder cache sequence length.
             decoder_max_seq_len (int): maximum decoder cache sequence length.
+            self_attn_cache (bool): whether to cache decoder self-attention.
+                Defaults to False: the sampler re-reads the whole canvas every
+                denoising pass and would overrun the cache, while the encoder
+                keys/values it does cache are stable across passes.
         """
         self.nn['decoder'].setup_caches(batch_size,
                                         dtype,
                                         encoder_max_seq_len=encoder_max_seq_len,
-                                        decoder_max_seq_len=decoder_max_seq_len)
+                                        decoder_max_seq_len=decoder_max_seq_len,
+                                        self_attn_cache=self_attn_cache)
         self._cache_batch_size = batch_size
 
     def caches_are_setup(self) -> bool:
@@ -446,11 +455,21 @@ class PartyModel(nn.Module, RecognitionBaseModel):
                     if not any(k.startswith(p) for p in drop_prefixes)}
 
         missing, unexpected = self.load_state_dict(filtered, strict=False)
+        # mask_embedding is the only parameter the diffusion decoder adds, so
+        # autoregressive weights never carry it.
+        converted = [k for k in missing if k.endswith('mask_embedding')]
+        if converted:
+            self.nn['decoder'].init_mask_embedding(first_token_id=CODEPOINT_OFFSET)
+            logger.info('Converting autoregressive weights to masked diffusion: '
+                        'seeded mask_embedding from the token embedding table. '
+                        'The model needs fine-tuning under the diffusion '
+                        'objective before it will decode in parallel.')
+
         # The prototype-specific keys (tok_embeddings, output.prototypes,
         # output.temperature) are expected to be missing because we just
         # filtered them out. Anything else is a real concern.
         real_missing = [k for k in missing
-                        if not k.startswith(drop_prefixes)]
+                        if not k.startswith(drop_prefixes) and k not in converted]
         if real_missing:
             logger.warning(f'Pretrained party weights missing keys: {real_missing}')
         if unexpected:
@@ -468,9 +487,16 @@ class PartyModel(nn.Module, RecognitionBaseModel):
     def prepare_for_generation(self,
                                batch_size: int,
                                *,
-                               max_generated_tokens: int = 512) -> None:
+                               max_generated_tokens: int = 512,
+                               diffusion_steps: int = 4,
+                               confidence_threshold: Optional[float] = None,
+                               truncate_at_eos: bool = True) -> None:
         """
-        Allocates KV caches and primes the model for autoregressive decoding.
+        Allocates encoder KV caches and primes the model for parallel decoding.
+
+        ``max_generated_tokens`` is the canvas width, terminated by the first
+        predicted EOS. Decoding cost scales with it, so it is worth setting from
+        the dataset's ``max_tokens_in_line``.
         """
         self.eval()
         decoder_max_seq_len = self.nn['decoder'].max_seq_len
@@ -480,6 +506,9 @@ class PartyModel(nn.Module, RecognitionBaseModel):
             max_generated_tokens = decoder_max_seq_len
         self._batch_size = batch_size
         self._max_generated_tokens = max_generated_tokens
+        self._diffusion_steps = max(1, int(diffusion_steps))
+        self._confidence_threshold = confidence_threshold
+        self._truncate_at_eos = bool(truncate_at_eos)
         self.setup_caches(batch_size=batch_size,
                           encoder_max_seq_len=self.encoder_max_seq_len,
                           decoder_max_seq_len=max_generated_tokens,
@@ -501,7 +530,10 @@ class PartyModel(nn.Module, RecognitionBaseModel):
         self.m_dtype = next(self.parameters()).dtype
 
         self.prepare_for_generation(batch_size=config.batch_size,
-                                    max_generated_tokens=config.max_generated_tokens)
+                                    max_generated_tokens=config.max_generated_tokens,
+                                    diffusion_steps=config.diffusion_steps,
+                                    confidence_threshold=config.confidence_threshold,
+                                    truncate_at_eos=config.truncate_at_eos)
 
         self._fabric = Fabric(accelerator=self._inf_config.accelerator,
                               devices=self._inf_config.device,
@@ -599,7 +631,12 @@ class PartyModel(nn.Module, RecognitionBaseModel):
                        languages: Optional[list[Optional[list[str]]]] = None) -> Generator[tuple[torch.Tensor, torch.Tensor], None, None]:
         """
         Predicts text from an input page image and a number of cubic Bézier
-        curves.
+        curves or bounding boxes.
+
+        Each line is decoded as a single block: the canvas starts masked and is
+        filled over ``diffusion_steps`` passes, each unmasking the most
+        confident positions. Every position is predicted in parallel, so the
+        number of forward passes is independent of the transcription length.
 
         Args:
             encoder_input: Image input for the encoder with shape ``1 x c x h x w``
@@ -607,20 +644,17 @@ class PartyModel(nn.Module, RecognitionBaseModel):
             boxes: Boxes to be embedded and added to the encoder embeddings (``n x 4 x 2``)
             languages: Optional per-line language conditioning. One entry per
                        line in ``curves``/``boxes``; each entry is either a
-                       list of ISO-639-3 language identifiers to be prepended
-                       to that line's prompt, or ``None`` to leave it
-                       unconditioned. Pass ``None`` (the default) to disable
-                       language conditioning for all lines. Lines with
-                       differing prompt lengths are left-padded; padding
-                       positions are masked out of both self- and
-                       cross-attention.
+                       list of ISO-639-3 language identifiers to condition that
+                       line on, or ``None`` to let the model predict them. Pass
+                       ``None`` (the default) to leave every line
+                       unconditioned. Conditioning tokens start the canvas
+                       unmasked, so no left-padding is needed and positions are
+                       uniform across the batch.
 
         Yields:
             One tensor of integer labels and one tensor of float confidences,
-            each with shape ``n x s`` where ``s` is the length of the longest
-            generated sequence or `max_generated_tokens`. BOS and EOS have
-            already been stripped from the token sequences. Entries beyond the
-            EOS are padded with zeroes.
+            each with shape ``n x s``. BOS and the conditioning prefix have
+            already been stripped, and entries from EOS onward are zeroed.
         """
         if curves is not None and boxes is not None:
             raise ValueError('`curves` and `boxes` are mutually exclusive.')
@@ -637,14 +671,16 @@ class PartyModel(nn.Module, RecognitionBaseModel):
         adapter_output = self.forward_encoder_embeddings(encoder_input)
         device = adapter_output.device
 
-        # Build per-line prompts (varying lengths when languages differ).
+        # Conditioning prefix per line: BOS plus any requested language tokens.
         line_prompts = [self.tokenizer.encode('',
                                               langs=languages[i] if languages is not None else None,
                                               add_eos=False)
                         for i in range(n_lines)]
 
-        eos_token = torch.tensor(self.tokenizer.eos_id, device=device, dtype=torch.long)
-        cache_size = self._max_generated_tokens
+        canvas_len = self._max_generated_tokens
+        steps = self._diffusion_steps
+        threshold = self._confidence_threshold
+        truncate = self._truncate_at_eos
 
         n_batches = (n_lines + self._batch_size - 1) // self._batch_size
         for batch_idx in range(n_batches):
@@ -653,110 +689,102 @@ class PartyModel(nn.Module, RecognitionBaseModel):
             bsz = end - start
             batch = line_pos[start:end]
             batch_prompts = line_prompts[start:end]
-            prompt_lens = [len(p) for p in batch_prompts]
-            max_prompt_len = max(prompt_lens)
+            max_prompt_len = max(len(p) for p in batch_prompts)
 
-            if max_prompt_len >= cache_size:
-                raise ValueError(f'Prompt length {max_prompt_len} leaves no room to '
-                                 f'generate within decoder cache ({cache_size}).')
-
-            pad_lens = torch.tensor([max_prompt_len - L for L in prompt_lens],
-                                    device=device, dtype=torch.long)
-
-            # Left-pad each line's prompt with pad_id so all rows end at column
-            # (max_prompt_len - 1) regardless of original prompt length.
-            prompt_tokens = torch.full((bsz, max_prompt_len),
-                                       fill_value=self.tokenizer.pad_id,
-                                       dtype=torch.long,
-                                       device=device)
-            for i, p in enumerate(batch_prompts):
-                prompt_tokens[i, -len(p):] = torch.tensor(p, dtype=torch.long, device=device)
-
-            self.reset_caches()
+            if max_prompt_len >= canvas_len:
+                raise ValueError(f'Conditioning prefix of {max_prompt_len} tokens leaves no '
+                                 f'room on a canvas of {canvas_len}.')
 
             logger.info(f'Processing batch {batch_idx + 1} of {n_batches}')
             if bsz != self._cache_batch_size:
-                logger.debug(f'Resizing caches ({self._cache_batch_size} -> {bsz})')
+                logger.debug(f'Resizing encoder caches ({self._cache_batch_size} -> {bsz})')
                 self.setup_caches(batch_size=bsz,
                                   encoder_max_seq_len=self.encoder_max_seq_len,
-                                  decoder_max_seq_len=cache_size,
+                                  decoder_max_seq_len=canvas_len,
                                   dtype=next(self.nn['encoder'].parameters()).dtype)
+            self.reset_caches()
 
             logger.debug('Computing additive line embeddings.')
             line_embeddings = self.nn['line_embedding'](curves=batch if curves is not None else None,
                                                         boxes=batch if boxes is not None else None)
             encoder_hidden_states = adapter_output + line_embeddings.unsqueeze(1)
 
-            # Self-attention mask, shape [bsz, max_prompt_len, cache_size]:
-            # - real query rows attend causally to real key positions only,
-            # - pad query rows get a diagonal-only mask (outputs ignored) to
-            #   prevent all-False rows from producing NaNs in softmax.
-            q_pos = torch.arange(max_prompt_len, device=device).view(1, -1, 1)
-            k_pos = torch.arange(cache_size, device=device).view(1, 1, -1)
-            pad_lens_v = pad_lens.view(-1, 1, 1)
-            real_q = q_pos >= pad_lens_v
-            real_k = k_pos >= pad_lens_v
-            prefill_mask = (real_q & real_k & (k_pos <= q_pos)) | (~real_q & (k_pos == q_pos))
+            # the canvas starts fully masked apart from the prefix, which is
+            # left-aligned so RoPE positions are a plain arange for every row
+            x = torch.full((bsz, canvas_len), MASK_ID, dtype=torch.long, device=device)
+            for i, prompt in enumerate(batch_prompts):
+                x[i, :len(prompt)] = torch.tensor(prompt, dtype=torch.long, device=device)
+            confidences = torch.zeros((bsz, canvas_len), dtype=torch.float, device=device)
 
-            # Encoder mask: real query rows attend to all encoder embeddings;
-            # pad rows have all-False rows, which TransformerCrossAttentionLayer
-            # handles via its skip-mask path.
-            encoder_mask = real_q.expand(-1, -1, self.encoder_max_seq_len).contiguous()
+            # Live canvas width, shrunk once every row has terminated.
+            live = canvas_len
+            for step in range(steps):
+                masked = x[:, :live] == MASK_ID
+                if not masked.any():
+                    break
 
-            logger.debug('Prefilling cache.')
-            logits = self.forward(tokens=prompt_tokens,
-                                  encoder_hidden_states=encoder_hidden_states,
-                                  encoder_mask=encoder_mask,
-                                  mask=prefill_mask,
-                                  input_pos=torch.arange(0, max_prompt_len, device=device))
-            tokens = torch.argmax(logits, dim=-1)[:, -1:]
-            confs = logits[:, -1].softmax(-1)
-            generated_tokens = [tokens[:, -1]]
-            generated_confidences = [confs.gather(-1, tokens).squeeze(1)]
-            logger.debug(f'Generated {generated_tokens[-1]} with conf {generated_confidences[-1]}')
-            curr_pos = max_prompt_len
+                # encoder keys/values are stable, so they are projected once
+                # and read from the cross-attention cache on later passes
+                logits = self.forward(tokens=x[:, :live],
+                                      encoder_hidden_states=encoder_hidden_states if step == 0 else None,
+                                      encoder_mask=None)
+                probs = logits.softmax(-1)
+                slot_conf, slot_tok = probs.max(-1)
 
-            # keeps track of EOS tokens emitted by each sequence in a batch
-            eos_token_reached = torch.zeros(bsz, dtype=torch.bool, device=device)
-            eos_token_reached |= tokens[:, -1] == eos_token
+                # slot i scores position i+1, so shift right to index by the
+                # position decided. The last slot falls off the canvas.
+                pos_conf = torch.cat([slot_conf.new_zeros(bsz, 1), slot_conf[:, :-1]], dim=1)
+                pos_tok = torch.cat([slot_tok.new_zeros(bsz, 1), slot_tok[:, :-1]], dim=1)
 
-            # mask used for setting all values from EOS token to pad_id in output sequences.
-            eos_token_mask = torch.ones(bsz, 0, dtype=torch.int32, device=device)
+                # only still-masked positions are candidates: a committed one
+                # sees its own value and reports inflated confidence
+                score = pos_conf.masked_fill(~masked, -1.0)
 
-            if not eos_token_reached.all():
-                for _ in range(cache_size - max_prompt_len - 1):
-                    logger.debug('Generating...')
-                    eos_token_mask = torch.cat([eos_token_mask,
-                                                ~eos_token_reached.reshape(bsz, 1)], dim=-1)
+                # unmask the most confident 1/(remaining passes) of what is
+                # left, filling the canvas in exactly `steps` passes
+                remaining = steps - step
+                quota = torch.ceil(masked.sum(-1) / remaining).long().clamp_min(1)
+                order = score.argsort(dim=-1, descending=True)
+                rank = torch.empty_like(order)
+                rank.scatter_(1, order, torch.arange(live, device=device).expand(bsz, live))
+                take = masked & (rank < quota.unsqueeze(1))
+                if threshold is not None:
+                    take |= masked & (pos_conf >= threshold)
 
-                    # Step mask: each row can attend to its real key range
-                    # [pad_lens[b], curr_pos].
-                    step_mask = (k_pos >= pad_lens_v) & (k_pos <= curr_pos)
+                x[:, :live] = torch.where(take, pos_tok, x[:, :live])
+                confidences[:, :live] = torch.where(take, pos_conf, confidences[:, :live])
 
-                    logits = self.forward(tokens=tokens.clone(),
-                                          mask=step_mask,
-                                          input_pos=torch.tensor([curr_pos], device=device))
-                    tokens = torch.argmax(logits, dim=-1)
-                    confs = logits[:, -1].softmax(-1)
-                    generated_tokens.append(tokens[:, -1])
-                    generated_confidences.append(confs.gather(-1, tokens).squeeze(1))
-                    logger.debug(f'Generated {generated_tokens[-1]} with conf {generated_confidences[-1]}')
+                # everything after a committed EOS is PAD by construction;
+                # filling it here drops it out of later passes
+                eos_at = (x[:, :live] == self.tokenizer.eos_id)
+                if eos_at.any():
+                    after_eos = eos_at.cumsum(-1) > eos_at.long()
+                    x[:, :live] = torch.where(after_eos & (x[:, :live] == MASK_ID),
+                                              torch.full_like(x[:, :live], self.tokenizer.pad_id),
+                                              x[:, :live])
+                    if truncate and eos_at.any(-1).all():
+                        # every row terminated, so drop the dead tail. Slicing
+                        # from the left keeps RoPE positions correct.
+                        live = int(eos_at.float().argmax(-1).max().item()) + 1
+                        logger.debug(f'Truncating canvas to {live} after EOS.')
 
-                    curr_pos += 1
-                    eos_token_reached |= tokens[:, -1] == eos_token
-                    if eos_token_reached.all():
-                        break
+            # strip the prefix and zero from EOS on, as the autoregressive
+            # decoder yielded. Predicted language tokens are kept, as
+            # decode_with_confs reads the language tags back out of them.
+            keep = torch.ones_like(x, dtype=torch.bool)
+            for i, prompt in enumerate(batch_prompts):
+                keep[i, :len(prompt)] = False
+            eos_at = x == self.tokenizer.eos_id
+            live_mask = ~(eos_at.cumsum(-1) > 0)
 
-            eos_token_mask = torch.cat([eos_token_mask,
-                                        ~eos_token_reached.reshape(bsz, 1)], dim=-1)
-
-            # mask out generated tokens beyond EOS token
-            generated_tokens = torch.stack(generated_tokens).T
-            generated_confidences = torch.stack(generated_confidences).T
-
-            generated_tokens *= eos_token_mask
-            generated_confidences *= eos_token_mask
-            yield generated_tokens[..., :-1], generated_confidences[..., :-1]
+            width = canvas_len - min(len(p) for p in batch_prompts)
+            tokens_out = torch.zeros((bsz, width), dtype=torch.long, device=device)
+            confs_out = torch.zeros((bsz, width), dtype=torch.float, device=device)
+            for i in range(bsz):
+                row = (keep[i] & live_mask[i]).nonzero(as_tuple=True)[0]
+                tokens_out[i, :row.numel()] = x[i, row]
+                confs_out[i, :row.numel()] = confidences[i, row]
+            yield tokens_out, confs_out
 
     @torch.inference_mode()
     def predict_string(self,

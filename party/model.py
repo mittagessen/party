@@ -34,6 +34,10 @@ from torch.utils.data import RandomSampler, DataLoader
 from party.party import PartyModel
 from party.modules import PrototypeHead
 from party.tokenizer import CodePointTokenizer, CODEPOINT_OFFSET
+from party.diffusion import (apply_absorbing_mask, causal_window_mask,
+                             content_mask, position_weights, prompt_mask,
+                             sample_lang_prompt, sample_mask_rate, shift,
+                             to_canvas)
 from party.dataset import (collate_null, get_default_transforms,
                            BinnedBaselineDataset, TestBaselineDataset,
                            ValidationBaselineDataset,
@@ -53,10 +57,7 @@ logger = logging.getLogger(__name__)
 
 def _shift_targets(tokens: torch.Tensor, ignore_index: int) -> torch.Tensor:
     # shift the tokens to create targets
-    ignore_idxs = torch.full((tokens.shape[0], 1),
-                             ignore_index,
-                             dtype=tokens.dtype, device=tokens.device)
-    return torch.hstack((tokens[..., 1:], ignore_idxs)).reshape(-1)
+    return shift(tokens, ignore_index).reshape(-1)
 
 
 def apply_arcface_margin(logits: torch.Tensor,
@@ -130,7 +131,9 @@ def model_step(model, tokens, image, curves, boxes, ignore_index,
                    encoder_boxes=boxes)
 
     logits = logits.reshape(-1, logits.shape[-1])
-    if model.training:
+    # `proto_margin` is None whenever margin training is disabled, which is the
+    # default; gate on it rather than on `training` alone.
+    if model.training and proto_margin is not None:
         logits = apply_arcface_margin(logits,
                                       targets,
                                       margin=proto_margin,
@@ -146,6 +149,63 @@ def model_step(model, tokens, image, curves, boxes, ignore_index,
     valid_count = valid_mask.sum()
     loss = loss_sum / valid_count.clamp_min(1)
     return loss, loss_sum, valid_count
+
+
+@torch.compile(dynamic=False)
+def diffusion_model_step(model, tokens, image, curves, boxes, ignore_index,
+                         t: torch.Tensor,
+                         pad_loss_weight: torch.Tensor,
+                         label_smoothing: float = 0.0,
+                         attn_mask: Optional[torch.Tensor] = None,
+                         keep_langs: Optional[torch.Tensor] = None,
+                         proto_margin: Optional[torch.Tensor] = None):
+    """
+    One masked diffusion step. Returns the ELBO estimate to optimize plus a
+    content-only cross-entropy sum and count, which unlike the ELBO are
+    comparable across mask rates.
+    """
+    canvas = to_canvas(tokens, ignore_index)
+    x_t, m = apply_absorbing_mask(canvas, t, prompt_mask(canvas, keep_langs))
+
+    # slot i predicts canvas[i+1] and is supervised only where m[i+1] is set,
+    # which keeps this leak-free under bidirectional attention: slot i's answer
+    # sits at input slot i+1, which is MASK_ID exactly then.
+    targets = shift(canvas, ignore_index)
+    loss_mask = shift(m, False)
+    weights = position_weights(targets, pad_loss_weight, ignore_index)
+
+    logits = model(tokens=x_t,
+                   encoder_input=image,
+                   encoder_curves=curves,
+                   encoder_boxes=boxes,
+                   mask=attn_mask)
+
+    vocab = logits.shape[-1]
+    flat_logits = logits.reshape(-1, vocab)
+    flat_targets = targets.reshape(-1)
+    if model.training and proto_margin is not None:
+        flat_logits = apply_arcface_margin(flat_logits,
+                                           flat_targets,
+                                           margin=proto_margin,
+                                           temperature=model._prototype_head().temperature,
+                                           ignore_index=ignore_index)
+    token_loss = F.cross_entropy(flat_logits,
+                                 flat_targets,
+                                 ignore_index=ignore_index,
+                                 reduction='none',
+                                 label_smoothing=label_smoothing).view_as(targets)
+
+    # normalize by the canvas weight, not by the number of masked positions,
+    # which would cancel the 1/t reweighting
+    supervised = weights * loss_mask
+    t = t.to(dtype=token_loss.dtype, device=token_loss.device)
+    per_sample = (token_loss * supervised).sum(-1) / t.clamp_min(1e-4)
+    loss = (per_sample / weights.sum(-1).clamp_min(1.0)).mean()
+
+    content = loss_mask & content_mask(targets)
+    content_sum = (token_loss * content).sum()
+    content_count = content.sum()
+    return loss, content_sum, content_count
 
 
 def _update_loss_metric(metric: MeanMetric,
@@ -511,18 +571,113 @@ class PartyRecognitionModel(L.LightningModule):
             p = p * min(1.0, float(self.trainer.global_step + 1) / warmup_steps)
         return torch.tensor(p, device=self.device, dtype=torch.float32)
 
+    def _current_mask_rate_max(self) -> float:
+        """
+        Upper end of the mask rate range, ramped from ``mask_rate_max_start``.
+        Starting narrow keeps the model near the teacher-forced regime it was
+        pretrained in.
+        """
+        config = self.hparams.config
+        target = float(config.mask_rate_max)
+        start = float(config.mask_rate_max_start)
+        warmup = int(config.mask_rate_warmup or 0)
+        if warmup <= 0:
+            return target
+        # no +1 as in the ntf ramp; this one starts from a non-zero base and
+        # should sit exactly there at step 0
+        scale = min(1.0, float(self.trainer.global_step) / warmup)
+        return start + (target - start) * scale
+
+    def _current_attn_window(self, seq_len: int) -> Optional[int]:
+        """
+        How far right each query may attend, or None once fully bidirectional.
+        None rather than a full-True mask keeps SDPA on the flash attention path
+        for the steady state.
+        """
+        anneal = int(self.hparams.config.attn_anneal_steps or 0)
+        if anneal <= 0 or self.trainer.global_step >= anneal:
+            return None
+        scale = float(self.trainer.global_step) / anneal
+        window = int(scale * (seq_len - 1))
+        return window if window < seq_len - 1 else None
+
+    def _diffusion_step(self, batch, curves, boxes, mask_rate_max, *, training: bool,
+                        seed: Optional[int] = None):
+        """
+        Runs one diffusion step. ``seed`` makes the noise realisation
+        reproducible, which validation relies on.
+
+        It seeds the global RNG rather than passing a ``torch.Generator``, as
+        the masking happens inside the compiled step where a generator would
+        force a graph break. Forking keeps the training stream undisturbed.
+        """
+        if seed is not None:
+            with torch.random.fork_rng(devices=[self.device] if self.device.type == 'cuda' else [],
+                                       enabled=True):
+                torch.manual_seed(seed)
+                return self._diffusion_step(batch, curves, boxes, mask_rate_max,
+                                            training=training)
+
+        config = self.hparams.config
+        tokens = batch['tokens']
+        bsz, seq_len = tokens.shape
+
+        t = sample_mask_rate(bsz,
+                             seq_len,
+                             low=float(config.mask_rate_min),
+                             high=mask_rate_max,
+                             stratified=bool(config.stratified_t) and training,
+                             device=tokens.device)
+        keep_langs = sample_lang_prompt(bsz,
+                                        float(config.lang_prompt_p),
+                                        device=tokens.device)
+        window = self._current_attn_window(seq_len) if training else None
+        attn_mask = (causal_window_mask(seq_len, window, tokens.device)
+                     if window is not None else None)
+
+        return diffusion_model_step(self.net,
+                                    tokens,
+                                    batch['image'],
+                                    curves,
+                                    boxes,
+                                    self.criterion.ignore_index,
+                                    t,
+                                    torch.tensor(float(config.pad_loss_weight),
+                                                 device=tokens.device),
+                                    config.label_smoothing if training else 0.0,
+                                    attn_mask,
+                                    keep_langs,
+                                    self._current_proto_margin() if training else None)
+
+    def _ar_consistency_step(self, batch, curves, boxes):
+        """
+        The original teacher-forced step, mixed in at a low rate to keep an
+        autoregressive decoder alive in the same weights.
+        """
+        return self.model_step(self.net,
+                               batch['tokens'],
+                               batch['image'],
+                               curves,
+                               boxes,
+                               self.criterion.ignore_index,
+                               self.hparams.config.label_smoothing,
+                               self._current_proto_margin(),
+                               self._current_ntf_p(),
+                               CODEPOINT_OFFSET,
+                               self.net.tokenizer.vocab_size)
+
     def training_step(self, batch, batch_idx):
-        loss, _, valid_count = self.model_step(self.net,
-                                               batch['tokens'],
-                                               batch['image'],
-                                               batch['curves'],
-                                               batch['boxes'],
-                                               self.criterion.ignore_index,
-                                               self.hparams.config.label_smoothing,
-                                               self._current_proto_margin(),
-                                               self._current_ntf_p(),
-                                               CODEPOINT_OFFSET,
-                                               self.net.tokenizer.vocab_size)
+        ar_p = float(getattr(self.hparams.config, 'ar_consistency_p', 0.0) or 0.0)
+        if ar_p > 0.0 and torch.rand(()).item() < ar_p:
+            loss, _, valid_count = self._ar_consistency_step(batch,
+                                                             batch['curves'],
+                                                             batch['boxes'])
+        else:
+            loss, _, valid_count = self._diffusion_step(batch,
+                                                        batch['curves'],
+                                                        batch['boxes'],
+                                                        self._current_mask_rate_max(),
+                                                        training=True)
 
         if batch['curves'] is not None:
             _update_loss_metric(self.train_curves_mean, loss, valid_count)
@@ -559,25 +714,38 @@ class PartyRecognitionModel(L.LightningModule):
         self.train_curves_mean.reset()
         self.train_boxes_mean.reset()
 
+    def _val_seed(self, batch_idx: int) -> int:
+        """Per-batch seed, so the noise is identical across epochs."""
+        return 0x5eed + batch_idx
+
+    def _val_mask_rate(self, batch_idx: int) -> float:
+        """
+        Cycles through a fixed grid of mask rates. A random rate would make the
+        metric high-variance and checkpoint selection noisy; cycling covers the
+        grid over the epoch at one forward pass per batch.
+        """
+        rates = tuple(self.hparams.config.val_mask_rates)
+        return float(rates[batch_idx % len(rates)])
+
     def validation_step(self, batch, batch_idx):
+        # val_metric tracks content-only CE, not the ELBO, which a full canvas
+        # dilutes with its PAD tail. EarlyStopping monitors this value.
+        rate = self._val_mask_rate(batch_idx)
+        content_ce = None
         if batch['curves'] is not None:
-            loss, _, valid_count = self.model_step(self.net,
-                                                   batch['tokens'],
-                                                   batch['image'],
-                                                   batch['curves'],
-                                                   None,
-                                                   self.criterion.ignore_index)
-            _update_loss_metric(self.val_curves_mean, loss, valid_count)
+            _, content_sum, content_count = self._diffusion_step(
+                batch, batch['curves'], None, rate, training=False,
+                seed=self._val_seed(batch_idx))
+            content_ce = content_sum / content_count.clamp_min(1)
+            _update_loss_metric(self.val_curves_mean, content_ce, content_count)
 
         if batch['boxes'] is not None:
-            loss, _, valid_count = self.model_step(self.net,
-                                                   batch['tokens'],
-                                                   batch['image'],
-                                                   None,
-                                                   batch['boxes'],
-                                                   self.criterion.ignore_index)
-            _update_loss_metric(self.val_boxes_mean, loss, valid_count)
-        return loss
+            _, content_sum, content_count = self._diffusion_step(
+                batch, None, batch['boxes'], rate, training=False,
+                seed=self._val_seed(batch_idx))
+            content_ce = content_sum / content_count.clamp_min(1)
+            _update_loss_metric(self.val_boxes_mean, content_ce, content_count)
+        return content_ce
 
     def on_validation_epoch_end(self):
         if not self.trainer.sanity_checking:
@@ -614,8 +782,12 @@ class PartyRecognitionModel(L.LightningModule):
                                                           dtype=next(self.net.parameters()).dtype)
         self._test_prompt_mode = self.trainer.datamodule.test_set.prompt_mode
 
-        self.net.prepare_for_generation(batch_size=self._test_batch_size,
-                                        max_generated_tokens=config.max_generated_tokens)
+        self.net.prepare_for_generation(
+            batch_size=self._test_batch_size,
+            max_generated_tokens=config.max_generated_tokens,
+            diffusion_steps=getattr(config, 'diffusion_steps', 4),
+            confidence_threshold=getattr(config, 'confidence_threshold', None),
+            truncate_at_eos=getattr(config, 'truncate_at_eos', True))
 
         device = self.device
         self._test_micro_cer = CharErrorRate().to(device)

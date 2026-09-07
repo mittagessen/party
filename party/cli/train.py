@@ -148,6 +148,35 @@ def compile(ctx, **params):
 @click.option('--noisy-teacher-forcing-warmup',
               type=int,
               help='Number of steps to ramp up the noisy-teacher-forcing probability.')
+@click.option('--mask-rate-min', type=click.FloatRange(0, 1), default=0.0,
+              show_default=True,
+              help='Lower end of the per-sample mask rate range.')
+@click.option('--mask-rate-max', type=click.FloatRange(0, 1), default=1.0,
+              show_default=True,
+              help='Upper end of the mask rate range, reached after warmup.')
+@click.option('--mask-rate-max-start', type=click.FloatRange(0, 1), default=0.15,
+              show_default=True,
+              help='Upper end of the mask rate range at step 0. Starting narrow '
+                   'keeps the model near the teacher-forced regime.')
+@click.option('--mask-rate-warmup', type=click.IntRange(0), default=4000,
+              show_default=True,
+              help='Steps over which to widen the mask rate range.')
+@click.option('--attn-anneal-steps', type=click.IntRange(0), default=3000,
+              show_default=True,
+              help='Steps over which decoder self-attention is annealed from '
+                   'causal to bidirectional. 0 goes straight to bidirectional.')
+@click.option('--pad-loss-weight', type=click.FloatRange(0, 1), default=0.05,
+              show_default=True,
+              help='Loss weight of the PAD tail, which is most of a canvas and '
+                   'would otherwise dominate the objective.')
+@click.option('--lang-prompt-p', type=click.FloatRange(0, 1), default=0.5,
+              show_default=True,
+              help="Probability of keeping a line's language tokens as prompt. "
+                   'The rest are masked and supervised.')
+@click.option('--ar-consistency-p', type=click.FloatRange(0, 1), default=0.05,
+              show_default=True,
+              help='Fraction of steps trained on the old teacher-forced '
+                   'objective, keeping an autoregressive fallback alive.')
 @click.option('--proto-margin',
               type=float,
               help='ArcFace angular margin applied to prototype logits during training.')

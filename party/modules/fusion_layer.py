@@ -95,6 +95,7 @@ class FusionLayer(nn.Module):
         *,
         encoder_max_seq_len: int,
         decoder_max_seq_len: int,
+        self_attn_cache: bool = True,
     ) -> None:
         """Setup key value cache for both layers.
 
@@ -103,12 +104,16 @@ class FusionLayer(nn.Module):
             dtype (torch.dtype): dtype for the caches.
             encoder_max_seq_len (int): maximum cache sequence length for cross-attention layer.
             decoder_max_seq_len (int): maximum cache sequence length for self-attention layer.
+            self_attn_cache (bool): whether to cache the wrapped decoder
+                layer's self-attention keys/values. The fused cross-attention
+                layer is cached regardless.
         """
         self.layer.setup_caches(
             batch_size,
             dtype,
             encoder_max_seq_len=encoder_max_seq_len,
             decoder_max_seq_len=decoder_max_seq_len,
+            self_attn_cache=self_attn_cache,
         )
 
         self.fusion_layer.setup_caches(

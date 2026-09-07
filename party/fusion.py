@@ -26,6 +26,7 @@ from party.modules import (MultiHeadAttention, RMSNorm, TanhGate,
                            TransformerSelfAttentionLayer,
                            FusionLayer, scale_hidden_dim_for_mlp,
                            Llama3ScaledRoPE, llama3_mlp, PrototypeHead)
+from party.tokenizer import CODEPOINT_OFFSET
 
 
 logger = logging.getLogger(__name__)
@@ -126,6 +127,10 @@ def bytellama_vision_decoder(vocab_size: int,
             pos_embeddings=rope,
             max_seq_len=config['max_seq_len'],
             attn_dropout=0.0,
+            # the decoder reads the whole canvas at once, so the no-mask
+            # default is bidirectional. Causal attention is still reachable by
+            # passing an explicit mask, as the annealing phase does.
+            is_causal=False,
         )
         mlp = llama3_mlp(dim=config['embed_dim'], hidden_dim=hidden_dim)
         decoder_layer = TransformerSelfAttentionLayer(
@@ -195,6 +200,10 @@ def bytellama_vision_decoder(vocab_size: int,
         state_dict.pop('tok_embeddings.weight', None)
         state_dict.pop('output.weight', None)
         decoder.load_state_dict(state_dict, strict=False)
+
+    # after any pretrained load, so it is scaled against the table the
+    # decoder will actually run with
+    decoder.init_mask_embedding(first_token_id=CODEPOINT_OFFSET)
 
     return decoder
 

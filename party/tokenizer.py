@@ -456,6 +456,11 @@ EOS_ID = 2
 LANG_OFFSET = 3
 CODEPOINT_OFFSET = LANG_OFFSET + len(ISO_TO_IDX)
 
+# marks a position as unknown to the diffusion decoder, which substitutes a
+# learned embedding. Not a vocabulary row: the prototype table grows at its
+# tail, so a trailing row would be clobbered and a low id would renumber.
+MASK_ID = -1
+
 
 class CodePointTokenizer(object):
     """

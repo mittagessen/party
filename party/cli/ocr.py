@@ -128,7 +128,18 @@ def _recognize(ctx, model, config, output_mode, output_template, steps,
                    'derived from the segmentation type (baselines -> curves, '
                    'bbox -> boxes).')
 @click.option('--max-generated-tokens', type=click.IntRange(1),
-              show_default=True, help='Maximum number of tokens to generate per line.')
+              show_default=True,
+              help='Canvas width in tokens, terminated by the first predicted '
+                   'EOS. Decoding cost scales with it.')
+@click.option('--diffusion-steps', type=click.IntRange(1), default=4,
+              show_default=True,
+              help='Number of parallel denoising passes over the canvas. Cost '
+                   'is independent of line length. 1 decodes in one pass.')
+@click.option('--confidence-threshold', type=click.FloatRange(0, 1), default=None,
+              help='Also commit any position above this probability, on top of '
+                   'the per-pass quota. Needs recalibrating per fine-tune.')
+@click.option('--truncate-at-eos/--no-truncate-at-eos', default=True, show_default=True,
+              help='Drop the dead canvas tail once every line has terminated.')
 @click.option('--add-lang-token/--no-lang-token', default=False, show_default=True,
               help='Prepend language tokens from the segmentation to condition '
                    'the decoder on the input language.')
@@ -136,6 +147,7 @@ def _recognize(ctx, model, config, output_mode, output_template, steps,
               help='Raises the exception that caused processing to fail in the case of an error.')
 def ocr(ctx, load_from_repo, load_from_file, input, batch_input, suffix,
         serializer, template, batch_size, prompt_mode, max_generated_tokens,
+        diffusion_steps, confidence_threshold, truncate_at_eos,
         add_lang_token, raise_on_error):
     """
     Recognizes text in pre-segmented ALTO/PageXML page images.
@@ -191,6 +203,9 @@ def ocr(ctx, load_from_repo, load_from_file, input, batch_input, suffix,
                                              batch_size=batch_size if batch_size else 1,
                                              prompt_mode=prompt_mode,
                                              max_generated_tokens=max_generated_tokens,
+                                             diffusion_steps=diffusion_steps,
+                                             confidence_threshold=confidence_threshold,
+                                             truncate_at_eos=truncate_at_eos,
                                              add_lang_token=add_lang_token,
                                              raise_on_error=raise_on_error)
 
@@ -200,6 +215,7 @@ def ocr(ctx, load_from_repo, load_from_file, input, batch_input, suffix,
                             settings={'models': load_from_repo or str(load_from_file),
                                       'prompt_mode': prompt_mode,
                                       'max_generated_tokens': max_generated_tokens,
+                                      'diffusion_steps': diffusion_steps,
                                       'add_lang_token': add_lang_token})]
 
     message(f'Loading model from {load_from_file}.')

@@ -49,6 +49,7 @@ class TransformerSelfAttentionLayer(nn.Module):
         *,
         encoder_max_seq_len: int,
         decoder_max_seq_len: int,
+        self_attn_cache: bool = True,
     ) -> None:
         """Setup key value caches for attention calculation.
 
@@ -57,7 +58,12 @@ class TransformerSelfAttentionLayer(nn.Module):
             dtype (torch.dtype): dtype for the caches.
             encoder_max_seq_len (int): this parameter is ignored in this layer.
             decoder_max_seq_len (int): maximum cache sequence length.
+            self_attn_cache (bool): whether to allocate a cache at all. False
+                for masked diffusion decoding, which re-reads the whole canvas
+                every pass and would otherwise overrun the cache.
         """
+        if not self_attn_cache:
+            return
         self.attn.setup_cache(batch_size, dtype, max_seq_len=decoder_max_seq_len)
 
     def caches_are_setup(self) -> bool:
@@ -75,8 +81,11 @@ class TransformerSelfAttentionLayer(nn.Module):
         return self.attn.cache_enabled
 
     def reset_cache(self):
-        """Reset the key value caches."""
-        self.attn.reset_cache()
+        """Reset the key value caches, if this layer has any."""
+        # masked diffusion decoding caches the cross-attention layers only, so
+        # a blanket reset walks over layers that never had a cache
+        if self.attn.kv_cache is not None:
+            self.attn.reset_cache()
 
     def forward(
         self,
@@ -169,6 +178,7 @@ class TransformerCrossAttentionLayer(nn.Module):
         *,
         encoder_max_seq_len: int,
         decoder_max_seq_len: int,
+        self_attn_cache: bool = True,
     ) -> None:
         """Setup key value caches for attention calculation.
 
@@ -177,6 +187,7 @@ class TransformerCrossAttentionLayer(nn.Module):
             dtype (torch.dtype): dtype for the caches.
             encoder_max_seq_len (int): maximum cache sequence length.
             decoder_max_seq_len (int): this parameter is ignored in this layer.
+            self_attn_cache (bool): this parameter is ignored in this layer.
         """
         self.attn.setup_cache(batch_size, dtype, encoder_max_seq_len)
 
@@ -195,8 +206,11 @@ class TransformerCrossAttentionLayer(nn.Module):
         return self.attn.cache_enabled
 
     def reset_cache(self):
-        """Reset the key value caches."""
-        self.attn.reset_cache()
+        """Reset the key value caches, if this layer has any."""
+        # masked diffusion decoding caches the cross-attention layers only, so
+        # a blanket reset walks over layers that never had a cache
+        if self.attn.kv_cache is not None:
+            self.attn.reset_cache()
 
     def _skip_mask(self, mask: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         """Some tokens in x may not attend to any encoder inputs
@@ -379,6 +393,13 @@ class TransformerDecoder(nn.Module):
         self.causal_mask = None
         self.num_output_chunks = 0
 
+        # substituted for positions carrying MASK_ID. Kept out of
+        # `tok_embeddings` so the tied prototype table stays exactly the
+        # predictable classes and party.adapt can still grow it.
+        self.mask_embedding = nn.Parameter(
+            torch.zeros(tok_embeddings.embedding_dim)
+        )
+
         # attributes for KV caches during inference
         self.encoder_max_cache_seq_len = None
         self.decoder_max_cache_seq_len = None
@@ -388,6 +409,25 @@ class TransformerDecoder(nn.Module):
         This should be called before the first forward pass, in the recipe."""
         self.num_output_chunks = num_output_chunks
 
+    @torch.no_grad()
+    def init_mask_embedding(self, first_token_id: int = 0) -> None:
+        """
+        Seeds the mask embedding from the mean of the token embedding rows,
+        rescaled to their mean RMS so it enters the residual stream where the
+        pretrained norms expect it. Zeros would stall early adaptation.
+
+        Args:
+            first_token_id: Index of the first row to average over. Pass
+                ``CODEPOINT_OFFSET`` to skip the special and language tokens.
+        """
+        weight = self.tok_embeddings.weight[first_token_id:]
+        if weight.numel() == 0:
+            return
+        mean = weight.mean(dim=0)
+        mean_rms = weight.pow(2).mean(dim=-1).sqrt().mean()
+        mean_norm = mean.pow(2).mean().sqrt().clamp_min(1e-8)
+        self.mask_embedding.copy_(mean * (mean_rms / mean_norm))
+
     def setup_caches(
         self,
         batch_size: int,
@@ -395,6 +435,7 @@ class TransformerDecoder(nn.Module):
         *,
         encoder_max_seq_len: Optional[int] = None,
         decoder_max_seq_len: Optional[int] = None,
+        self_attn_cache: bool = True,
     ):
         """
         Sets up key-value attention caches for inference. For each layer in ``self.layers``:
@@ -407,12 +448,15 @@ class TransformerDecoder(nn.Module):
             dtype (torch.dtype): dtype for the caches.
             encoder_max_seq_len (Optional[int]): maximum encoder cache sequence length.
             decoder_max_seq_len (Optional[int]): maximum decoder cache sequence length.
+            self_attn_cache (bool): whether to cache self-attention keys/values.
+                Set to False for masked diffusion decoding, where only the
+                encoder keys/values are stable across denoising passes.
         """
 
         has_encoder_layers = any(
             isinstance(m, TransformerCrossAttentionLayer) for m in self.modules()
         )
-        has_decoder_layers = any(
+        has_decoder_layers = self_attn_cache and any(
             isinstance(m, TransformerSelfAttentionLayer) for m in self.modules()
         )
 
@@ -434,6 +478,7 @@ class TransformerDecoder(nn.Module):
                 dtype,
                 encoder_max_seq_len=self.encoder_max_cache_seq_len,
                 decoder_max_seq_len=self.decoder_max_cache_seq_len,
+                self_attn_cache=self_attn_cache,
             )
 
     def caches_are_setup(self) -> bool:
@@ -449,8 +494,20 @@ class TransformerDecoder(nn.Module):
         attention modules will be "enabled" and all forward passes will update the caches. This behaviour
         can be disabled without altering the state of the KV-caches by "disabling" the KV-caches
         using :func:`torchtune.modules.common_utils.disable_kv_cache`, upon which ``caches_are_enabled`` would return False.
+
+        This probes ``layers[0]``, a self-attention layer, so it reports on the
+        self-attention caches, which is what ``_validate_inputs`` cares about.
+        Masked diffusion decoding caches the encoder only and so does not trip
+        its demand for a mask and input positions.
         """
         return self.layers[0].caches_are_enabled()
+
+    def encoder_caches_are_enabled(self) -> bool:
+        """
+        Checks whether any cross-attention layer is caching encoder keys/values.
+        """
+        return any(isinstance(m, TransformerCrossAttentionLayer) and m.caches_are_enabled()
+                   for m in self.modules())
 
     def reset_caches(self):
         """
@@ -461,7 +518,7 @@ class TransformerDecoder(nn.Module):
             RuntimeError: if KV-caches are not setup. Use :func:`~party.modules.TransformerDecoder.setup_caches` to
                 setup caches first.
         """
-        if not self.caches_are_enabled():
+        if not self.caches_are_enabled() and not self.encoder_caches_are_enabled():
             raise RuntimeError(
                 "Key value caches are not setup. Call model.setup_caches first."
             )
@@ -615,7 +672,12 @@ class TransformerDecoder(nn.Module):
         )
 
         # shape: [b, s, d]
-        h = self.tok_embeddings(tokens)
+        # negative ids (MASK_ID) are markers, not classes: clamp to keep the
+        # lookup in range, then overwrite with the mask embedding
+        h = self.tok_embeddings(tokens.clamp_min(0))
+        h = torch.where(tokens.unsqueeze(-1) < 0,
+                        self.mask_embedding.to(h.dtype),
+                        h)
 
         hidden = []
         for i, layer in enumerate(self.layers):

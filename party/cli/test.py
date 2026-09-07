@@ -54,10 +54,17 @@ logging.getLogger("lightning.fabric.utilities.seed").setLevel(logging.ERROR)
 @click.option('--compile/--no-compile', help='Switch to enable/disable torch.compile() on model', default=True, show_default=True)
 @click.option('--quantize/--no-quantize', help='Switch to enable/disable PTQ', default=False, show_default=True)
 @click.option('--add-lang-token/--no-lang-token', help='Switch to enable language tokens.', default=False, show_default=True)
+@click.option('--diffusion-steps', type=click.IntRange(1), default=4, show_default=True,
+              help='Number of parallel denoising passes over the canvas.')
+@click.option('--confidence-threshold', type=click.FloatRange(0, 1), default=None,
+              help='Also commit any position above this probability.')
+@click.option('--max-generated-tokens', type=click.IntRange(1), default=None,
+              help='Canvas width in tokens. Decoding cost scales with it.')
 @click.argument('test_set', nargs=-1, callback=_expand_gt, type=click.Path(exists=False, dir_okay=False))
 def test(ctx, batch_size, load_from_repo, load_from_file, evaluation_files,
          normalization, normalize_whitespace, curves, compile, quantize,
-         add_lang_token, test_set):
+         add_lang_token, diffusion_steps, confidence_threshold,
+         max_generated_tokens, test_set):
     """
     Tests a model on a compiled dataset.
     """
@@ -119,7 +126,10 @@ def test(ctx, batch_size, load_from_repo, load_from_file, evaluation_files,
                                                    num_workers=ctx.meta['num_workers'],
                                                    normalization=normalization,
                                                    normalize_whitespace=normalize_whitespace)
-    m_config = PartyRecognitionTrainingConfig(add_lang_token=add_lang_token)
+    m_config = PartyRecognitionTrainingConfig(add_lang_token=add_lang_token,
+                                              diffusion_steps=diffusion_steps,
+                                              confidence_threshold=confidence_threshold,
+                                              max_generated_tokens=max_generated_tokens)
 
     trainer = Trainer(accelerator=ctx.meta['accelerator'],
                       devices=ctx.meta['devices'],

@@ -84,6 +84,16 @@ MODEL_VARIANTS = {
 }
 
 
+def _popped(kwargs: dict, key: str, default):
+    """
+    ``dict.pop`` treating an explicit None as "not provided". The train CLI
+    builds its config from ``ctx.params``, where unset options are present and
+    None, so a plain pop would hand back None instead of the default.
+    """
+    value = kwargs.pop(key, None)
+    return default if value is None else value
+
+
 def get_model_variant(name: str) -> dict:
     if name not in MODEL_VARIANTS:
         raise ValueError(f'Unknown model variant {name!r}. Available: {list(MODEL_VARIANTS)}')
@@ -102,15 +112,34 @@ class PartyRecognitionInferenceConfig(RecognitionInferenceConfig):
             converted to the requested format when possible. Setting 'curves'
             with a bounding box segmentation will raise a ValueError.
         max_generated_tokens (int, defaults to 512):
-            Maximum number of tokens to generate per line.
+            Canvas width in tokens, clamped to the decoder's maximum sequence
+            length. Each line is decoded on a canvas of this many slots and
+            terminated by the first predicted EOS. Decoding cost scales with it,
+            so it is worth setting from the data.
         add_lang_token (bool, defaults to True):
             Prepend language tokens from the segmentation's language field to
             condition the decoder on the input language.
+        diffusion_steps (int, defaults to 4):
+            Number of denoising passes over the canvas. Each predicts every
+            position in parallel and commits the most confident ``1/remaining``
+            of what is still masked, so the canvas fills in this many passes
+            whatever the line length. 1 decodes in a single pass.
+        confidence_threshold (float or None, defaults to None):
+            Optionally also commit any position above this probability, on top
+            of the per-pass quota. Off by default, as the prototype head's
+            logit scale is learned and a fixed threshold would need
+            recalibrating per fine-tune.
+        truncate_at_eos (bool, defaults to True):
+            Drop the canvas tail from later passes once every line in the batch
+            has committed an EOS.
     """
     def __init__(self, **kwargs):
         self.prompt_mode = kwargs.pop('prompt_mode', None)
         self.max_generated_tokens = kwargs.pop('max_generated_tokens', 512)
         self.add_lang_token = kwargs.pop('add_lang_token', True)
+        self.diffusion_steps = kwargs.pop('diffusion_steps', 4)
+        self.confidence_threshold = kwargs.pop('confidence_threshold', None)
+        self.truncate_at_eos = kwargs.pop('truncate_at_eos', True)
         super().__init__(**kwargs)
 
 
@@ -134,6 +163,33 @@ class PartyRecognitionTrainingConfig(TrainingConfig):
         self.pretrained_weights_path = kwargs.pop('pretrained_weights_path', None)
         self.add_lang_token = kwargs.pop('add_lang_token', False)
         self.max_generated_tokens = kwargs.pop('max_generated_tokens', 512)
+
+        # masked diffusion objective, see party/diffusion.py. The mask rate
+        # ceiling ramps from `mask_rate_max_start` to `mask_rate_max` over
+        # `mask_rate_warmup` steps, starting near the teacher-forced regime.
+        self.mask_rate_min = _popped(kwargs, 'mask_rate_min', 0.0)
+        self.mask_rate_max = _popped(kwargs, 'mask_rate_max', 1.0)
+        self.mask_rate_max_start = _popped(kwargs, 'mask_rate_max_start', 0.15)
+        self.mask_rate_warmup = _popped(kwargs, 'mask_rate_warmup', 4000)
+        self.stratified_t = _popped(kwargs, 'stratified_t', True)
+        # the window over which each query may see future positions grows from
+        # causal to bidirectional. 0 goes straight to bidirectional.
+        self.attn_anneal_steps = _popped(kwargs, 'attn_anneal_steps', 3000)
+        # most slots of a full canvas are PAD, which would otherwise dominate
+        self.pad_loss_weight = _popped(kwargs, 'pad_loss_weight', 0.05)
+        # probability of keeping a line's language tokens as prompt; the rest
+        # are masked and supervised, keeping language prediction available
+        self.lang_prompt_p = _popped(kwargs, 'lang_prompt_p', 0.5)
+        # fraction of steps trained on the old autoregressive objective, which
+        # keeps a fallback decoder alive in the same weights
+        self.ar_consistency_p = _popped(kwargs, 'ar_consistency_p', 0.05)
+        # cycled deterministically; random rates would make val_metric a
+        # high-variance estimator and checkpoint selection noisy
+        self.val_mask_rates = _popped(kwargs, 'val_mask_rates', (0.25, 0.5, 0.75))
+        # decoding knobs, used by `party test` to sweep the step budget
+        self.diffusion_steps = _popped(kwargs, 'diffusion_steps', 4)
+        self.confidence_threshold = kwargs.pop('confidence_threshold', None)
+        self.truncate_at_eos = _popped(kwargs, 'truncate_at_eos', True)
 
         kwargs.setdefault('quit', 'fixed')
         kwargs.setdefault('epochs', 32)
