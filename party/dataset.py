@@ -40,6 +40,7 @@ from torchvision.transforms import v2
 from torch.utils.data import Dataset, IterableDataset, get_worker_info
 from torch.distributed import get_rank, get_world_size, is_initialized
 
+import pillow_jxl
 
 from scipy.special import comb
 
@@ -63,6 +64,25 @@ Image.MAX_IMAGE_PIXELS = 20000 ** 2
 RESIZED_PAGE_ENCODINGS = (('JPEG', {'quality': 95}),
                           ('PNG', {}))
 MAX_PAGE_LOAD_ATTEMPTS = 10
+
+try:
+    _libc = ctypes.CDLL('libc.so.6')
+except OSError:
+    _libc = None
+
+# number of iterations between GC runs/malloc trim
+_TRIM_INTERVAL = 50
+_batches_since_trim = 0
+
+
+def _maybe_release_memory():
+    global _batches_since_trim
+    _batches_since_trim += 1
+    if _batches_since_trim >= _TRIM_INTERVAL:
+        _batches_since_trim = 0
+        gc.collect()
+        if _libc is not None:
+            _libc.malloc_trim(0)
 
 
 def batched(iterable, n, *, strict=False):
@@ -134,16 +154,7 @@ def _to_curve(baseline, im_size, min_points: int = 8, clamp_tolerance: float = 0
 
 
 def _codepoints_from_metadata(raw_metadata: Optional[dict]) -> Optional[list[int]]:
-    if not raw_metadata:
-        return None
-    if b'codepoints' not in raw_metadata:
-        return None
-    try:
-        return json.loads(raw_metadata[b'codepoints'].decode('utf-8'))
-    except Exception:
-        logger.warning('Failed to parse codepoints metadata. Falling back to table scan.')
-        return None
-
+    return json.loads(raw_metadata[b'codepoints'].decode('utf-8'))
 
 def _max_tokens_from_metadata(raw_metadata: Optional[dict]) -> int:
     if not raw_metadata or b'max_tokens_in_line' not in raw_metadata:
@@ -341,6 +352,11 @@ def _validation_worker_init_fn(worker_id):
     seed_everything(42)
 
 
+def _train_worker_init_fn(worker_id):
+    gc.collect()
+    gc.freeze()
+
+
 def collate_null(batch):
     return batch[0]
 
@@ -395,10 +411,7 @@ def collate_sequences(im, page_data, max_seq_len: int, index: int):
         curves = torch.stack([x for _, x, _ in page_data])
     if page_data[0][2] is not None:
         boxes = torch.stack([x for _, _, x in page_data])
-    gc.collect()
-    libc = ctypes.CDLL("libc.so.6")
-    libc.malloc_trim(0)
-    gc.collect()
+    _maybe_release_memory()
     return {'image': im,
             'tokens': labels,
             'curves': curves,
@@ -454,9 +467,7 @@ class BinnedBaselineDataset(Dataset):
                 raw_metadata = ds_table.schema.metadata
                 if not raw_metadata or b'num_lines' not in raw_metadata:
                     raise ValueError(f'{file} does not contain a valid metadata record.')
-                file_codepoints = _codepoints_from_metadata(raw_metadata)
-                if file_codepoints is not None:
-                    all_codepoints.append(file_codepoints)
+                all_codepoints.append(_codepoints_from_metadata(raw_metadata))
                 if b'lang_counts' in raw_metadata:
                     self.lang_counts.update(json.loads(raw_metadata[b'lang_counts']))
                 if not self.arrow_table:
@@ -575,9 +586,7 @@ class ValidationBaselineDataset(IterableDataset):
                 raw_metadata = ds_table.schema.metadata
                 if not raw_metadata or b'num_lines' not in raw_metadata:
                     raise ValueError(f'{file} does not contain a valid metadata record.')
-                file_codepoints = _codepoints_from_metadata(raw_metadata)
-                if file_codepoints is not None:
-                    all_codepoints.append(file_codepoints)
+                all_codepoints.append(_codepoints_from_metadata(raw_metadata))
                 if b'lang_counts' in raw_metadata:
                     self.lang_counts.update(json.loads(raw_metadata[b'lang_counts']))
                 if not self.arrow_table:
@@ -682,9 +691,7 @@ class TestBaselineDataset(Dataset):
                 raw_metadata = ds_table.schema.metadata
                 if not raw_metadata or b'num_lines' not in raw_metadata:
                     raise ValueError(f'{file} does not contain a valid metadata record.')
-                file_codepoints = _codepoints_from_metadata(raw_metadata)
-                if file_codepoints is not None:
-                    all_codepoints.append(file_codepoints)
+                all_codepoints.append(_codepoints_from_metadata(raw_metadata))
                 if not self.arrow_table:
                     self.arrow_table = ds_table
                 else:

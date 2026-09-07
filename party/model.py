@@ -37,6 +37,7 @@ from party.tokenizer import CodePointTokenizer, CODEPOINT_OFFSET
 from party.dataset import (collate_null, get_default_transforms,
                            BinnedBaselineDataset, TestBaselineDataset,
                            ValidationBaselineDataset,
+                           _train_worker_init_fn,
                            _validation_worker_init_fn)
 from party.report import compute_script_cer_from_algn, global_align
 from party.configs import PartyRecognitionTrainingConfig, PartyRecognitionTrainingDataConfig
@@ -409,10 +410,12 @@ class PartyTextLineDataModule(L.LightningDataModule):
                              'sampler': sampler,
                              'pin_memory': True,
                              'shuffle': False,
-                             'collate_fn': collate_null}
+                             'collate_fn': collate_null,
+                             'worker_init_fn': _train_worker_init_fn}
 
         if self.hparams.data_config.num_workers > 0:
             dataloader_kwargs['prefetch_factor'] = 1
+            dataloader_kwargs['persistent_workers'] = True
 
         return DataLoader(self.train_set, **dataloader_kwargs)
 
